@@ -254,11 +254,17 @@ class MessagingUtils:
     async def create_record_consumer_config(
         app_container: IndexingAppContainer,
     ) -> KafkaConsumerConfig | RedisStreamsConfig:
+        # lane_topics_for returns [record-events] unless laning is on. With
+        # Redis lanes it also keeps the pre-lane stream subscribed, so an
+        # install that enables laning drains whatever was written before the
+        # switch instead of stranding it.
+        from app.services.messaging.messaging_factory import lane_topics_for
+
         return await MessagingUtils.create_consumer_config(
             app_container,
             "records_consumer_client",
             "records_consumer_group",
-            [Topic.RECORD_EVENTS.value],
+            lane_topics_for(Topic.RECORD_EVENTS.value),
             is_indexing=True,  # Use indexing batch size
         )
 

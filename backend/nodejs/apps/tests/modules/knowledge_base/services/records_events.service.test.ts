@@ -232,7 +232,10 @@ describe('RecordsEventProducer - coverage', () => {
       expect(mockProducer.publish.calledOnce).to.be.true
       const [topic, message] = mockProducer.publish.firstCall.args
       expect(topic).to.equal('record-events')
-      expect(message.key).to.equal(EventType.NewRecordEvent)
+      // Keyed by the fairness key, not the event type: keying every
+      // newRecord identically would put them all on one partition the
+      // moment record-events has more than one.
+      expect(message.key).to.equal('org-1')
       expect(JSON.parse(message.value)).to.deep.include({ eventType: EventType.NewRecordEvent })
       expect(message.headers.eventType).to.equal(EventType.NewRecordEvent)
     })

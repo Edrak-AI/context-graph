@@ -32,7 +32,6 @@ from app.services.messaging.kafka.config.kafka_config import (
 )
 from app.services.messaging.utils import MessagingUtils
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

@@ -71,6 +71,23 @@ export interface DeletedRecordEvent {
   virtualRecordId?: string;
 }
 
+/**
+ * The fairness key a record event is placed by.
+ *
+ * Mirrors the Python side's default (`connectorId`, falling back to `orgId`),
+ * so both producers put one connector's records on the same lane.
+ */
+function laneKeyFor(event: Event): string {
+  const payload = (event.payload ?? {}) as unknown as Record<string, unknown>;
+  for (const field of ['connectorId', 'orgId']) {
+    const value = payload[field];
+    if (typeof value === 'string' && value.length > 0) {
+      return value;
+    }
+  }
+  return '__default__';
+}
+
 @injectable()
 export class RecordsEventProducer {
   private readonly recordsTopic = 'record-events';
@@ -98,7 +115,11 @@ export class RecordsEventProducer {
 
   async publishEvent(event: Event): Promise<void> {
     const message: StreamMessage<string> = {
-      key: event.eventType,
+      // Keyed by the connector instance, matching the Python lane key
+      // (FAIR_SCHEDULING_LANE_KEY_FIELD). Keying by eventType would put
+      // every newRecord on one partition the moment record-events has more
+      // than one, which is exactly what lanes are for.
+      key: laneKeyFor(event),
       value: JSON.stringify(event),
       headers: {
         eventType: event.eventType,
