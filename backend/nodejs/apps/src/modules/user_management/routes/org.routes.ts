@@ -5,7 +5,11 @@ import { ValidationMiddleware } from '../../../libs/middlewares/validation.middl
 import { AuthMiddleware } from '../../../libs/middlewares/auth.middleware';
 
 import { userAdminCheck } from '../middlewares/userAdminCheck';
-import { AuthenticatedUserRequest } from '../../../libs/middlewares/types';
+import {
+  AuthenticatedServiceRequest,
+  AuthenticatedUserRequest,
+} from '../../../libs/middlewares/types';
+import { TokenScopes } from '../../../libs/enums/token-scopes.enum';
 import { OrgController } from '../controller/org.controller';
 import { passwordValidator } from '../../auth/utils/passwordValidator';
 import { attachContainerMiddleware } from '../../auth/middlewares/attachContainer.middleware';
@@ -104,6 +108,37 @@ export function createOrgRouter(container: Container) {
       try {
         const orgController = container.get<OrgController>('OrgController');
         await orgController.checkOrgExistence(res);
+      } catch (error) {
+        next(error);
+      }
+    },
+  );
+
+  // Edrak identity bridge: one CGraph org per external tenant (scoped `org:provision` token).
+  router.post(
+    '/internal/provision',
+    authMiddleware.scopedTokenValidator(TokenScopes.ORG_PROVISION),
+    ValidationMiddleware.validate(
+      z.object({
+        body: z.object({
+          externalId: z.string().min(1).max(128),
+          registeredName: z.string().min(1).max(200),
+          contactEmail: z.string().email('Invalid email'),
+          adminFullName: z.string().min(1).max(200),
+        }),
+        query: z.object({}),
+        params: z.object({}),
+        headers: z.object({}),
+      }),
+    ),
+    async (
+      req: AuthenticatedServiceRequest,
+      res: Response,
+      next: NextFunction,
+    ) => {
+      try {
+        const orgController = container.get<OrgController>('OrgController');
+        await orgController.provisionExternalOrg(req, res, next);
       } catch (error) {
         next(error);
       }

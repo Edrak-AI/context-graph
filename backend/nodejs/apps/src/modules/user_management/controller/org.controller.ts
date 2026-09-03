@@ -5,7 +5,10 @@ import bcrypt from 'bcryptjs';
 import { Org } from '../schema/org.schema';
 import { Users } from '../schema/users.schema';
 import { UserGroups } from '../schema/userGroup.schema';
-import { AuthenticatedUserRequest } from '../../../libs/middlewares/types';
+import {
+  AuthenticatedServiceRequest,
+  AuthenticatedUserRequest,
+} from '../../../libs/middlewares/types';
 import { OrgLogos } from '../schema/orgLogo.schema';
 import sharp from 'sharp';
 import { inject, injectable } from 'inversify';
@@ -149,6 +152,125 @@ export class OrgController {
     const count = await Org.countDocuments();
 
     res.status(200).json({ exists: count != 0 });
+  }
+
+  /**
+   * Edrak identity bridge: create-or-return the CGraph org for an external tenant (scoped
+   * `org:provision` token). Idempotent by `externalId`. Mirrors createOrg's side effects except
+   * password credentials and mail — the admin only ever signs in through edrak-ai. The public
+   * single-org signup guard in createOrg is untouched.
+   */
+  async provisionExternalOrg(
+    req: AuthenticatedServiceRequest,
+    res: Response,
+    next: NextFunction,
+  ): Promise<void> {
+    try {
+      const { externalId, registeredName, contactEmail, adminFullName } =
+        req.body as {
+          externalId: string;
+          registeredName: string;
+          contactEmail: string;
+          adminFullName: string;
+        };
+      const email = contactEmail.trim().toLowerCase();
+
+      const existing = await Org.findOne({ externalId, isDeleted: false });
+      if (existing) {
+        const admin = await Users.findOne({
+          orgId: existing._id,
+          email,
+          isDeleted: false,
+        });
+        res.status(200).json({
+          orgId: String(existing._id),
+          adminUserId: admin ? String(admin._id) : null,
+          created: false,
+        });
+        return;
+      }
+
+      // Emails are globally unique across CGraph orgs.
+      const clash = await Users.findOne({ email });
+      if (clash) {
+        throw new BadRequestError(
+          'Admin email already belongs to another organization',
+        );
+      }
+
+      const domain = this.getDomainFromEmail(email) ?? 'edrak.tenant';
+      const org = new Org({
+        registeredName,
+        domain,
+        contactEmail: email,
+        accountType: 'business',
+        onBoardingStatus: 'notConfigured',
+        externalId,
+      });
+      const adminUser = new Users({
+        fullName: adminFullName,
+        email,
+        orgId: org._id,
+        role: 'admin',
+        hasLoggedIn: false,
+        isDeleted: false,
+      });
+      const allUsersGroup = new UserGroups({
+        type: 'everyone',
+        name: 'everyone',
+        orgId: org._id,
+        users: [adminUser._id],
+      });
+      const standardUsersGroup = new UserGroups({
+        type: 'standard',
+        name: 'standard',
+        orgId: org._id,
+        users: [],
+      });
+      const orgAuthConfig = new OrgAuthConfig({
+        orgId: org._id,
+        authSteps: [
+          { order: 1, allowedMethods: [{ type: AuthMethodType.PASSWORD }] },
+        ],
+      });
+
+      await orgAuthConfig.save();
+      await allUsersGroup.save();
+      await standardUsersGroup.save();
+      await adminUser.save();
+      await org.save();
+
+      await this.eventService.start();
+      await this.eventService.publishEvent({
+        eventType: EventType.OrgCreatedEvent,
+        timestamp: Date.now(),
+        payload: {
+          orgId: org._id,
+          accountType: org.accountType,
+          registeredName: org.registeredName,
+        } as OrgAddedEvent,
+      });
+      await this.eventService.publishEvent({
+        eventType: EventType.NewUserEvent,
+        timestamp: Date.now(),
+        payload: {
+          orgId: String(org._id),
+          userId: adminUser._id,
+          fullName: adminUser.fullName,
+          email: adminUser.email,
+          syncAction: 'none',
+        } as UserAddedEvent,
+      });
+      await this.eventService.stop();
+
+      res.status(201).json({
+        orgId: String(org._id),
+        adminUserId: String(adminUser._id),
+        created: true,
+      });
+    } catch (error) {
+      next(error);
+    }
   }
 
   async createOrg(req: ContainerRequest, res: Response): Promise<void> {

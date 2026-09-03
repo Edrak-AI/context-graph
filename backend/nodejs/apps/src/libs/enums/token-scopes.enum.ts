@@ -11,6 +11,8 @@ export const TokenScopes = Object.freeze({
   EMAIL_VERIFIED: 'email:verified',
   // Edrak identity bridge: service-to-service user provisioning (users `/internal/provision`).
   USER_PROVISION: 'user:provision',
+  // Edrak identity bridge: one CGraph org per Edrak tenant (org `/internal/provision`).
+  ORG_PROVISION: 'org:provision',
 } as const);
 
 // Create a type for the TokenScopes keys

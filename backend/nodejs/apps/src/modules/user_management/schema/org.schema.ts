@@ -19,11 +19,14 @@ export interface IOrg extends Document {
   onBoardingStatus : string;
   /** Written during admin demotion txns to serialize last-admin checks. */
   adminRoleGuardAt?: Date;
+  /** Edrak identity bridge: id of the tenant in the external system that provisioned this org. */
+  externalId?: string;
 }
 
 const orgSchema = new Schema<IOrg>(
   {
     slug: { type: String, unique: true },
+    externalId: { type: String, index: true, sparse: true },
     registeredName: {
       type: String,
       validate: {
