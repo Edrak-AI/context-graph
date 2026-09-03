@@ -103,6 +103,25 @@ const createUserValidationSchema = z.object({
   headers: z.object({}),
 });
 
+// Edrak identity bridge (scoped `user:provision` token). Idempotent by email.
+const provisionUserValidationSchema = z.object({
+  body: z.object({
+    email: z.string().email('Invalid email'),
+    fullName: z.string().min(1, 'Full name is required'),
+    firstName: z.string().optional(),
+    lastName: z.string().optional(),
+    role: z.enum(['admin', 'member']).optional(),
+    // Omit → the single active org (OSS single-org deployments).
+    orgId: z
+      .string()
+      .regex(/^[a-fA-F0-9]{24}$/, 'Invalid orgId')
+      .optional(),
+  }),
+  query: z.object({}),
+  params: z.object({}),
+  headers: z.object({}),
+});
+
 const bulkInviteBody = z.object({
   emails: z
     .array(z.string())
@@ -461,6 +480,24 @@ export function createUserRouter(container: Container) {
         } catch (error) {
           next(error);
         }
+      } catch (error) {
+        next(error);
+      }
+    },
+  );
+
+  router.post(
+    '/internal/provision',
+    authMiddleware.scopedTokenValidator(TokenScopes.USER_PROVISION),
+    ValidationMiddleware.validate(provisionUserValidationSchema),
+    async (
+      req: AuthenticatedServiceRequest,
+      res: Response,
+      next: NextFunction,
+    ) => {
+      try {
+        const userController = container.get<UserController>('UserController');
+        await userController.provisionExternalUser(req, res, next);
       } catch (error) {
         next(error);
       }

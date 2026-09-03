@@ -604,7 +604,17 @@ export class ConfigService {
       );
     }
 
-    if (!parsedKeys || !parsedKeys.jwtSecret) {
+    // JWT_SECRET env lets an external issuer (edrak-ai) mint session JWTs this service
+    // accepts. It is persisted to the KV store because the Python services verify with
+    // the value stored under /services/secretKeys, not with env.
+    const envJwtSecret = process.env.JWT_SECRET?.trim();
+    if (envJwtSecret && parsedKeys.jwtSecret !== envJwtSecret) {
+      parsedKeys.jwtSecret = envJwtSecret;
+      await this.keyValueStoreService.set(
+        configPaths.secretKeys,
+        this.encryptionService.encrypt(JSON.stringify(parsedKeys)),
+      );
+    } else if (!parsedKeys || !parsedKeys.jwtSecret) {
       parsedKeys.jwtSecret = randomKeyGenerator();
       const encryptedKeys = this.encryptionService.encrypt(
         JSON.stringify(parsedKeys),
@@ -628,7 +638,16 @@ export class ConfigService {
         this.encryptionService.decrypt(encryptedSecretKeys),
       );
     }
-    if (!parsedKeys.scopedJwtSecret) {
+    // See getJwtSecret(): SCOPED_JWT_SECRET lets edrak-ai mint scoped service tokens
+    // (e.g. `user:provision`).
+    const envScopedSecret = process.env.SCOPED_JWT_SECRET?.trim();
+    if (envScopedSecret && parsedKeys.scopedJwtSecret !== envScopedSecret) {
+      parsedKeys.scopedJwtSecret = envScopedSecret;
+      await this.keyValueStoreService.set(
+        configPaths.secretKeys,
+        this.encryptionService.encrypt(JSON.stringify(parsedKeys)),
+      );
+    } else if (!parsedKeys.scopedJwtSecret) {
       parsedKeys.scopedJwtSecret = randomKeyGenerator();
       const encryptedKeys = this.encryptionService.encrypt(
         JSON.stringify(parsedKeys),

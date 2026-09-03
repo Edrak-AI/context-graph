@@ -9,6 +9,8 @@ export const TokenScopes = Object.freeze({
   VALIDATE_EMAIL: 'email:validate',
   ORG_EMAIL_VERIFY: 'org:email:verify',
   EMAIL_VERIFIED: 'email:verified',
+  // Edrak identity bridge: service-to-service user provisioning (users `/internal/provision`).
+  USER_PROVISION: 'user:provision',
 } as const);
 
 // Create a type for the TokenScopes keys

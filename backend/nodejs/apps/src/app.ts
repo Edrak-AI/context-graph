@@ -25,8 +25,6 @@ import { xssSanitizationMiddleware } from './libs/middlewares/xss-sanitization.m
 import { loadConfigurationManagerConfig } from './modules/configuration_manager/config/config';
 import { MigrationService } from './modules/configuration_manager/services/migration.service';
 import { createOAuthRouter } from './modules/tokens_manager/routes/oauth.routes';
-import { startTelemetry } from './libs/services/telemetry/telemetry.service';
-import { KeyValueStoreService } from './libs/services/keyValueStore.service';
 // Import shared symbols from `./config` rather than `./modules/*` directly.
 import {
   createStorageRouter,
@@ -47,6 +45,7 @@ import {
   EnterpriseSearchAgentContainer,
   createConversationalRouter,
   createSemanticSearchRouter,
+  createKnowledgeGraphRouter,
   createAgentConversationalRouter,
   createChatSpeechRouter,
   KnowledgeBaseContainer,
@@ -239,9 +238,8 @@ export class Application {
       this.setupApiDocs();
       this.configureErrorHandling();
 
-      startTelemetry(
-        KeyValueStoreService.getInstance(configurationManagerConfig),
-      );
+      // Edrak fork: upstream usage-telemetry push to the vendor metrics collector
+      // is removed; in-process metrics stay local.
       startOrgMetricsRefresh(this.logger);
 
       this.notificationContainer
@@ -517,6 +515,11 @@ export class Application {
     this.app.use(
       '/api/v1/search',
       createSemanticSearchRouter(this.esAgentContainer),
+    );
+    // Edrak addition: graph explorer proxy → query service /api/v1/knowledge-graph/*
+    this.app.use(
+      '/api/v1/knowledge-graph',
+      createKnowledgeGraphRouter(this.esAgentContainer),
     );
 
     // enterprise search connectors routes — pass the crawling container

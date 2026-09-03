@@ -57,6 +57,7 @@ import {
   listAllAgentsArchivedConversationsGrouped,
   searchArchivedConversations,
 } from '../controller/es_controller';
+import { knowledgeGraphNeighborhood } from '../controller/knowledge_graph.controller';
 import {
   getSpeechCapabilities,
   synthesizeSpeech,
@@ -853,6 +854,22 @@ export function createChatSpeechRouter(container: Container): Router {
     requireScopes(OAuthScopeNames.CONVERSATION_CHAT),
     audioUpload.single('file'),
     transcribeAudio(appConfig),
+  );
+
+  return router;
+}
+
+// Edrak addition: knowledge-graph explorer (permission-filtered neighbourhood from the query service).
+export function createKnowledgeGraphRouter(container: Container): Router {
+  const router = Router();
+  const authMiddleware = container.get<AuthMiddleware>('AuthMiddleware');
+  const appConfig = container.get<AppConfig>('AppConfig');
+
+  router.get(
+    '/neighborhood',
+    authMiddleware.authenticate,
+    requireScopes(OAuthScopeNames.KB_READ),
+    knowledgeGraphNeighborhood(appConfig),
   );
 
   return router;

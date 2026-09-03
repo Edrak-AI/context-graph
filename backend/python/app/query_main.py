@@ -26,6 +26,7 @@ from app.utils.request_context import set_service_suffix
 set_service_suffix("-qs")
 from app.api.routes.ai_models_registry import router as ai_models_registry_router
 from app.api.routes.health import router as health_router
+from app.api.routes.knowledge_graph import router as knowledge_graph_router
 from app.api.routes.skills import router as skills_router
 from app.api.routes.speech import router as speech_router
 from app.api.routes.toolsets import router as toolsets_router
@@ -35,7 +36,6 @@ from app.services.messaging.config import get_message_broker_type
 from app.services.messaging.kafka.utils.utils import KafkaUtils
 from app.services.messaging.messaging_factory import MessagingFactory
 from app.services.messaging.utils import MessagingUtils
-from app.telemetry.setup import setup_telemetry
 from app.utils.llm_api_mode_store import get_llm_api_mode_store
 from app.utils.time_conversion import get_epoch_timestamp_in_ms
 from app.utils.worker_scaling import set_process_worker_count
@@ -164,11 +164,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     logger = app.container.logger()
     logger.debug("🚀 Starting retrieval application")
 
-    try:
-        await telemetry.bind(app_container.config_service(), logger).start()
-    except Exception as e:
-        logger.warning(f"❌ Failed to start telemetry pusher: {e}")
-
     # Get the already-resolved graph_provider from container (set during initialization)
     # This avoids coroutine reuse error
     graph_provider = getattr(app_container, '_graph_provider', None)
@@ -281,9 +276,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # Shutdown
     logger.info("🔄 Shutting down application")
 
-    if telemetry.pusher is not None:
-        await telemetry.pusher.stop()
-
     # Cancel background warmup tasks if still running.
     for _warmup_attr in ("embedding_warmup_task", "knn_warmup_task"):
         warmup_task: asyncio.Task | None = getattr(app.state, _warmup_attr, None)
@@ -385,7 +377,6 @@ app.add_middleware(
 
 # Trace context — outermost, before auth.
 app.add_middleware(RequestContextMiddleware)
-telemetry = setup_telemetry(app, service_name="query_service")
 
 
 @app.get("/health")
@@ -433,6 +424,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 
 # Include routes from routes.py
 app.include_router(search_router, prefix="/api/v1")
+app.include_router(knowledge_graph_router, prefix="/api/v1")
 app.include_router(chatbot_router, prefix="/api/v1")
 app.include_router(speech_router, prefix="/api/v1")
 app.include_router(agent_router, prefix="/api/v1/agent")

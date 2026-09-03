@@ -10,6 +10,31 @@ You are a **senior staff engineer** reviewing a pull request on the **PipesHub**
 
 PipesHub is a workplace AI platform for enterprise search and workflow automation. It integrates with 30+ enterprise connectors (Google Workspace, Microsoft 365, Slack, Jira, Confluence, etc.) and provides natural language search, knowledge graphs, and AI agent capabilities on top of that data.
 
+### This checkout is Edrak's fork ("CGraph")
+
+Branch `edrak/platform` tracks upstream (`f8485518`) plus Edrak patches. In Edrak's platform this
+repo is a **backend only**: the `frontend/` is never deployed to users — `../edrak-ai` is the sole UI
+and calls the Node gateway (`/api/v1/*`) over an internal load balancer with JWTs it mints itself.
+Keep upstream mergeability: small, isolated patches, no renames. Cross-repo plan/status:
+`../docs/cgraph-integration-runbook.md`.
+
+Edrak additions (keep them working when merging upstream):
+- `backend/nodejs/apps/src/modules/tokens_manager/services/cm.service.ts` — `JWT_SECRET` /
+  `SCOPED_JWT_SECRET` env override, persisted into the KV store (`/services/secretKeys`) so the
+  Python services verify with the same value. This is what lets edrak-ai mint accepted tokens.
+- `libs/enums/token-scopes.enum.ts` — `USER_PROVISION = 'user:provision'`.
+- `modules/user_management/routes/users.routes.ts` + `controller/users.controller.ts` —
+  `POST /api/v1/users/internal/provision` (scoped token), `provisionExternalUser()`: idempotent
+  by email, restores soft-deleted users, returns `{userId, orgId, role, created}`.
+- Telemetry phone-home removal and Helm `extraEnv` / `deploymentStrategy` passthrough
+  (`deployment/helm/pipeshub-ai`), used by `../platform-infra`.
+- Planned, not done: single-org guard in `org.controller.ts` behind an env flag (multi-org).
+
+Deployment facts: stage runs on GKE with **Neo4j** as the graph store, Redis as KV + message
+broker, image built by `../platform-infra/cloudbuild/build-pipeshub.yaml` (tag
+`<upstream short sha>-edrak<n>`). `FRONTEND_PUBLIC_URL` must be the edrak-ai origin because
+connector OAuth callbacks land on edrak-ai's `/connectors/oauth/callback/<slug>`.
+
 ### Architecture
 
 The platform is a polyglot system: **Python FastAPI microservices**, **1 Node.js Express API**, and **1 Next.js frontend**. In Docker Compose those Node and frontend pieces are one process; from source they are two. See `AGENTS.md` for which localhost port to open.

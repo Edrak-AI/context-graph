@@ -1,6 +1,10 @@
 import { Response, NextFunction } from 'express';
 import { User, Users } from '../schema/users.schema'; // Adjust path as needed
-import { AuthenticatedUserRequest } from '../../../libs/middlewares/types';
+import {
+  AuthenticatedServiceRequest,
+  AuthenticatedUserRequest,
+} from '../../../libs/middlewares/types';
+import { findActiveOrgById } from '../utils/org.utils';
 import mongoose from 'mongoose';
 import { UserDisplayPicture } from '../schema/userDp.schema';
 import sharp from 'sharp';
@@ -679,6 +683,104 @@ export class UserController {
     });
 
     return newUser.toObject();
+  }
+
+  /**
+   * Edrak identity bridge: create-or-update a user on behalf of a trusted external
+   * identity provider (scoped `user:provision` token). Idempotent by email; the
+   * external IdP is authoritative, so a soft-deleted user is restored rather than
+   * rejected. Returns the ids the caller needs to mint session JWTs for this user.
+   */
+  async provisionExternalUser(
+    req: AuthenticatedServiceRequest,
+    res: Response,
+    next: NextFunction,
+  ): Promise<void> {
+    try {
+      const {
+        email,
+        fullName,
+        firstName,
+        lastName,
+        role,
+        orgId: requestedOrgId,
+      } = req.body as {
+        email: string;
+        fullName: string;
+        firstName?: string;
+        lastName?: string;
+        role?: string;
+        orgId?: string;
+      };
+      const normalizedEmail = email.trim().toLowerCase();
+      const desiredRole = normalizeUserRole(role) ?? 'member';
+
+      const org = requestedOrgId
+        ? await findActiveOrgById(requestedOrgId)
+        : await Org.findOne({ isDeleted: false }).sort({ createdAt: 1 });
+      if (!org) {
+        throw new NotFoundError('Organization not found');
+      }
+      const orgId = String(org._id);
+
+      const existing = await Users.findOne({ email: normalizedEmail });
+      if (existing) {
+        if (existing.orgId.toString() !== orgId) {
+          throw new BadRequestError('User belongs to a different organization');
+        }
+        const set: Record<string, unknown> = {};
+        if (existing.isDeleted) {
+          set.isDeleted = false;
+          set.deletedBy = null;
+        }
+        if (existing.fullName !== fullName) set.fullName = fullName;
+        if (firstName && existing.firstName !== firstName) {
+          set.firstName = firstName;
+        }
+        if (lastName && existing.lastName !== lastName) {
+          set.lastName = lastName;
+        }
+        if (existing.role !== desiredRole) set.role = desiredRole;
+        if (Object.keys(set).length > 0) {
+          await Users.updateOne({ _id: existing._id }, { $set: set });
+        }
+        if (existing.isDeleted) {
+          await UserGroups.updateOne(
+            { orgId, type: 'everyone', isDeleted: false },
+            { $addToSet: { users: existing._id } },
+          );
+        }
+        res.status(200).json({
+          userId: String(existing._id),
+          orgId,
+          role: desiredRole,
+          created: false,
+        });
+        return;
+      }
+
+      const created = await this.provisionJitUser(
+        normalizedEmail,
+        { firstName, lastName, fullName },
+        orgId,
+        'oauth',
+        this.logger,
+      );
+      if (desiredRole !== 'member') {
+        await Users.updateOne(
+          { _id: created._id },
+          { $set: { role: desiredRole } },
+        );
+      }
+      res.status(201).json({
+        userId: String(created._id),
+        orgId,
+        role: desiredRole,
+        created: true,
+      });
+    } catch (error) {
+      next(error);
+    }
   }
 
   /**
