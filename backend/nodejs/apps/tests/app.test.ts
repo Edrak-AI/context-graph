@@ -7,7 +7,6 @@ import { Container } from 'inversify';
 import { Application } from '../src/app';
 import { createMockLogger, MockLogger } from './helpers/mock-logger';
 import { Logger } from '../src/libs/services/logger.service';
-import * as telemetryModule from '../src/libs/services/telemetry/telemetry.service';
 import * as metricsRefreshModule from '../src/modules/user_management/services/metrics.refresh.service';
 import { KeyValueStoreService } from '../src/libs/services/keyValueStore.service';
 import { MigrationService } from '../src/modules/configuration_manager/services/migration.service';
@@ -184,8 +183,7 @@ function stubAllContainers(sandbox: sinon.SinonSandbox) {
   // Stub route factories so configureRoutes() doesn't blow up
   stubAllRouteFactories(sandbox);
 
-  // Telemetry — never start the real push loop / Mongo-backed gauge refresh
-  sandbox.stub(telemetryModule, 'startTelemetry');
+  // Never start the real Mongo-backed gauge refresh
   sandbox.stub(metricsRefreshModule, 'startOrgMetricsRefresh');
   sandbox.stub(KeyValueStoreService, 'getInstance').returns({} as any);
 
@@ -415,17 +413,13 @@ describe('Application', () => {
       expect(mockSamlController.updateSamlStrategiesWithCallback.calledOnce).to.be.true;
     });
 
-    it('should start telemetry and the org metrics refresh loop', async () => {
+    it('should start the org metrics refresh loop', async () => {
       const app = new Application();
       stubAllContainers(sandbox);
       sandbox.stub(oauthProviderModule, 'registerOAuthTokenService');
 
       await app.initialize();
 
-      expect(
-        (telemetryModule.startTelemetry as sinon.SinonStub).calledOnce,
-        'startTelemetry should be called once during initialize',
-      ).to.be.true;
       expect(
         (metricsRefreshModule.startOrgMetricsRefresh as sinon.SinonStub).calledOnce,
         'startOrgMetricsRefresh should be called once during initialize',

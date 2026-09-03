@@ -31,7 +31,6 @@ from app.services.docling.docling_service import (
 )
 from app.services.messaging.config import messaging_env
 from app.services.resource_governor import ResourceGovernor
-from app.telemetry.setup import setup_telemetry
 from app.utils.llm import is_local_cpu_embedding_configured
 from app.utils.time_conversion import get_epoch_timestamp_in_ms
 
@@ -82,11 +81,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             logger.error("❌ Failed to initialize Docling service: %s", str(e))
         raise
 
-    try:
-        await telemetry.bind(config_service, logger).start()
-    except Exception as e:
-        logger.warning(f"❌ Failed to start telemetry pusher: {e}")
-
     # One governor per process, sharing the HEAVY_PARSE ceiling/adaptation
     # concept with the Parsing Service but sized from *this* container's own
     # cgroup/CPU limits (Docling typically runs in its own, differently
@@ -124,8 +118,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     except Exception:
         logger.exception("Error during resource governor shutdown")
     governor.close()
-    if telemetry.pusher is not None:
-        await telemetry.pusher.stop()
 
     # Close configuration service (stops Redis Pub/Sub subscription)
     try:
@@ -153,8 +145,6 @@ app.add_middleware(RequestContextMiddleware)
 # Mount the Docling service routes
 app.mount("/", docling_app)
 
-# Telemetry: metrics middleware + pusher (started/stopped in lifespan).
-telemetry = setup_telemetry(app, service_name="docling_service")
 
 @app.get("/health")
 async def health_check() -> JSONResponse:

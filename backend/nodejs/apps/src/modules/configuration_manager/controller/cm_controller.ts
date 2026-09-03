@@ -30,7 +30,6 @@ import {
 import { EncryptionService } from '../../../libs/encryptor/encryptor';
 import { setMetricCollectionEnabled } from '../../../libs/services/telemetry/modules/collection-metrics';
 import { normalizeOrgId } from '../../../libs/services/telemetry/identity';
-import { TelemetryService } from '../../../libs/services/telemetry/telemetry.service';
 import { loadConfigurationManagerConfig } from '../config/config';
 import { findActiveOrgById } from '../../user_management/utils/org.utils';
 
@@ -2435,10 +2434,6 @@ export const toggleMetricsCollection =
         enableMetricCollection === false || enableMetricCollection === 'false'
       );
       setMetricCollectionEnabled(normalizeOrgId(req.user?.orgId), enabled);
-
-      if (!enabled) {
-        await TelemetryService.current()?.flush();
-      }
 
       if (enableMetricCollection !== metricsCollection.enableMetricCollection) {
         metricsCollection.enableMetricCollection = enableMetricCollection;

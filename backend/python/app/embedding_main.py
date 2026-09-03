@@ -30,7 +30,6 @@ from app.config.constants.ai_models import (
     EMBEDDING_SERVER_PORT,
 )
 from app.config.providers.encrypted_store import EncryptedKeyValueStore
-from app.telemetry.setup import setup_telemetry
 from app.utils.logger import create_logger
 from app.utils.time_conversion import get_epoch_timestamp_in_ms
 
@@ -555,15 +554,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             logger=logger,
             key_value_store=EncryptedKeyValueStore(logger=logger),
         )
-        await telemetry.bind(config_service, logger).start()
     except Exception as exc:
-        logger.warning("Failed to start telemetry pusher: %s", exc)
+        logger.warning("Failed to initialize configuration service: %s", exc)
 
     yield
 
     logger.info("Shutting down embedding server")
-    if telemetry.pusher is not None:
-        await telemetry.pusher.stop()
     if config_service is not None:
         try:
             await config_service.close()
@@ -586,8 +582,6 @@ app = FastAPI(
 # Trace context — outermost.
 app.add_middleware(RequestContextMiddleware)
 
-# Telemetry: metrics middleware + pusher (started/stopped in lifespan).
-telemetry = setup_telemetry(app, service_name="embedding_service")
 
 
 @app.get("/health")

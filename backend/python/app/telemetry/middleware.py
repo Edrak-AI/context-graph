@@ -1,6 +1,6 @@
 """ASGI middleware that instruments every HTTP request with telemetry metrics.
 
-Registered once per FastAPI app (see ``setup_telemetry``), this makes collection
+Registered once per FastAPI app (Edrak fork: no longer wired — the upstream pusher was removed), this makes collection
 *default-on*: new routes are covered automatically, fixing the per-route opt-in
 drift that left the Python services entirely uninstrumented.
 """

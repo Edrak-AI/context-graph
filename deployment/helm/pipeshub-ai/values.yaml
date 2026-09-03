@@ -1,6 +1,12 @@
 replicaCount: 2
 terminationGracePeriodSeconds: 300
 
+# Deployment strategy override. Default (empty) is RollingUpdate maxSurge=1/maxUnavailable=0.
+# With replicaCount=1 and a ReadWriteOnce persistence volume, use `type: Recreate`: the rolling
+# strategy keeps the old pod (and its volume attachment) alive until the new pod is Ready, and the
+# new pod cannot attach the volume — a permanent Multi-Attach deadlock.
+deploymentStrategy: {}
+
 # Global configuration
 global:
   # Image registry and pull policy
@@ -144,6 +150,13 @@ resources:
     cpu: 4
     memory: 8Gi
   # For small clusters (e.g. kind), use lower requests so the pod can schedule: --set resources.requests.cpu=500m --set resources.requests.memory=1Gi
+
+# Additional environment variables for the main container (list of k8s EnvVar).
+# Example:
+# extraEnv:
+#   - name: METRICS_SERVER_URL
+#     value: "http://127.0.0.1:9/disabled"
+extraEnv: []
 
 # Additional volumes for app deployment
 # Example:

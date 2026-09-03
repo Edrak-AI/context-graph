@@ -47,7 +47,6 @@ from app.services.messaging.kafka.utils.utils import KafkaUtils
 from app.services.messaging.messaging_factory import MessagingFactory
 from app.services.messaging.utils import MessagingUtils
 from app.services.resource_governor import ResourceGovernor
-from app.telemetry.setup import setup_telemetry
 from app.utils.llm import is_local_cpu_embedding_configured
 from app.utils.time_conversion import get_epoch_timestamp_in_ms
 
@@ -974,11 +973,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     logger = app.container.logger()
     logger.info("🚀 Starting application")
 
-    try:
-        await telemetry.bind(app_container.config_service(), logger).start()
-    except Exception as e:
-        logger.warning(f"❌ Failed to start telemetry pusher: {e}")
-
     graph_provider = getattr(app_container, '_graph_provider', None)
     if not graph_provider:
         # Fallback: if not set during initialization, resolve it now
@@ -1062,17 +1056,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     yield
     # Shutdown
     logger.info("🔄 Shutting down application")
-    if telemetry.pusher is not None:
-        try:
-            await telemetry.pusher.stop()
-        except asyncio.CancelledError:
-            # Let a genuine shutdown-timeout cancellation propagate instead
-            # of swallowing it here — otherwise the caller (ASGI server)
-            # can't tell shutdown didn't finish, and we'd still attempt the
-            # awaits below on a cancelled task.
-            raise
-        except Exception as e:
-            logger.warning(f"❌ Error stopping telemetry pusher: {e}")
 
     # Cancel background recovery if it's still running.
     recovery_task = getattr(app.state, "recovery_task", None)
@@ -1184,8 +1167,6 @@ app = FastAPI(
 
 # Trace context — outermost.
 app.add_middleware(RequestContextMiddleware)
-# Telemetry: metrics middleware + pusher (started/stopped in lifespan).
-telemetry = setup_telemetry(app, service_name="indexing_service")
 
 
 @app.get("/health")
