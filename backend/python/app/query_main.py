@@ -39,6 +39,9 @@ from app.services.messaging.utils import MessagingUtils
 from app.utils.llm_api_mode_store import get_llm_api_mode_store
 from app.utils.time_conversion import get_epoch_timestamp_in_ms
 from app.utils.worker_scaling import set_process_worker_count
+from app.utils.sentry import init_sentry
+
+init_sentry("query_service")  # no-op unless SENTRY_DSN is set
 
 container = QueryAppContainer.init("query_service")
 

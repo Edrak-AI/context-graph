@@ -1,9 +1,10 @@
 import 'reflect-metadata';
 import { config } from 'dotenv';
-import { Logger } from './libs/services/logger.service';
 
-// Loads environment variables
+// Loads environment variables (before Sentry so SENTRY_DSN from .env is honoured)
 config();
+import './instrument';
+import { Logger } from './libs/services/logger.service';
 import { Application } from './app';
 
 const app = new Application();

@@ -294,6 +294,7 @@ dependencies = [
     "lingua-language-detector==2.2.0",
     "qdrant-client==1.13.1",
     "redis==5.2.1",
+    "sentry-sdk[fastapi]==2.68.1",
     "requests-toolbelt==1.0.0",
     "requests==2.33.0",
     "selectolax>=0.3.21",

@@ -569,6 +569,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
 from app.api.middlewares.request_context import RequestContextMiddleware
 from app.utils.request_context import set_service_suffix
+from app.utils.sentry import init_sentry
+
+init_sentry("embedding_service")  # no-op unless SENTRY_DSN is set
 
 set_service_suffix("-es")
 

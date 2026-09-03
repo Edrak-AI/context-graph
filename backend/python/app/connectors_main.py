@@ -62,6 +62,9 @@ from app.services.messaging.messaging_factory import MessagingFactory
 from app.services.messaging.utils import MessagingUtils
 from app.telemetry.modules.connector_metrics import set_connector_active
 from app.utils.time_conversion import get_epoch_timestamp_in_ms
+from app.utils.sentry import init_sentry
+
+init_sentry("connector_service")  # no-op unless SENTRY_DSN is set
 
 container = ConnectorAppContainer.init("connector_service")
 
