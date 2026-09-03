@@ -1,0 +1,12 @@
+# Upload context for `gcloud builds submit`. Deliberately NOT derived from .gitignore: its `lib/`
+# pattern (Python build artifacts) would also drop frontend/lib/, which the Next.js build needs.
+.git
+.gitignore
+.gcloudignore
+**/node_modules
+**/.next
+**/.venv
+**/__pycache__
+**/*.pyc
+frontend/out
+deployment/helm/pipeshub-ai/charts
