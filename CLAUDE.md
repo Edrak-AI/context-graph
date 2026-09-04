@@ -28,10 +28,13 @@ Edrak additions (keep them working when merging upstream):
   by email, restores soft-deleted users, returns `{userId, orgId, role, created}`.
 - Telemetry phone-home removal and Helm `extraEnv` / `deploymentStrategy` passthrough
   (`deployment/helm/pipeshub-ai`), used by `../platform-infra`.
-- Planned, not done: single-org guard in `org.controller.ts` behind an env flag (multi-org).
+- `libs/enums/token-scopes.enum.ts` `ORG_PROVISION = 'org:provision'`; `schema/org.schema.ts` `externalId`
+  (sparse index); `routes/org.routes.ts` + `controller/org.controller.ts` `POST /api/v1/org/internal/provision`
+  (scoped token), `provisionExternalOrg()`: idempotent by `externalId`, creates org + admin user + default
+  groups + auth config, no credentials/mail — one CGraph org per Edrak org. Public single-org signup guard unchanged.
 
 Deployment facts: stage runs on GKE with **Neo4j** as the graph store, Redis as KV + message
-broker, image built by `../platform-infra/cloudbuild/build-pipeshub.yaml` (tag
+broker, image built by `../platform-infra/cloudbuild/build-cgraph.yaml` (`edrak/cgraph`) (tag
 `<upstream short sha>-edrak<n>`). `FRONTEND_PUBLIC_URL` must be the edrak-ai origin because
 connector OAuth callbacks land on edrak-ai's `/connectors/oauth/callback/<slug>`.
 
