@@ -36,6 +36,7 @@ import {
   BadGatewayError,
   GatewayTimeoutError,
   UnprocessableEntityError,
+  TooManyRequestsError,
 } from '../../../libs/errors/http.errors';
 import {
   AICommandOptions,
@@ -411,6 +412,9 @@ export const hydrateScopedRequestAsUser = async (
           return new NotFoundError(errorDetail);
         case 422:
           return new UnprocessableEntityError(errorDetail);
+        case 429:
+          // e.g. Edrak spend gate: body { error: 'spend_limit', reason, errorKey } kept as metadata
+          return new TooManyRequestsError(errorDetail, data);
         case 500:
           return new InternalServerError(errorDetail);
         case 502:
@@ -444,6 +448,9 @@ export const hydrateScopedRequestAsUser = async (
           return new NotFoundError(errorDetail);
         case 422:
           return new UnprocessableEntityError(errorDetail);
+        case 429:
+          // e.g. Edrak spend gate: body { error: 'spend_limit', reason, errorKey } kept as metadata
+          return new TooManyRequestsError(errorDetail, data);
         case 500:
           return new InternalServerError(errorDetail);
         case 502:
@@ -1309,7 +1316,10 @@ export const streamChat =
       }
 
       if (!res.headersSent) {
-        res.writeHead(500, { 'Content-Type': 'text/event-stream' });
+        res.writeHead(
+          typeof error?.statusCode === 'number' && error.statusCode >= 400 ? error.statusCode : 500,
+          { 'Content-Type': 'text/event-stream' },
+        );
       }
       logger.error('Error in streamChat', {
         requestId,
@@ -2676,7 +2686,10 @@ export const addMessageStream =
       }
 
       if (!res.headersSent) {
-        res.writeHead(500, { 'Content-Type': 'text/event-stream' });
+        res.writeHead(
+          typeof error?.statusCode === 'number' && error.statusCode >= 400 ? error.statusCode : 500,
+          { 'Content-Type': 'text/event-stream' },
+        );
       }
 
       const errorEvent = isAGUI(protocol)
@@ -3904,7 +3917,10 @@ async function regenerateAnswersInternal(
     });
 
     if (!res.headersSent) {
-      res.writeHead(500, { 'Content-Type': 'text/event-stream' });
+      res.writeHead(
+        typeof error?.statusCode === 'number' && error.statusCode >= 400 ? error.statusCode : 500,
+        { 'Content-Type': 'text/event-stream' },
+      );
     }
 
     try {
@@ -6258,7 +6274,10 @@ export const deleteAgent =
       }
 
       if (!res.headersSent) {
-        res.writeHead(500, { 'Content-Type': 'text/event-stream' });
+        res.writeHead(
+          typeof error?.statusCode === 'number' && error.statusCode >= 400 ? error.statusCode : 500,
+          { 'Content-Type': 'text/event-stream' },
+        );
       }
 
       const errorEvent = isAGUI(protocol)
@@ -7531,7 +7550,10 @@ export const addMessageStreamToAgentConversation =
       }
 
       if (!res.headersSent) {
-        res.writeHead(500, { 'Content-Type': 'text/event-stream' });
+        res.writeHead(
+          typeof error?.statusCode === 'number' && error.statusCode >= 400 ? error.statusCode : 500,
+          { 'Content-Type': 'text/event-stream' },
+        );
       }
 
       const errorEvent = isAGUI(protocol)

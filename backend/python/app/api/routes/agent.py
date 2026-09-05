@@ -43,6 +43,7 @@ from app.modules.transformers.blob_storage import (
 from app.services.graph_db.interface.graph_db_provider import IGraphDBProvider
 from app.telemetry.event_buffer import record_event
 from app.telemetry.identity import domain_from_email
+from app.utils.edrak_spend_gate import check_spend_allowed  # Edrak: pre-dispatch spend gate
 from app.utils.attachment_utils import (
     resolve_attachments,  # noqa: F401 - re-exported, see above
 )
@@ -3161,6 +3162,12 @@ async def chat_stream(request: Request, agent_id: str) -> StreamingResponse:
             "has_tools": bool(chat_query.tools),
             "streaming": True,
         })
+
+        # Edrak: pre-dispatch spend gate (see chatbot.askAIStream); the non-streaming `chat()`
+        # wrapper passes this JSONResponse straight through.
+        spend_gate = await check_spend_allowed(user_context["userId"], org_key, config_service)
+        if not spend_gate.allowed:
+            return JSONResponse(status_code=429, content=spend_gate.http_detail())
 
         # `chat_query.tools` is a FILTER over the agent's configured toolsets
         # (see the `None` "use every configured toolset" branch further

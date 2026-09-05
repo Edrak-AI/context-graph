@@ -9,7 +9,7 @@ from uuid import uuid4
 
 from dependency_injector.wiring import inject
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from io import BytesIO
 
 import pdfplumber
@@ -39,6 +39,7 @@ from app.modules.transformers.sink_orchestrator import SinkOrchestrator
 from app.modules.transformers.transformer import TransformContext
 from app.services.graph_db.interface.graph_db_provider import IGraphDBProvider
 from app.utils.aimodels import get_generator_model_async
+from app.utils.edrak_spend_gate import check_spend_allowed  # Edrak: pre-dispatch spend gate
 from app.utils.attachment_mime_types import (
     DELIMITED_MIME_TYPES,
     DOCX_MIME_TYPES,
@@ -1074,6 +1075,12 @@ async def askAIStream(
         "mode": query_info.chatMode,
         "search_type": _search_type,
     })
+
+    # Edrak: ask edrak-ai whether this user still has budget before the run starts (no-op
+    # without EDRAK_USAGE_URL; fails open on edrak-ai errors, closed only on an explicit denial).
+    spend_gate = await check_spend_allowed(_chat_user.get("userId"), _chat_user.get("orgId"), config_service)
+    if not spend_gate.allowed:
+        return JSONResponse(status_code=429, content=spend_gate.http_detail())
 
     stream = _generate_chat_stream_via_agent_loop(
         request=request,
