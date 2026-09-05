@@ -60,6 +60,9 @@ from app.connectors.sources.google_cloud_storage.connector import GCSConnector
 from app.connectors.sources.linear.connector import LinearConnector
 from app.connectors.sources.localKB.connector import KnowledgeBaseConnector
 from app.connectors.sources.microsoft.onedrive.connector import OneDriveConnector
+from app.connectors.sources.microsoft.dynamics365.connector import (
+    MicrosoftDynamics365Connector,
+)
 from app.connectors.sources.microsoft.outlook.connector import OutlookConnector
 from app.connectors.sources.microsoft.outlook_individual.connector import (
     OutlookIndividualConnector,
@@ -98,6 +101,7 @@ class ConnectorFactory:
     _connector_registry: dict[str, type[BaseConnector]] = {
         "onedrive": OneDriveConnector,
         "sharepointonline": SharePointConnector,
+        "microsoftdynamics365": MicrosoftDynamics365Connector,
         "outlook": OutlookConnector,
         "outlookpersonal": OutlookIndividualConnector,
         "confluence": ConfluenceConnector,

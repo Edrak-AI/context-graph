@@ -86,6 +86,7 @@ class RecordGroupType(str, Enum):
     SQL_DATABASE = "SQL_DATABASE"
     SQL_NAMESPACE = "SQL_NAMESPACE"
     STAGE = "STAGE"
+    CRM_ENTITY = "CRM_ENTITY"  # one group per CRM table (Dynamics 365 accounts, contacts, ...)
 
 class RecordType(str, Enum):
     FILE = "FILE"

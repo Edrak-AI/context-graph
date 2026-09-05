@@ -3705,6 +3705,7 @@ components:
         - "OUTLOOK PERSONAL"
         - "OUTLOOK CALENDAR"
         - "MICROSOFT TEAMS"
+        - "MICROSOFT DYNAMICS 365"
         - "NOTION"
         - "NOTION PERSONAL"
         - "SLACK"

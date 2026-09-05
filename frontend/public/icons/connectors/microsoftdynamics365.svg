@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48" role="img" aria-label="Microsoft Dynamics 365">
+  <defs>
+    <linearGradient id="d365a" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#0B53CE"/>
+      <stop offset="1" stop-color="#7252AA"/>
+    </linearGradient>
+    <linearGradient id="d365b" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2266E3"/>
+      <stop offset="1" stop-color="#AE7FE2"/>
+    </linearGradient>
+  </defs>
+  <path d="M10 4l28 12-28 12z" fill="url(#d365a)"/>
+  <path d="M10 44V20l28-4z" fill="url(#d365b)" opacity="0.95"/>
+  <path d="M10 44l28-16v-12L10 28z" fill="#1490DF" opacity="0.85"/>
+</svg>
