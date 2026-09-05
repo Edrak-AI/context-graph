@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
 
-from app.config.constants.ai_models import AzureDocIntelligenceModel, OCRProvider
+from app.config.constants.ai_models import AzureDocIntelligenceModel, OCRProvider, MARKDOWN_OCR_PROVIDERS
 from app.config.constants.arangodb import (
     CollectionNames,
     Connectors,
@@ -404,11 +404,12 @@ class Processor:
                 provider = config["provider"]
                 self.logger.info(f"🔧 Checking OCR provider: {provider}")
 
-                if provider == OCRProvider.VLM_OCR.value:
-                    self.logger.debug("🤖 Setting up VLM OCR handler")
+                # Edrak: edrakOCR (Tesseract via edrak-ai) and vlmOCR share the markdown result shape.
+                if provider in MARKDOWN_OCR_PROVIDERS:
+                    self.logger.debug(f"🤖 Setting up {provider} handler")
                     handler = OCRHandler(
                         self.logger,
-                        OCRProvider.VLM_OCR.value,
+                        provider,
                         config=self.config_service
                     )
                     break
@@ -444,9 +445,9 @@ class Processor:
 
 
 
-            if provider == OCRProvider.VLM_OCR.value:
+            if provider in MARKDOWN_OCR_PROVIDERS:
                 pages = ocr_result.get("pages", [])
-                self.logger.info(f"📄 Processing {len(pages)} pages from VLM OCR")
+                self.logger.info(f"📄 Processing {len(pages)} pages from {provider}")
 
                 # Phase 1: Parse all pages with Docling (no LLM calls yet)
                 all_conv_results = []

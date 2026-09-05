@@ -32,6 +32,15 @@ Edrak additions (keep them working when merging upstream):
   (sparse index); `routes/org.routes.ts` + `controller/org.controller.ts` `POST /api/v1/org/internal/provision`
   (scoped token), `provisionExternalOrg()`: idempotent by `externalId`, creates org + admin user + default
   groups + auth config, no credentials/mail — one CGraph org per Edrak org. Public single-org signup guard unchanged.
+- `Dockerfile` runtime stage tail — non-root patch: uid 10001 owns `/app` and `/root` (caches stay at their
+  upstream paths, `HOME=/root`), `USER 10001`. Pairs with platform-infra `cgraph_run_as_non_root` (image ≥ edrak6).
+- OCR provider `edrakOCR` (`config/constants/ai_models.py` `OCRProvider.EDRAK_OCR`, `MARKDOWN_OCR_PROVIDERS`;
+  `parsers/pdf/edrak_ocr_strategy.py`; branches in `ocr_handler.py`, `events/processor.py`,
+  `services/parsing/providers/ocr_parser.py`): Tesseract ara+eng through edrak-ai `POST /api/internal/ocr`
+  (env `EDRAK_OCR_URL`, scoped JWT `edrak:ocr`). Same per-page markdown result as `vlmOCR`.
+- `utils/edrak_usage.py` — `report_usage(...)` posts LLM token usage to edrak-ai `POST /api/internal/cgraph-usage`
+  (env `EDRAK_USAGE_URL`, scoped JWT `edrak:usage`, fire-and-forget, inert when unset). Wired from the agent-loop
+  transport via the optional `usage_reporter` callback (see `agents/agent_loop/factory.py`).
 
 Deployment facts: stage runs on GKE with **Neo4j** as the graph store, Redis as KV + message
 broker, image built by `../platform-infra/cloudbuild/build-cgraph.yaml` (`edrak/cgraph`) (tag

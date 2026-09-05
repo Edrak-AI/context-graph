@@ -184,8 +184,10 @@ def _register_final_answer_if_enabled(tool_registry: "ToolRegistry") -> None:
     if final_answer_enabled():
         tool_registry.register_tool(FinalAnswerTool())
 from app.modules.agents.qna.tool_system import code_execution_enabled
+from app.utils.edrak_usage import report_usage  # Edrak: usage ledger hook
 
 if TYPE_CHECKING:
+    from app.agent_loop_lib.core.responses import TokenUsage
     from langchain_core.language_models.chat_models import BaseChatModel
 
     from app.agent_loop_lib.core.types import Goal
@@ -303,13 +305,29 @@ class PipesHubAgentFactory:
             provider=context.llm_provider, is_multimodal=context.is_multimodal_llm,
         ).max_images_per_request
 
+
+        # Edrak: forward every completion's token usage to edrak-ai's ledger (no-op without
+        # EDRAK_USAGE_URL). Bound here because only the request context knows org/user.
+        def _edrak_usage_reporter(usage: "TokenUsage", model: str) -> None:
+            report_usage(
+                context.config_service,
+                org_id=context.org_id,
+                user_id=context.user_id,
+                model=model,
+                provider=context.llm_provider,
+                input_tokens=usage.input_tokens,
+                output_tokens=usage.output_tokens,
+                kind="agent",
+                request_id=None,
+            )
+
         transport_registry = TransportRegistry()
         transport_registry.register(
             "langchain",
             traced_transport_factory(
                 lambda: LangChainTransport(
                     llm, model_name=model_name, opik_project_name=opik_project_name, model_key=model_key,
-                    max_images_per_request=image_cap,
+                    max_images_per_request=image_cap, usage_reporter=_edrak_usage_reporter,
                 ),
                 opik_active=opik_active,
                 project_name=opik_project_name,
@@ -345,7 +363,7 @@ class PipesHubAgentFactory:
             return LangChainTransport(
                 llm, model_name=model_name,
                 opik_project_name=opik_project_name, model_key=model_key,
-                max_images_per_request=image_cap,
+                max_images_per_request=image_cap, usage_reporter=_edrak_usage_reporter,
             )
 
         transport_registry.register(

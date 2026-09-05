@@ -10,6 +10,13 @@ EMBEDDING_SERVER_REQUEST_TIMEOUT_SECONDS = 600.0
 class OCRProvider(Enum):
     AZURE_DI = "azureDI"
     VLM_OCR = "vlmOCR"
+    # Edrak: Tesseract via edrak-ai's OCR worker; yields the same per-page markdown shape as VLM_OCR.
+    EDRAK_OCR = "edrakOCR"
+
+
+# OCR providers whose result is {"pages": [{"page_number", "markdown", ...}]} — everything downstream
+# of the handler treats them identically (indexing processor, OCR parser).
+MARKDOWN_OCR_PROVIDERS = frozenset({OCRProvider.VLM_OCR.value, OCRProvider.EDRAK_OCR.value})
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 

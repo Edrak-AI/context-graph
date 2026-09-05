@@ -430,6 +430,18 @@ EOF
 
 RUN chmod +x /app/process_monitor.sh
 
+# --- Edrak: run as a non-root user (uid 10001) ---------------------------------------------------
+# Upstream paths stay exactly as they are (/app, /root/.cache/{huggingface,fastembed,ms-playwright},
+# /root/nltk_data) so this remains a small mergeable patch: instead of relocating the caches, they are
+# handed to the runtime user and HOME stays /root so HF/NLTK/Playwright resolve them unchanged.
+# process_monitor.sh writes /app/process_monitor.log, hence the chown of /app.
+RUN groupadd -g 10001 cgraph \
+    && useradd -u 10001 -g 10001 -d /root -M -s /usr/sbin/nologin cgraph \
+    && chown -R 10001:10001 /app /root \
+    && chmod 755 /root
+ENV HOME=/root
+USER 10001
+
 EXPOSE 3000 8002 8092 8093
 
 CMD ["/app/process_monitor.sh"]

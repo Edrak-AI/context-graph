@@ -110,7 +110,7 @@ class OCRHandler:
         self._ensure_supported(strategy_type)
 
     def _ensure_supported(self, strategy_type: str) -> None:
-        if strategy_type == OCRProvider.VLM_OCR.value:
+        if strategy_type in (OCRProvider.VLM_OCR.value, OCRProvider.EDRAK_OCR.value):
             return
         self.logger.error(f"❌ Unsupported OCR strategy: {strategy_type}")
         raise DocumentProcessingError(
@@ -122,6 +122,12 @@ class OCRHandler:
         """Factory method to create appropriate OCR strategy"""
         self.logger.debug(f"🏭 Creating OCR strategy: {strategy_type}")
         self._ensure_supported(strategy_type)
+
+        if strategy_type == OCRProvider.EDRAK_OCR.value:
+            self.logger.debug("🧾 Creating Edrak (Tesseract) OCR strategy")
+            from app.modules.parsers.pdf.edrak_ocr_strategy import EdrakOCRStrategy
+
+            return EdrakOCRStrategy(logger=self.logger, config=kwargs.get("config"))
 
         self.logger.debug("🤖 Creating VLM OCR strategy")
         from app.modules.parsers.pdf.vlm_ocr_strategy import (

@@ -39,13 +39,14 @@ class OCRParser:
         record_name: str,
         config: dict[str, Any] | None = None,
     ) -> ParseResult:
-        from app.config.constants.ai_models import OCRProvider
+        from app.config.constants.ai_models import MARKDOWN_OCR_PROVIDERS
 
         ocr_result = await self._handler.process_document(content)
 
         provider_name = getattr(self._handler, "provider", "")
 
-        if provider_name == OCRProvider.VLM_OCR.value:
+        # vlmOCR and Edrak's edrakOCR both yield per-page markdown.
+        if provider_name in MARKDOWN_OCR_PROVIDERS:
             block_containers = await self._process_vlm_ocr_result(ocr_result, record_name)
         else:
             raise ParseError(

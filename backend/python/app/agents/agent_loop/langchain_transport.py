@@ -31,7 +31,7 @@ not a replacement for, `OpikTracingTransport`'s own summary span.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 from langchain_core.messages import AIMessage
 
@@ -224,9 +224,13 @@ class LangChainTransport(LLMTransport):
         opik_project_name: str | None = None,
         model_key: str | None = None,
         max_images_per_request: int | None = None,
+        usage_reporter: "Callable[[TokenUsage, str], None] | None" = None,
     ) -> None:
         self._llm = chat_model
         self._model = model_name
+        # Edrak: optional hook called with (usage, resolved model) after every completion so token
+        # usage can be forwarded to edrak-ai's ledger (utils/edrak_usage.py). None → upstream behaviour.
+        self._usage_reporter = usage_reporter
         # Final enforcement of this model's image cap (see `image_guard`).
         # `None` means "not wired by this caller" and leaves the messages
         # untouched -- selection at the source already bounded them.
@@ -619,12 +623,23 @@ class LangChainTransport(LLMTransport):
             else self._stop_reason_from(ai_message)
         )
         self._log_turn_outcome(tools, ai_message, stop_reason)
+        usage = token_usage_from_ai_message(ai_message)
+        resolved = self._resolve_model_name(model)
+        self._report_usage(usage, resolved)
         return ModelResponse(
             message=assistant_message,
-            usage=token_usage_from_ai_message(ai_message),
+            usage=usage,
             stop_reason=stop_reason,
-            model=self._resolve_model_name(model),
+            model=resolved,
         )
+
+    def _report_usage(self, usage: TokenUsage, model: str) -> None:
+        if self._usage_reporter is None:
+            return
+        try:
+            self._usage_reporter(usage, model)
+        except Exception:  # noqa: BLE001 — accounting must never affect the turn
+            logger.debug("usage_reporter raised", exc_info=True)
 
     async def complete_structured(
         self,
@@ -888,6 +903,7 @@ class LangChainTransport(LLMTransport):
             else self._stop_reason_from(final_ai_message)
         )
         self._log_turn_outcome(tools, final_ai_message, stop_reason)
+        self._report_usage(usage, self._resolve_model_name(model))
         yield StreamCompleteEvent(
             response=ModelResponse(
                 message=assistant_message,
