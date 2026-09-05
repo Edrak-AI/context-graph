@@ -3741,6 +3741,7 @@ components:
         - "SNOWFLAKE"
         - "POSTGRESQL"
         - "MARIADB"
+        - "SAP"
         - "UNKNOWN"
         - "RSS"
         - "LOCAL_FS"

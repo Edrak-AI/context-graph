@@ -96,6 +96,7 @@ from app.connectors.sources.github_teams.connector import GitHubTeamsConnector
 from app.connectors.sources.snowflake.connector import SnowflakeConnector
 from app.connectors.sources.postgres.connector import PostgreSQLConnector
 from app.connectors.sources.mariadb.connector import MariaDBConnector
+from app.connectors.sources.sap.connector import SapConnector
 
 class ConnectorFactory:
     """Generic factory for creating and managing connectors"""
@@ -146,6 +147,7 @@ class ConnectorFactory:
         "gitlabpersonal": GitLabPersonalConnector,
         "githubteams": GitHubTeamsConnector,
         "mariadb": MariaDBConnector,
+        "sap": SapConnector,
         "slackworkspace": SlackConnector,
         "slack": SlackIndividualConnector,
     }

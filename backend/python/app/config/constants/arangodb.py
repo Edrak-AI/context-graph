@@ -81,6 +81,7 @@ class Connectors(Enum):
     SNOWFLAKE = "SNOWFLAKE"
     POSTGRESQL = "POSTGRESQL"
     MARIADB = "MARIADB"
+    SAP = "SAP"
 
     UNKNOWN = "UNKNOWN"
 
@@ -137,6 +138,7 @@ class AppGroups(Enum):
     SNOWFLAKE = "Snowflake"
     POSTGRESQL = "PostgreSQL"
     MARIADB = "MariaDB"
+    SAP = "SAP"
 
 class OriginTypes(Enum):
     CONNECTOR = "CONNECTOR"

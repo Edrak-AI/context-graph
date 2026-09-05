@@ -97,11 +97,11 @@ describe('libs/types/connector.types', () => {
       expect(ConnectorId.LOCAL_FS).to.equal('localfs')
     })
 
-    it('should have exactly 22 connector IDs', () => {
+    it('should have exactly 23 connector IDs', () => {
       const values = Object.values(ConnectorId).filter(
         (v) => typeof v === 'string',
       )
-      expect(values).to.have.lengthOf(22)
+      expect(values).to.have.lengthOf(23)
     })
   })
 
@@ -126,11 +126,11 @@ describe('libs/types/connector.types', () => {
       expect(ConnectorNames.LOCAL_FS).to.equal('Local FS')
     })
 
-    it('should have exactly 22 connector names', () => {
+    it('should have exactly 23 connector names', () => {
       const values = Object.values(ConnectorNames).filter(
         (v) => typeof v === 'string',
       )
-      expect(values).to.have.lengthOf(22)
+      expect(values).to.have.lengthOf(23)
     })
   })
 
