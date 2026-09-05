@@ -70,6 +70,9 @@ from app.connectors.sources.microsoft.outlook_individual.connector import (
 from app.connectors.sources.microsoft.sharepoint_online.connector import (
     SharePointConnector,
 )
+from app.connectors.sources.microsoft.teams.connector import (
+    MicrosoftTeamsConnector,
+)
 from app.connectors.sources.minio.connector import MinIOConnector
 from app.connectors.sources.nextcloud.connector import NextcloudConnector
 from app.connectors.sources.notion.connector import NotionConnector
@@ -102,6 +105,7 @@ class ConnectorFactory:
         "onedrive": OneDriveConnector,
         "sharepointonline": SharePointConnector,
         "microsoftdynamics365": MicrosoftDynamics365Connector,
+        "microsoftteams": MicrosoftTeamsConnector,
         "outlook": OutlookConnector,
         "outlookpersonal": OutlookIndividualConnector,
         "confluence": ConfluenceConnector,

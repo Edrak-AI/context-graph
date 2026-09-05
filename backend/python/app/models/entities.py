@@ -87,6 +87,7 @@ class RecordGroupType(str, Enum):
     SQL_NAMESPACE = "SQL_NAMESPACE"
     STAGE = "STAGE"
     CRM_ENTITY = "CRM_ENTITY"  # one group per CRM table (Dynamics 365 accounts, contacts, ...)
+    TEAMS_CHANNEL = "TEAMS_CHANNEL"  # one group per Microsoft Teams channel (and the "Teams chats" group)
 
 class RecordType(str, Enum):
     FILE = "FILE"
