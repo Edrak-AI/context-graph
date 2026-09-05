@@ -99,6 +99,8 @@ REQUIRED_APPLICATION_PERMISSIONS: tuple[str, ...] = (
 )
 CHAT_APPLICATION_PERMISSIONS: tuple[str, ...] = ("Chat.Read.All",)
 PROTECTED_API_PERMISSIONS: tuple[str, ...] = ("ChannelMessage.Read.All", "Chat.Read.All")
+# Personal scope (delegated OAuth, the signed-in user's own chats only). Not protected APIs.
+PERSONAL_DELEGATED_PERMISSIONS: tuple[str, ...] = ("Chat.Read", "User.Read", "offline_access")
 
 # Filter keys (sync filters)
 TEAMS_FILTER_KEY = "teams"
@@ -268,6 +270,11 @@ def chat_messages_url(chat_id: str, since_ms: Optional[int] = None, top: int = C
 def user_chats_url(user_id: str) -> str:
     """App-only Graph cannot list ``/chats`` tenant-wide; chats are discovered per user."""
     return f"users/{quote(user_id)}/chats?$expand=members&$top={CHATS_PAGE_SIZE}"
+
+
+def me_chats_url() -> str:
+    """Personal scope: the signed-in user's chats through the delegated token (``Chat.Read``)."""
+    return f"me/chats?$expand=members&$top={CHATS_PAGE_SIZE}"
 
 
 # ---------------------------------------------------------------------------
@@ -850,6 +857,16 @@ def chat_grants(members: Iterable[Member]) -> list[PermissionGrant]:
         seen.add(member.email)
         grants.append(PermissionGrant(GrantEntity.USER, GrantRole.READER, email=member.email, reason="chat participant"))
     return grants
+
+
+def personal_chat_grants(creator_email: Optional[str]) -> list[PermissionGrant]:
+    """Personal scope: the connector creator is the only READER of every chat record
+    (and of the chats record group); participants are never granted anything.
+    Empty when the creator email is unknown so the caller fails closed."""
+    email = _clean_email(creator_email)
+    if not email:
+        return []
+    return [PermissionGrant(GrantEntity.USER, GrantRole.READER, email=email, reason="personal connector creator")]
 
 
 # ---------------------------------------------------------------------------

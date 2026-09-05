@@ -18,6 +18,14 @@ Application permissions (admin consent): see
 ``ChannelMessage.Read.All`` and ``Chat.Read.All`` are Microsoft **protected
 APIs** — without Microsoft's approval Graph returns 403 and the connector logs
 and skips the channel / chat.
+
+Personal scope (``scope=personal``, ``AuthType.OAUTH``): the member signs in with
+their own Microsoft account (delegated ``Chat.Read`` — not a protected API) and
+only **their 1:1 / group chats** (``/me/chats``) are indexed; teams, channels,
+directory users and groups are skipped and every record is READER for the
+connector creator alone (``common.personal_scope``).  The bearer token comes
+from the instance config through ``common.delegated_auth.DelegatedTokenProvider``
+and is refreshed by the platform ``TokenRefreshService``.
 """
 
 from __future__ import annotations
@@ -45,7 +53,11 @@ from app.connectors.core.base.data_processor.data_source_entities_processor impo
 from app.connectors.core.base.data_store.data_store import DataStoreProvider
 from app.connectors.core.base.sync_point.sync_point import SyncDataPointType, SyncPoint
 from app.connectors.core.constants import CONNECTOR_EMAIL_IDENTITY_INFO, IconPaths
-from app.connectors.core.registry.auth_builder import AuthBuilder, AuthType
+from app.connectors.core.registry.auth_builder import (
+    AuthBuilder,
+    AuthType,
+    OAuthScopeConfig,
+)
 from app.connectors.core.registry.connector_builder import (
     AuthField,
     CommonFields,
@@ -65,7 +77,19 @@ from app.connectors.core.registry.filters import (
     load_connector_filters,
 )
 from app.connectors.sources.microsoft.common.apps import MicrosoftTeamsApp
+from app.connectors.sources.microsoft.common.constants import (
+    MicrosoftGraphScopes,
+    MicrosoftOAuth,
+    MicrosoftOAuthParams,
+)
+from app.connectors.sources.microsoft.common.delegated_auth import (
+    DelegatedTokenProvider,
+)
 from app.connectors.sources.microsoft.common.msgraph_client import MSGraphClient
+from app.connectors.sources.microsoft.common.personal_scope import (
+    is_personal_scope,
+    signed_in_account_matches_creator,
+)
 from app.connectors.sources.microsoft.teams.mapping import (
     CHAT_APPLICATION_PERMISSIONS,
     CHAT_ID_PREFIX,
@@ -78,6 +102,7 @@ from app.connectors.sources.microsoft.teams.mapping import (
     GRAPH_SCOPE,
     INCLUDE_CHATS_FILTER_KEY,
     INCLUDE_PRIVATE_CHANNELS_FILTER_KEY,
+    PERSONAL_DELEGATED_PERMISSIONS,
     PROTECTED_API_PERMISSIONS,
     REQUIRED_APPLICATION_PERMISSIONS,
     TEAMS_FILTER_KEY,
@@ -109,11 +134,13 @@ from app.connectors.sources.microsoft.teams.mapping import (
     is_delta_unsupported_status,
     is_private_or_shared_channel,
     lookback_start_ms,
+    me_chats_url,
     message_replies_url,
     parse_conversation_members,
     parse_delta_page,
     parse_graph_timestamp,
     parse_group_members,
+    personal_chat_grants,
     read_delta_link,
     read_last_sync_ms,
     render_chat_markdown,
@@ -182,8 +209,9 @@ class _GraphForbidden(Exception):
         "permissions derived from team and channel membership"
     )\
     .with_categories(["Communication", "Collaboration"])\
-    .with_scopes([ConnectorScope.TEAM.value])\
+    .with_scopes([ConnectorScope.PERSONAL.value, ConnectorScope.TEAM.value])\
     .with_auth([
+        # team scope: app-only Entra app + admin consent (first entry = default auth type)
         AuthBuilder.type(AuthType.OAUTH_ADMIN_CONSENT).fields([
             AuthField(
                 name="clientId",
@@ -219,7 +247,38 @@ class _GraphForbidden(Exception):
                 required=True,
                 default_value=False,
             ),
-        ])
+        ]),
+        # personal scope: the member signs in with their own account; chats only.
+        # Client id / secret come from the org's shared OAuth app (``/services/oauth/microsoftteams``,
+        # referenced by ``auth.oauthConfigId``), exactly like Outlook Personal.
+        AuthBuilder.type(AuthType.OAUTH).oauth(
+            connector_name="Microsoft Teams",
+            authorize_url=MicrosoftOAuth.authorize_url(),
+            token_url=MicrosoftOAuth.token_url(),
+            redirect_uri="connectors/oauth/callback/MicrosoftTeams",
+            scopes=OAuthScopeConfig(
+                personal_sync=[
+                    MicrosoftGraphScopes.CHAT_READ,
+                    MicrosoftGraphScopes.USER_READ,
+                    MicrosoftGraphScopes.OFFLINE_ACCESS,
+                ],
+                team_sync=[],
+                agent=[],
+            ),
+            fields=[
+                CommonFields.tenant_id("Entra ID App Registration"),
+                CommonFields.client_id("Entra ID App Registration"),
+                CommonFields.client_secret("Entra ID App Registration"),
+            ],
+            icon_path=IconPaths.connector_icon(Connectors.MICROSOFT_TEAMS.value),
+            app_group="Microsoft 365",
+            app_description="OAuth application for reading a user's own Microsoft Teams chats",
+            app_categories=["Communication", "Collaboration"],
+            additional_params={
+                "response_mode": MicrosoftOAuthParams.RESPONSE_MODE_QUERY,
+                "prompt": MicrosoftOAuthParams.PROMPT_SELECT_ACCOUNT,
+            },
+        ),
     ])\
     .with_info(CONNECTOR_EMAIL_IDENTITY_INFO)\
     .configure(lambda builder: builder
@@ -255,7 +314,11 @@ class _GraphForbidden(Exception):
             display_name="Include 1:1 and group chats",
             filter_type=FilterType.BOOLEAN,
             category=FilterCategory.SYNC,
-            description="Index chats as one rolling record per chat, readable only by its participants (needs Chat.Read.All, a protected API).",
+            description=(
+                "Index chats as one rolling record per chat, readable only by its participants "
+                "(needs Chat.Read.All, a protected API). Personal connectors always sync the "
+                "signed-in user's chats and nothing else."
+            ),
             default_value=False,
         ))
         .add_filter_field(FilterField(
@@ -316,6 +379,9 @@ class MicrosoftTeamsConnector(BaseConnector):
         self._token: Optional[str] = None
         self._token_expires_on: int = 0
         self._request_semaphore = asyncio.Semaphore(_MAX_CONCURRENT_REQUESTS)
+        # personal scope: delegated token provider (None in team scope)
+        self._delegated: Optional[DelegatedTokenProvider] = None
+        self._me_oid: Optional[str] = None
 
         self.sync_filters: FilterCollection = FilterCollection()
         self.indexing_filters: FilterCollection = FilterCollection()
@@ -329,11 +395,20 @@ class MicrosoftTeamsConnector(BaseConnector):
     # Lifecycle
     # ------------------------------------------------------------------
 
+    def _is_personal(self) -> bool:
+        return is_personal_scope(self.scope)
+
+    def _personal_permissions(self) -> List[Permission]:
+        """Creator-only READER grants for personal-scope records and record groups."""
+        return grants_to_permissions(personal_chat_grants(self.creator_email))
+
     async def init(self) -> bool:
         config = await self.config_service.get_config(f"/services/connectors/{self.connector_id}/config")
         if not config:
             self.logger.error("Microsoft Teams config not found")
             return False
+        if self._is_personal():
+            return await self._init_personal()
         auth = config.get("auth", {}) or {}
         tenant_id = auth.get("tenantId")
         client_id = auth.get("clientId")
@@ -370,9 +445,49 @@ class MicrosoftTeamsConnector(BaseConnector):
         self.logger.info("Microsoft Teams connector initialised for tenant %s", tenant_name)
         return True
 
+    async def _init_personal(self) -> bool:
+        """Personal scope: delegated token from the instance config, no ClientSecretCredential."""
+        await self._load_creator_email()
+        if not self.creator_email:
+            raise ConnectorInitError(
+                "Cannot resolve the creator of this personal Microsoft Teams connector; "
+                "records would be readable by nobody."
+            )
+        await self._close_http()
+        self._delegated = DelegatedTokenProvider(
+            self.config_service, self.connector_id, Connectors.MICROSOFT_TEAMS.value, self.logger
+        )
+        self._http = httpx.AsyncClient(
+            base_url=GRAPH_BASE_URL,
+            timeout=httpx.Timeout(90.0, connect=15.0),
+            headers={"Accept": "application/json"},
+        )
+        try:
+            await self._delegated.get_token()
+            me = await self._get_json("me", params={"$select": "id,displayName,mail,userPrincipalName"})
+        except Exception as e:
+            await self._close_http()
+            raise ConnectorInitError(
+                "Could not read the signed-in Microsoft account. Sign in again to re-authorise this "
+                f"personal Teams connector ({', '.join(PERSONAL_DELEGATED_PERMISSIONS)}). "
+                f"({type(e).__name__}: {str(e)[:200]})"
+            ) from e
+        self._me_oid = str(me.get("id") or self._delegated.user_oid() or "")
+        if signed_in_account_matches_creator(self.creator_email, me.get("mail"), me.get("userPrincipalName")) is False:
+            self.logger.warning(
+                "Personal Teams connector %s: signed-in account %s differs from creator %s; "
+                "records stay readable by the creator only",
+                self.connector_id, me.get("userPrincipalName") or me.get("mail"), self.creator_email,
+            )
+        self.logger.info("Microsoft Teams personal connector initialised for %s", self.creator_email)
+        return True
+
     async def test_connection_and_access(self) -> bool:
         try:
-            payload = await self._get_json("teams", params={"$top": "1", "$select": "id"})
+            if self._is_personal():
+                payload = await self._get_json("me/chats", params={"$top": "1", "$select": "id"})
+            else:
+                payload = await self._get_json("teams", params={"$top": "1", "$select": "id"})
             return isinstance(payload.get("value"), list)
         except Exception as e:
             self.logger.error("Microsoft Teams connection test failed: %s", e)
@@ -394,6 +509,7 @@ class MicrosoftTeamsConnector(BaseConnector):
             self.credential = None
         self._token = None
         self._token_expires_on = 0
+        self._delegated = None
 
     @classmethod
     async def create_connector(
@@ -422,6 +538,10 @@ class MicrosoftTeamsConnector(BaseConnector):
     # ------------------------------------------------------------------
 
     async def _refresh_token(self) -> str:
+        if self._delegated is not None:
+            # personal: ask the platform refresh service, then fall back to whatever is stored
+            self._token = await self._delegated.refresh() or await self._delegated.get_token()
+            return self._token
         if self.credential is None:
             raise RuntimeError("Microsoft Teams connector not initialised")
         token = await self.credential.get_token(GRAPH_SCOPE)
@@ -430,6 +550,9 @@ class MicrosoftTeamsConnector(BaseConnector):
         return self._token
 
     async def _get_token(self) -> str:
+        if self._delegated is not None:
+            # re-read every call: the background TokenRefreshService rewrites the stored token
+            return await self._delegated.get_token()
         now_s = get_epoch_timestamp_in_ms() // 1000
         if self._token and now_s < self._token_expires_on - _TOKEN_REFRESH_SKEW_S:
             return self._token
@@ -497,6 +620,13 @@ class MicrosoftTeamsConnector(BaseConnector):
         return rows
 
     def _log_protected_api(self, what: str, error: Exception) -> None:
+        if self._is_personal():
+            self.logger.warning(
+                "Microsoft Graph denied access (403) while reading %s with the signed-in user's token. "
+                "Re-authorise the personal connector so it carries %s. (%s)",
+                what, ", ".join(PERSONAL_DELEGATED_PERMISSIONS), str(error)[:200],
+            )
+            return
         if not self._protected_api_logged:
             self._protected_api_logged = True
             self.logger.warning(
@@ -530,6 +660,15 @@ class MicrosoftTeamsConnector(BaseConnector):
         self.sync_filters, self.indexing_filters = await load_connector_filters(
             self.config_service, CONNECTOR_KEY, self.connector_id, self.logger
         )
+        if self._is_personal():
+            # signed-in user's chats only: no directory, no teams / channels, creator-only permissions
+            self.logger.info("Personal scope: syncing chats of %s only", self.creator_email)
+            try:
+                await self._sync_chats(incremental=incremental)
+            except _GraphForbidden as e:
+                self._log_protected_api("chats", e)
+            self.logger.info("Microsoft Teams sync completed")
+            return
         await self._sync_users()
 
         teams = select_teams(await self._list_teams(), self._selected_team_values())
@@ -877,31 +1016,42 @@ class MicrosoftTeamsConnector(BaseConnector):
         point = await self.records_sync_point.read_sync_point(CHATS_SYNC_POINT_KEY) if incremental else {}
         last_sync_ms = read_last_sync_ms(point)
 
+        personal = self._is_personal()
         await self.data_entities_processor.on_new_record_groups([(
             RecordGroup(
                 name=CHATS_RECORD_GROUP_NAME,
                 short_name=CHATS_RECORD_GROUP_NAME,
-                description="Microsoft Teams 1:1 and group chats (each record readable only by its participants)",
+                description=(
+                    f"Microsoft Teams chats of {self.creator_email} (personal connector)"
+                    if personal
+                    else "Microsoft Teams 1:1 and group chats (each record readable only by its participants)"
+                ),
                 external_group_id=CHATS_RECORD_GROUP_ID,
                 connector_name=self.connector_name,
                 connector_id=self.connector_id,
                 group_type=RecordGroupType.TEAMS_CHANNEL,
                 org_id=self.data_entities_processor.org_id,
             ),
-            [],
+            self._personal_permissions() if personal else [],
         )])
 
         chats_by_id: Dict[str, Dict[str, Any]] = {}
-        for user_id in list(self._users_by_id):
-            try:
-                for chat in await self._fetch_all(user_chats_url(user_id)):
-                    if chat.get("id"):
-                        chats_by_id.setdefault(str(chat["id"]), chat)
-            except httpx.HTTPStatusError as e:
-                if e.response.status_code == HttpStatusCode.NOT_FOUND.value:
-                    continue  # user without a Teams license
-                raise
-        self.logger.info("Discovered %d chat(s) across %d user(s)", len(chats_by_id), len(self._users_by_id))
+        if personal:
+            for chat in await self._fetch_all(me_chats_url()):
+                if chat.get("id"):
+                    chats_by_id.setdefault(str(chat["id"]), chat)
+            self.logger.info("Discovered %d chat(s) for %s", len(chats_by_id), self.creator_email)
+        else:
+            for user_id in list(self._users_by_id):
+                try:
+                    for chat in await self._fetch_all(user_chats_url(user_id)):
+                        if chat.get("id"):
+                            chats_by_id.setdefault(str(chat["id"]), chat)
+                except httpx.HTTPStatusError as e:
+                    if e.response.status_code == HttpStatusCode.NOT_FOUND.value:
+                        continue  # user without a Teams license
+                    raise
+            self.logger.info("Discovered %d chat(s) across %d user(s)", len(chats_by_id), len(self._users_by_id))
 
         total = 0
         batch: List[Tuple[Record, List[Permission]]] = []
@@ -913,10 +1063,14 @@ class MicrosoftTeamsConnector(BaseConnector):
                     continue  # nothing changed since the last run
                 raw_messages = await self._fetch_all(chat_messages_url(chat_id, since_ms=window_start_ms))
             members = parse_conversation_members(chat.get("members") or [])
+            for member in members:  # roster emails resolve author_email when no directory sync ran
+                if member.email:
+                    self._user_email_by_id.setdefault(member.user_id, member.email)
             messages = select_chat_messages(raw_messages, window_start_ms)
             if not messages:
                 continue
-            batch.append((self._build_chat_record(chat, members, messages, lookback_days), grants_to_permissions(chat_grants(members))))
+            permissions = self._personal_permissions() if personal else grants_to_permissions(chat_grants(members))
+            batch.append((self._build_chat_record(chat, members, messages, lookback_days), permissions))
             if len(batch) >= _RECORD_BATCH_SIZE:
                 await self.data_entities_processor.on_new_records(batch)
                 total += len(batch)
@@ -1081,6 +1235,9 @@ class MicrosoftTeamsConnector(BaseConnector):
             raise ValueError(f"Unsupported filter key: {filter_key}")
         if self._http is None:
             return FilterOptionsResponse(success=False, options=[], page=page, limit=limit, has_more=False)
+        if self._is_personal():
+            # teams / channels are not synced in personal scope (chats only)
+            return FilterOptionsResponse(success=True, options=[], page=page, limit=limit, has_more=False)
         needle = (search or "").strip().lower()
         teams = await self._list_teams()
         options = [

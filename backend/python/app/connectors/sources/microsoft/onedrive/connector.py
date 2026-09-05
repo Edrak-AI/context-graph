@@ -32,7 +32,11 @@ from app.connectors.core.base.sync_point.sync_point import (
     SyncPoint,
     generate_record_sync_point_key,
 )
-from app.connectors.core.registry.auth_builder import AuthBuilder, AuthType
+from app.connectors.core.registry.auth_builder import (
+    AuthBuilder,
+    AuthType,
+    OAuthScopeConfig,
+)
 from app.connectors.core.registry.connector_builder import (
     AuthField,
     CommonFields,
@@ -53,10 +57,24 @@ from app.connectors.core.registry.filters import (
     load_connector_filters,
 )
 from app.connectors.sources.microsoft.common.apps import OneDriveApp
+from app.connectors.sources.microsoft.common.constants import (
+    MicrosoftGraphScopes,
+    MicrosoftOAuth,
+    MicrosoftOAuthParams,
+)
+from app.connectors.sources.microsoft.common.delegated_auth import (
+    DelegatedTokenProvider,
+    build_delegated_graph_client,
+)
 from app.connectors.sources.microsoft.common.msgraph_client import (
     MSGraphClient,
     RecordUpdate,
     map_msgraph_role_to_permission_type,
+)
+from app.connectors.sources.microsoft.common.personal_scope import (
+    creator_grants,
+    is_personal_scope,
+    signed_in_account_matches_creator,
 )
 from app.models.entities import (
     AppUser,
@@ -117,8 +135,9 @@ class OneDriveCredentials:
     .in_group("Microsoft 365")\
     .with_description("Sync files and folders from OneDrive")\
     .with_categories(["Storage"])\
-    .with_scopes([ConnectorScope.TEAM.value])\
+    .with_scopes([ConnectorScope.PERSONAL.value, ConnectorScope.TEAM.value])\
     .with_auth([
+        # team scope: app-only Entra app + admin consent (first entry = default auth type)
         AuthBuilder.type(AuthType.OAUTH_ADMIN_CONSENT).fields([
             AuthField(
                 name="clientId",
@@ -148,7 +167,38 @@ class OneDriveCredentials:
                 required=True,
                 default_value=False
             ),
-        ])
+        ]),
+        # personal scope: the member signs in with their own account and only their drive is
+        # indexed, readable by them alone. Client id / secret come from the org's shared OAuth
+        # app (``/services/oauth/onedrive``, referenced by ``auth.oauthConfigId``) like Outlook Personal.
+        AuthBuilder.type(AuthType.OAUTH).oauth(
+            connector_name="OneDrive",
+            authorize_url=MicrosoftOAuth.authorize_url(),
+            token_url=MicrosoftOAuth.token_url(),
+            redirect_uri="connectors/oauth/callback/OneDrive",
+            scopes=OAuthScopeConfig(
+                personal_sync=[
+                    MicrosoftGraphScopes.FILES_READ,
+                    MicrosoftGraphScopes.USER_READ,
+                    MicrosoftGraphScopes.OFFLINE_ACCESS,
+                ],
+                team_sync=[],
+                agent=[],
+            ),
+            fields=[
+                CommonFields.tenant_id("Azure AD App Registration"),
+                CommonFields.client_id("Azure AD App Registration"),
+                CommonFields.client_secret("Azure AD App Registration"),
+            ],
+            icon_path=IconPaths.connector_icon(Connectors.ONEDRIVE.value),
+            app_group="Microsoft 365",
+            app_description="OAuth application for reading a user's own OneDrive files",
+            app_categories=["Storage"],
+            additional_params={
+                "response_mode": MicrosoftOAuthParams.RESPONSE_MODE_QUERY,
+                "prompt": MicrosoftOAuthParams.PROMPT_SELECT_ACCOUNT,
+            },
+        ),
     ])\
     .with_info(CONNECTOR_EMAIL_IDENTITY_INFO)\
     .configure(lambda builder: builder
@@ -209,6 +259,60 @@ class OneDriveConnector(BaseConnector):
         self.sync_filters: FilterCollection = FilterCollection()
         self.indexing_filters: FilterCollection = FilterCollection()
 
+        # personal scope (delegated OAuth): token provider + the signed-in user; None in team scope
+        self.credential: Optional[ClientSecretCredential] = None
+        self._delegated: Optional[DelegatedTokenProvider] = None
+        self._me_user: Optional[AppUser] = None
+
+    def _is_personal(self) -> bool:
+        return is_personal_scope(self.scope)
+
+    def _personal_permissions(self) -> List[Permission]:
+        """Creator-only READER grants used for every record / record group in personal scope."""
+        return [
+            Permission(email=grant.email, type=PermissionType.READ, entity_type=EntityType.USER)
+            for grant in creator_grants(self.creator_email)
+        ]
+
+    async def _init_personal(self) -> bool:
+        """Personal scope: Graph client with the user's delegated token (no ClientSecretCredential).
+
+        Only ``/users/{oid}/drive`` of the signed-in user is touched (``Files.Read`` +
+        ``User.Read``); directory users / groups are never listed."""
+        await self._load_creator_email()
+        if not self.creator_email:
+            raise ValueError(
+                "Cannot resolve the creator of this personal OneDrive connector; records would be readable by nobody."
+            )
+        self.credential = None
+        self._delegated = DelegatedTokenProvider(
+            self.config_service, self.connector_id, Connectors.ONEDRIVE.value, self.logger
+        )
+        await self._delegated.get_token()
+        oid = self._delegated.user_oid()
+        if not oid:
+            raise ValueError("Delegated OneDrive access token carries no user object id (oid); sign in again.")
+        self.client = build_delegated_graph_client(self._delegated)
+        self.msgraph_client = MSGraphClient(self.connector_name, self.connector_id, self.client, self.logger)
+        user_info = await self.msgraph_client.get_user_info(oid) or {}
+        if signed_in_account_matches_creator(self.creator_email, user_info.get("email")) is False:
+            self.logger.warning(
+                "Personal OneDrive connector %s: signed-in account %s differs from creator %s; "
+                "records stay readable by the creator only",
+                self.connector_id, user_info.get("email"), self.creator_email,
+            )
+        self._me_user = AppUser(
+            app_name=self.connector_name,
+            connector_id=self.connector_id,
+            source_user_id=oid,
+            email=self.creator_email,
+            full_name=user_info.get("display_name") or self.creator_email,
+            org_id=self.data_entities_processor.org_id,
+            is_active=True,
+        )
+        self.logger.info("✅ OneDrive personal connector initialised for %s", self.creator_email)
+        return True
+
     async def init(self) -> bool:
         config = await self.config_service.get_config(f"/services/connectors/{self.connector_id}/config")
         if not config:
@@ -216,6 +320,8 @@ class OneDriveConnector(BaseConnector):
             return False
 
         self.config = {"credentials": config}
+        if self._is_personal():
+            return await self._init_personal()
         if not config:
             self.logger.error("OneDrive config not found")
             raise ValueError("OneDrive config not found")
@@ -386,13 +492,17 @@ class OneDriveConnector(BaseConnector):
             if file_record.is_file and file_record.extension is None:
                 return None
 
-            # Get current permissions
-            permission_result = await self.msgraph_client.get_file_permission(
-                item.parent_reference.drive_id if item.parent_reference else None,
-                item.id
-            )
+            if self._is_personal():
+                # personal scope: never mirror the source ACL; the creator is the only reader
+                new_permissions = self._personal_permissions()
+            else:
+                # Get current permissions
+                permission_result = await self.msgraph_client.get_file_permission(
+                    item.parent_reference.drive_id if item.parent_reference else None,
+                    item.id
+                )
 
-            new_permissions = await self._convert_to_permissions(permission_result)
+                new_permissions = await self._convert_to_permissions(permission_result)
 
             if existing_record:
                 # compare permissions with existing permissions (To be implemented)
@@ -403,10 +513,11 @@ class OneDriveConnector(BaseConnector):
             if existing_record and existing_record.is_shared != is_shared_folder:
                 metadata_changed = True
                 is_updated = True
-                await self._update_folder_children_permissions(
-                    drive_id=item.parent_reference.drive_id,
-                    folder_id=item.id
-                )
+                if not self._is_personal():
+                    await self._update_folder_children_permissions(
+                        drive_id=item.parent_reference.drive_id,
+                        folder_id=item.id
+                    )
 
 
             return RecordUpdate(
@@ -1181,9 +1292,12 @@ class OneDriveConnector(BaseConnector):
                             type=PermissionType.OWNER,
                             entity_type=EntityType.USER
                         )
+                        group_permissions = (
+                            self._personal_permissions() if self._is_personal() else [owner_permission]
+                        )
 
                         # Save the RecordGroup
-                        await self.data_entities_processor.on_new_record_groups([(record_group, [owner_permission])])
+                        await self.data_entities_processor.on_new_record_groups([(record_group, group_permissions)])
                         self.logger.info(f"Created RecordGroup for user {user_id} with drive ID {drive.id}")
                     else:
                         self.logger.warning(f"Could not fetch user info for {user_id}, skipping RecordGroup creation")
@@ -1366,6 +1480,11 @@ class OneDriveConnector(BaseConnector):
         Syncs OneDrive users.
         """
         try:
+            if self._is_personal():
+                # personal scope: only the signed-in user; no directory listing (User.Read.All)
+                users = [self._me_user] if self._me_user else []
+                await self.data_entities_processor.on_new_app_users(users)
+                return users
             users = await self.msgraph_client.get_all_users()
             await self.data_entities_processor.on_new_app_users(users)
             self.logger.info(f"✅ Successfully synced {len(users)} users")
@@ -1494,9 +1613,10 @@ class OneDriveConnector(BaseConnector):
             self.logger.info("Syncing users...")
             users = await self._sync_users()
 
-            # Step 2: Sync user groups and their members
-            self.logger.info("Syncing user groups...")
-            await self._sync_user_groups()
+            # Step 2: Sync user groups and their members (team scope only; personal has no directory access)
+            if not self._is_personal():
+                self.logger.info("Syncing user groups...")
+                await self._sync_user_groups()
 
             # Step 3: Process user drives with yielding for non-blocking operation
             self.logger.info("Syncing user drives...")
@@ -1527,6 +1647,9 @@ class OneDriveConnector(BaseConnector):
         This prevents "HTTP transport has already been closed" errors when the connector
         instance is reused across multiple scheduled runs that are days apart.
         """
+        if self._is_personal():
+            # delegated token is re-read from config per request; nothing to reinitialise
+            return
         try:
             # Test if the credential is still valid by attempting to get a token
             await self.credential.get_token("https://graph.microsoft.com/.default")
@@ -1604,8 +1727,8 @@ class OneDriveConnector(BaseConnector):
             # Reinitialize credential to prevent session timeout issues
             await self._reinitialize_credential_if_needed()
 
-            # Sync all active users
-            users = await self.msgraph_client.get_all_users()
+            # Sync all active users (personal scope: the signed-in user only)
+            users = [self._me_user] if self._is_personal() and self._me_user else await self.msgraph_client.get_all_users()
             await self._process_users_in_batches(users)
 
             self.logger.info("Incremental sync completed")
@@ -1794,6 +1917,19 @@ class OneDriveConnector(BaseConnector):
         Returns True only when both directory probes succeed.
         """
         self.logger.info("Testing connection and access to OneDrive")
+
+        if self._is_personal():
+            # delegated Files.Read: the signed-in user's own drive is all we need
+            if not self._me_user or not self.msgraph_client:
+                return False
+            try:
+                await self.msgraph_client.get_user_drive(self._me_user.source_user_id)
+                self.logger.info("✅ Permission verified: Files.Read (personal)")
+                return True
+            except ODataError as e:
+                raise ConnectionError(
+                    f"Microsoft Graph error while reading the signed-in user's OneDrive: {sanitize_graph_error(e)}"
+                ) from e
 
         scope_probes = [
             ("User.Read.All",  self._probe_users_scope),

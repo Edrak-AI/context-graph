@@ -45,7 +45,11 @@ from app.connectors.core.constants import (
     IconPaths,
     OAuthConfigKeys,
 )
-from app.connectors.core.registry.auth_builder import AuthBuilder, AuthType
+from app.connectors.core.registry.auth_builder import (
+    AuthBuilder,
+    AuthType,
+    OAuthScopeConfig,
+)
 from app.connectors.core.registry.connector_builder import (
     AuthField,
     CommonFields,
@@ -71,8 +75,18 @@ from app.connectors.core.registry.filters import (
 )
 from app.connectors.core.registry.types import FieldType
 from app.connectors.sources.microsoft.common.apps import OutlookApp
+from app.connectors.sources.microsoft.common.constants import (
+    MicrosoftGraphScopes,
+    MicrosoftOAuth,
+    MicrosoftOAuthParams,
+)
 from app.connectors.sources.microsoft.common.content_type_utils import (
     attachment_metadata_from_graph,
+)
+from app.connectors.sources.microsoft.common.delegated_auth import (
+    DelegatedGraphClientHandle,
+    DelegatedTokenProvider,
+    build_delegated_graph_client,
 )
 from app.connectors.sources.microsoft.common.msgraph_client import RecordUpdate
 from app.connectors.sources.microsoft.common.outlook_constants import (
@@ -91,6 +105,10 @@ from app.connectors.sources.microsoft.common.outlook_constants import (
     OutlookSyncPointKeys,
     OutlookThreadDetection,
     normalize_conversation_index,
+)
+from app.connectors.sources.microsoft.common.personal_scope import (
+    creator_grants,
+    is_personal_scope,
 )
 from app.models.entities import (
     AppUser,
@@ -130,8 +148,9 @@ from app.utils.time_conversion import (
     .in_group("Microsoft 365")\
     .with_description("Sync emails from Outlook")\
     .with_categories(["Email"])\
-    .with_scopes([ConnectorScope.TEAM.value])\
+    .with_scopes([ConnectorScope.PERSONAL.value, ConnectorScope.TEAM.value])\
     .with_auth([
+        # team scope: app-only Entra app + admin consent (first entry = default auth type)
         AuthBuilder.type(AuthType.OAUTH_ADMIN_CONSENT).fields([
             AuthField(
                 name=AuthFieldKeys.CLIENT_ID,
@@ -163,7 +182,38 @@ from app.utils.time_conversion import (
                 required=True,
                 default_value=False
             ),
-        ])
+        ]),
+        # personal scope: the member signs in with their own account and only their mailbox is
+        # indexed, readable by them alone. Client id / secret come from the org's shared OAuth
+        # app (``/services/oauth/outlook``, referenced by ``auth.oauthConfigId``) like Outlook Personal.
+        AuthBuilder.type(AuthType.OAUTH).oauth(
+            connector_name=OutlookConnectorNames.TEAM,
+            authorize_url=MicrosoftOAuth.authorize_url(),
+            token_url=MicrosoftOAuth.token_url(),
+            redirect_uri="connectors/oauth/callback/Outlook",
+            scopes=OAuthScopeConfig(
+                personal_sync=[
+                    MicrosoftGraphScopes.MAIL_READ,
+                    MicrosoftGraphScopes.USER_READ,
+                    MicrosoftGraphScopes.OFFLINE_ACCESS,
+                ],
+                team_sync=[],
+                agent=[],
+            ),
+            fields=[
+                CommonFields.tenant_id("Azure AD App Registration"),
+                CommonFields.client_id("Azure AD App Registration"),
+                CommonFields.client_secret("Azure AD App Registration"),
+            ],
+            icon_path=IconPaths.connector_icon(Connectors.OUTLOOK.value),
+            app_group="Microsoft 365",
+            app_description="OAuth application for reading a user's own Outlook mailbox",
+            app_categories=["Email"],
+            additional_params={
+                "response_mode": MicrosoftOAuthParams.RESPONSE_MODE_QUERY,
+                "prompt": MicrosoftOAuthParams.PROMPT_SELECT_ACCOUNT,
+            },
+        ),
     ])\
     .with_info(CONNECTOR_EMAIL_IDENTITY_INFO)\
     .configure(lambda builder: builder
@@ -307,12 +357,68 @@ class OutlookConnector(BaseConnector):
         self.sync_filters: FilterCollection = FilterCollection()
         self.indexing_filters: FilterCollection = FilterCollection()
 
+        # personal scope (delegated OAuth): token provider + the signed-in user; None in team scope
+        self._delegated: DelegatedTokenProvider | None = None
+        self._me_user: AppUser | None = None
+
+    def _is_personal(self) -> bool:
+        return is_personal_scope(self.scope)
+
+    def _personal_permissions(self) -> list[Permission]:
+        """Creator-only READER grants used for every folder, mail and attachment in personal scope."""
+        return [
+            Permission(email=grant.email, type=PermissionType.READ, entity_type=EntityType.USER)
+            for grant in creator_grants(self.creator_email)
+        ]
+
+    async def _mailbox_owner_email(self, record: Record) -> str | None:
+        """Mailbox that holds ``record``: the creator in personal scope, else the OWNER edge."""
+        if self._is_personal():
+            return self.creator_email
+        return await self.data_entities_processor.get_record_owner_source_user_email(record.id)
+
+    async def _init_personal(self) -> bool:
+        """Personal scope: Graph clients on the user's delegated token (``Mail.Read`` + ``User.Read``).
+
+        The same ``users/{oid}/...`` data-source calls as team scope are used, with ``oid`` being
+        the signed-in user, so the mailbox sync code is shared; directory / group sync is skipped."""
+        await self._load_creator_email()
+        if not self.creator_email:
+            raise ValueError(
+                "Cannot resolve the creator of this personal Outlook connector; records would be readable by nobody."
+            )
+        self.credentials = None
+        self._delegated = DelegatedTokenProvider(
+            self.config_service, self.connector_id, OutlookConnectorNames.TEAM, self.logger
+        )
+        await self._delegated.get_token()
+        oid = self._delegated.user_oid()
+        if not oid:
+            raise ValueError("Delegated Outlook access token carries no user object id (oid); sign in again.")
+        graph_client = build_delegated_graph_client(self._delegated)
+        self.external_client = ExternalMSGraphClient(DelegatedGraphClientHandle(graph_client), mode=GraphMode.DELEGATED)
+        self.external_outlook_client = OutlookCalendarContactsDataSource(self.external_client)
+        self.external_users_client = UsersGroupsDataSource(self.external_client)
+        self._me_user = AppUser(
+            app_name=Connectors.OUTLOOK,
+            connector_id=self.connector_id,
+            source_user_id=oid,
+            email=self.creator_email,
+            full_name=self.creator_email.split("@")[0].replace(".", " ").title(),
+            org_id=self.data_entities_processor.org_id,
+            is_active=True,
+        )
+        self.logger.info("Outlook personal connector initialised for %s", self.creator_email)
+        return True
 
     async def init(self) -> bool:
         """Initialize the Outlook connector with credentials and Graph client."""
         try:
 
             connector_id = self.connector_id
+
+            if self._is_personal():
+                return await self._init_personal()
 
             # Load credentials
             self.credentials = await self._get_credentials(connector_id)
@@ -346,6 +452,9 @@ class OutlookConnector(BaseConnector):
         first Graph call of a later run fails with "HTTP transport has already been closed".
         Probe the credential and rebuild the client on failure.
         """
+        if self._is_personal():
+            # delegated token is re-read from config per request; no credential to probe
+            return
         try:
             await self.external_client.get_client().credential.get_token(
                 "https://graph.microsoft.com/.default"
@@ -379,6 +488,20 @@ class OutlookConnector(BaseConnector):
     async def test_connection_and_access(self) -> bool:
         """Test connection and access to external APIs."""
         try:
+            if self._is_personal():
+                if not self.external_outlook_client or not self._me_user:
+                    return False
+                response = await self.external_outlook_client.users_list_mail_folders(
+                    user_id=self._me_user.source_user_id,
+                    top=1,
+                    select=OutlookAPIFields.FOLDER_SELECT_FIELDS,
+                )
+                if not response.success:
+                    self.logger.error(f"Connection test failed: {response.error}")
+                    return False
+                self.logger.info("✅ Outlook personal connector connection test passed")
+                return True
+
             if not self.external_outlook_client or not self.external_users_client or not self.credentials:
                 return False
 
@@ -489,11 +612,12 @@ class OutlookConnector(BaseConnector):
             # Sync users and get list of users to process
             users_to_sync = await self._sync_users()
 
-            # Sync Microsoft 365 groups
-            synced_groups = await self._sync_user_groups()
+            if not self._is_personal():
+                # Sync Microsoft 365 groups (team scope only; personal has no directory access)
+                synced_groups = await self._sync_user_groups()
 
-            # Sync group conversations (pass synced groups)
-            await self._sync_group_conversations(synced_groups)
+                # Sync group conversations (pass synced groups)
+                await self._sync_group_conversations(synced_groups)
 
             # Process emails per user
             async for status in self._process_users(org_id, users_to_sync):
@@ -567,6 +691,9 @@ class OutlookConnector(BaseConnector):
 
     async def _get_all_users_external(self) -> list[AppUser]:
         """Get all users using external Users Groups API with pagination."""
+        if self._is_personal():
+            # personal scope: only the signed-in user; no directory listing (User.Read.All)
+            return [self._me_user] if self._me_user else []
         try:
             if not self.external_users_client:
                 raise Exception("External Users Groups client not initialized")
@@ -1928,9 +2055,11 @@ class OutlookConnector(BaseConnector):
                     entity_type=EntityType.USER
                 )
 
+                folder_permissions = self._personal_permissions() if self._is_personal() else [owner_permission]
+
                 # Apply owner permission to all folders for this user
                 record_groups_with_permissions = [
-                    (rg, [owner_permission]) for rg in record_groups
+                    (rg, folder_permissions) for rg in record_groups
                 ]
 
                 await self.data_entities_processor.on_new_record_groups(record_groups_with_permissions)
@@ -2276,6 +2405,10 @@ class OutlookConnector(BaseConnector):
 
         Note: This method is for PERSONAL mailbox emails only.
         """
+        if self._is_personal():
+            # personal scope: recipients are never granted anything; the creator is the only reader
+            return self._personal_permissions()
+
         permissions = []
 
         try:
@@ -2657,7 +2790,7 @@ class OutlookConnector(BaseConnector):
             # User mailbox records (need user_id)
             user_id = None
 
-            user_email = await self.data_entities_processor.get_record_owner_source_user_email(record.id)
+            user_email = await self._mailbox_owner_email(record)
             if user_email:
                 user_id = await self._get_user_id_from_email(user_email)
 
@@ -2901,6 +3034,14 @@ class OutlookConnector(BaseConnector):
         cursor: str | None = None
     ) -> FilterOptionsResponse:
         """Get dynamic filter options for the users or groups filter."""
+        if self._is_personal():
+            # personal scope: no directory access; the only mailbox is the signed-in user's
+            options = (
+                [FilterOption(id=self.creator_email, label=self.creator_email)]
+                if filter_key == SyncFilterKey.USERS.value and self.creator_email
+                else []
+            )
+            return FilterOptionsResponse(success=True, options=options, page=page, limit=limit, has_more=False)
         if filter_key == SyncFilterKey.USERS.value:
             return await self._get_user_options(page, limit, search, cursor)
         if filter_key == SyncFilterKey.GROUPS.value:
@@ -3184,7 +3325,7 @@ class OutlookConnector(BaseConnector):
         records_by_user: dict[str, list[Record]] = {}
         for record in records:
             try:
-                user_email = await self.data_entities_processor.get_record_owner_source_user_email(record.id)
+                user_email = await self._mailbox_owner_email(record)
 
                 if not user_email:
                     self.logger.warning(f"No owner found for record {record.id}, skipping")

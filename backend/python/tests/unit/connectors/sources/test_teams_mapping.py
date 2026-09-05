@@ -12,6 +12,7 @@ from app.connectors.sources.microsoft.teams.mapping import (
     CHAT_APPLICATION_PERMISSIONS,
     DEFAULT_CHAT_LOOKBACK_DAYS,
     MAX_CHAT_LOOKBACK_DAYS,
+    PERSONAL_DELEGATED_PERMISSIONS,
     PROTECTED_API_PERMISSIONS,
     REQUIRED_APPLICATION_PERMISSIONS,
     DeltaChanges,
@@ -39,12 +40,14 @@ from app.connectors.sources.microsoft.teams.mapping import (
     is_delta_unsupported_status,
     is_private_or_shared_channel,
     lookback_start_ms,
+    me_chats_url,
     message_replies_url,
     normalize_message,
     parse_conversation_members,
     parse_delta_page,
     parse_graph_timestamp,
     parse_group_members,
+    personal_chat_grants,
     read_delta_link,
     read_last_sync_ms,
     render_chat_markdown,
@@ -478,6 +481,38 @@ class TestDelta:
     def test_delta_unsupported_statuses(self):
         assert all(is_delta_unsupported_status(s) for s in (400, 404, 501))
         assert not any(is_delta_unsupported_status(s) for s in (401, 403, 429, 500, 503))
+
+
+class TestPersonalScope:
+    """Personal (delegated OAuth) scope: the signed-in user's chats, creator-only READER."""
+
+    def test_personal_chat_grants_creator_only(self):
+        grants = personal_chat_grants("Alice.Owner@Contoso.com")
+        assert grants == [PermissionGrant(
+            GrantEntity.USER, GrantRole.READER, email="alice.owner@contoso.com", reason="personal connector creator",
+        )]
+        # participants of the chat never leak into the grant list
+        members = parse_conversation_members([
+            {"userId": "u1", "email": "alice.owner@contoso.com", "displayName": "Alice"},
+            {"userId": "u2", "email": "bob@contoso.com", "displayName": "Bob"},
+        ])
+        assert {g.email for g in chat_grants(members)} == {"alice.owner@contoso.com", "bob@contoso.com"}
+        assert [g.email for g in personal_chat_grants("alice.owner@contoso.com")] == ["alice.owner@contoso.com"]
+        assert all(g.entity_type is GrantEntity.USER and g.role is GrantRole.READER for g in grants)
+        assert all(g.external_id is None for g in grants)
+
+    def test_personal_chat_grants_fail_closed_without_creator(self):
+        assert personal_chat_grants(None) == []
+        assert personal_chat_grants("") == []
+        assert personal_chat_grants("   ") == []
+        assert personal_chat_grants("not-an-email") == []
+
+    def test_me_chats_url_and_delegated_permissions(self):
+        assert me_chats_url() == "me/chats?$expand=members&$top=50"
+        assert not me_chats_url().startswith("users/")
+        assert PERSONAL_DELEGATED_PERMISSIONS == ("Chat.Read", "User.Read", "offline_access")
+        # delegated Chat.Read is not one of the protected app-only APIs
+        assert not set(PERSONAL_DELEGATED_PERMISSIONS) & set(PROTECTED_API_PERMISSIONS)
 
 
 if __name__ == "__main__":  # plain-python runner for machines without pytest

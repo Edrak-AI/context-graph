@@ -31,6 +31,8 @@ class MicrosoftGraphScopes:
     """Microsoft Graph delegated scopes."""
     MAIL_READ = "https://graph.microsoft.com/Mail.Read"
     USER_READ = "https://graph.microsoft.com/User.Read"
+    FILES_READ = "https://graph.microsoft.com/Files.Read"  # OneDrive personal scope
+    CHAT_READ = "https://graph.microsoft.com/Chat.Read"  # Teams personal scope (1:1 / group chats)
     OFFLINE_ACCESS = "offline_access"
 
 
