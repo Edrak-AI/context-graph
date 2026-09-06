@@ -6,8 +6,9 @@ Scaffold copied from Confluence Cloud; implementation will target Confluence Dat
 Authentication: API token (personal access token or HTTP basic with API token).
 """
 
-import uuid
+import os
 import re
+import uuid
 from collections.abc import AsyncGenerator
 from datetime import datetime, timezone
 from logging import Logger
@@ -145,6 +146,23 @@ CONTENT_V1_ATTACHMENT_EXPAND = "version,history,metadata,extensions"
 
 # Constant for pseudo-user group prefix
 PSEUDO_USER_GROUP_PREFIX = "[Pseudo-User]"
+PSEUDO_GROUP_PREFIX = "[Pseudo-Group]"
+
+
+def _env_flag(name: str, default: bool = True) -> bool:
+    """Read a boolean feature flag from the environment (Edrak safe-default toggles)."""
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+# Edrak (connector RBAC): a page restriction whose group cannot be resolved (group not
+# synced yet) used to yield no permission, so the record silently fell back to the
+# space ACL (over-share). Default = fail closed: keep the restriction via an empty
+# placeholder group until the real group syncs. Set
+# CONFLUENCE_RESTRICTIONS_FAIL_CLOSED=false to restore upstream behaviour.
+CONFLUENCE_RESTRICTIONS_FAIL_CLOSED: bool = _env_flag("CONFLUENCE_RESTRICTIONS_FAIL_CLOSED", True)
 
 @ConnectorBuilder("Confluence Data Center")\
     .in_group("Atlassian")\
@@ -3066,6 +3084,17 @@ class ConfluenceDataCenterConnector(BaseConnector):
                         entity_type=entity_type
                     )
 
+                if create_pseudo_group_if_missing and CONFLUENCE_RESTRICTIONS_FAIL_CLOSED:
+                    # Record-level restriction on an unsynced group: keep it (fail closed) via
+                    # an empty placeholder group; the real group wins once synced (id/name lookup).
+                    pseudo_group = await self._create_pseudo_group(principal_id, kind="group")
+                    if pseudo_group:
+                        return Permission(
+                            external_id=pseudo_group.source_user_group_id,
+                            type=permission_type,
+                            entity_type=EntityType.GROUP
+                        )
+
                 self.logger.debug(f"  ⚠️ Group {principal_id} not found in DB (by ID or name), skipping permission")
                 return None
 
@@ -3075,25 +3104,28 @@ class ConfluenceDataCenterConnector(BaseConnector):
             self.logger.error(f"❌ Failed to create permission from principal: {e}")
             return None
 
-    async def _create_pseudo_group(self, account_id: str) -> Optional[AppUserGroup]:
+    async def _create_pseudo_group(self, account_id: str, kind: str = "user") -> Optional[AppUserGroup]:
         """
-        Create a pseudo-group for a user without email.
+        Create a pseudo-group for a user without email (``kind="user"``) or an empty
+        placeholder for a not-yet-synced group (``kind="group"``).
 
-        This preserves permissions for users who don't have email addresses yet.
-        The pseudo-group uses the user's accountId as source_user_group_id.
+        This preserves permissions for principals we cannot resolve yet.
+        The pseudo-group uses the principal's source id as source_user_group_id.
 
         Args:
-            account_id: Confluence user accountId
+            account_id: Confluence user key (or group id/name when kind="group")
+            kind: "user" or "group" (affects the display name only)
 
         Returns:
             Created AppUserGroup or None if creation fails
         """
         try:
+            prefix = PSEUDO_GROUP_PREFIX if kind == "group" else PSEUDO_USER_GROUP_PREFIX
             pseudo_group = AppUserGroup(
                 app_name=Connectors.CONFLUENCE_DATA_CENTER,
                 connector_id=self.connector_id,
                 source_user_group_id=account_id,
-                name=f"{PSEUDO_USER_GROUP_PREFIX} {account_id}",
+                name=f"{prefix} {account_id}",
                 org_id=self.data_entities_processor.org_id,
             )
 
@@ -3407,13 +3439,14 @@ class ConfluenceDataCenterConnector(BaseConnector):
             group_results = group_restrictions.get("results", [])
 
             for group_data in group_results:
-                principal_id = group_data.get("id")
+                principal_id = group_data.get("id") or group_data.get("name")
                 if principal_id:
                     permission = await self._create_permission_from_principal(
                         "group",
                         principal_id,
                         permission_type,
-                        create_pseudo_group_if_missing=False  # Groups don't need pseudo-groups
+                        # Placeholder group for not-yet-synced groups (fail closed)
+                        create_pseudo_group_if_missing=True
                     )
                     if permission:
                         permissions.append(permission)

@@ -12,6 +12,7 @@ Authentication: OAuth 2.0 (3-legged OAuth)
 import asyncio
 import base64
 import json
+import os
 import uuid
 from collections import defaultdict
 from collections.abc import AsyncGenerator, Awaitable, Callable
@@ -150,6 +151,28 @@ FOLDER_EXPAND_PARAMS = (
 
 # Constant for pseudo-user group prefix
 PSEUDO_USER_GROUP_PREFIX = "[Pseudo-User]"
+PSEUDO_GROUP_PREFIX = "[Pseudo-Group]"
+
+
+def _env_flag(name: str, default: bool = True) -> bool:
+    """Read a boolean feature flag from the environment (Edrak safe-default toggles)."""
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+# Edrak (connector RBAC): Confluence view restrictions cascade to descendants and the
+# v1 ``/content/{id}/restriction`` endpoint only returns a page's *own* restrictions.
+# Upstream therefore lets children of a restricted page inherit the *space* ACL, and lets
+# a restriction whose principals cannot be resolved (group not synced yet, user without
+# email) fall back to the space ACL too. Both over-share. Default = fail closed:
+#   * a page without own READ restriction takes the READ restriction of its nearest
+#     restricted ancestor (intersected across restricted levels when several exist);
+#   * unresolved restriction principals get an empty placeholder group so the record
+#     keeps ``inherit_permissions=False`` (nobody, until the real group/user syncs).
+# Set CONFLUENCE_RESTRICTIONS_FAIL_CLOSED=false to restore upstream behaviour.
+CONFLUENCE_RESTRICTIONS_FAIL_CLOSED: bool = _env_flag("CONFLUENCE_RESTRICTIONS_FAIL_CLOSED", True)
 
 # Confluence v2 space permission access-class principals (ROLES-mode / default ACLs)
 ACCESS_CLASS_LICENSED_USERS = "ALL_LICENSED_USERS"
@@ -602,6 +625,9 @@ class ConfluenceConnector(BaseConnector):
             self.sync_filters, self.indexing_filters = await load_connector_filters(
                 self.config_service, "confluence", self.connector_id, self.logger
             )
+
+            # Per-run cache of own READ restrictions per content id (ancestor lookups)
+            self._own_read_restrictions_cache = {}
 
             # Step 1: Sync users
             await self._sync_users()
@@ -1384,8 +1410,10 @@ class ConfluenceConnector(BaseConnector):
                             external_record_id=item_id
                         )
 
-                        # Fetch folder permissions
-                        permissions = await self._fetch_page_permissions(item_id)
+                        # Fetch folder permissions (own + inherited from restricted ancestors)
+                        permissions = await self._fetch_page_permissions(
+                            item_id, ancestor_ids=self._ancestor_ids_from_v1(item_data)
+                        )
                         total_permissions_synced += len(permissions)
 
                         # Transform to FileRecord
@@ -1603,8 +1631,10 @@ class ConfluenceConnector(BaseConnector):
                             external_record_id=item_id
                         )
 
-                        # Fetch page permissions
-                        permissions = await self._fetch_page_permissions(item_id)
+                        # Fetch page permissions (own + inherited from restricted ancestors)
+                        permissions = await self._fetch_page_permissions(
+                            item_id, ancestor_ids=self._ancestor_ids_from_v1(item_data)
+                        )
                         total_permissions_synced += len(permissions)
 
                         # Transform to WebpageRecord with update tracking
@@ -2109,8 +2139,10 @@ class ConfluenceConnector(BaseConnector):
                         if not webpage_record:
                             continue
 
-                        # Fetch current permissions
-                        permissions = await self._fetch_page_permissions(item_id)
+                        # Fetch current permissions (own + inherited from restricted ancestors)
+                        permissions = await self._fetch_page_permissions(
+                            item_id, ancestor_ids=self._ancestor_ids_from_v1(item_data)
+                        )
                         total_permissions += len(permissions)
 
                         # Only set inherit_permissions to False if there are READ restrictions
@@ -2210,9 +2242,107 @@ class ConfluenceConnector(BaseConnector):
             self.logger.error(f"❌ Failed to fetch permissions for space {space_name}: {e}")
             return []  # Return empty list on error, space will be created without permissions
 
-    async def _fetch_page_permissions(self, page_id: str) -> list[Permission]:
+    @staticmethod
+    def _ancestor_ids_from_v1(data: dict[str, Any]) -> list[str]:
+        """Ancestor ids (root first, direct parent last) from a v1 content payload."""
+        ancestors = data.get("ancestors") or []
+        return [str(a.get("id")) for a in ancestors if isinstance(a, dict) and a.get("id")]
+
+    @staticmethod
+    def _permission_principal_key(permission: Permission) -> tuple[Any, str, str]:
+        return (
+            permission.entity_type,
+            permission.external_id or "",
+            (permission.email or "").lower(),
+        )
+
+    async def _get_own_read_restrictions(self, content_id: str) -> list[Permission]:
+        """Own READ restrictions of a content item, cached per sync run."""
+        cache = getattr(self, "_own_read_restrictions_cache", None)
+        if cache is None:
+            cache = self._own_read_restrictions_cache = {}
+        if content_id in cache:
+            return cache[content_id]
+        own = await self._fetch_own_page_permissions(content_id)
+        reads = [p for p in own if p.type == PermissionType.READ]
+        cache[content_id] = reads
+        return reads
+
+    async def _fetch_page_permissions(
+        self,
+        page_id: str,
+        ancestor_ids: Optional[list[str]] = None,
+    ) -> list[Permission]:
         """
-        Fetch permissions for a Confluence page using v1 API.
+        Fetch permissions for a Confluence page: its own restrictions plus, when
+        CONFLUENCE_RESTRICTIONS_FAIL_CLOSED is on and ``ancestor_ids`` are given, the
+        READ restriction inherited from restricted ancestors (Confluence view
+        restrictions cascade to every descendant).
+
+        Args:
+            page_id: The page ID
+            ancestor_ids: Ancestor ids, root first / direct parent last (v1 ``ancestors``)
+
+        Returns:
+            List of Permission objects
+        """
+        permissions = await self._fetch_own_page_permissions(page_id)
+
+        if not CONFLUENCE_RESTRICTIONS_FAIL_CLOSED:
+            return permissions
+
+        own_read = [p for p in permissions if p.type == PermissionType.READ]
+        cache = getattr(self, "_own_read_restrictions_cache", None)
+        if cache is None:
+            cache = self._own_read_restrictions_cache = {}
+        cache[str(page_id)] = own_read
+
+        if not ancestor_ids:
+            return permissions
+
+        try:
+            # Restricted levels, nearest first: own restriction (if any) then ancestors
+            levels: list[list[Permission]] = [own_read] if own_read else []
+            for ancestor_id in reversed(ancestor_ids):
+                if not ancestor_id or str(ancestor_id) == str(page_id):
+                    continue
+                ancestor_read = await self._get_own_read_restrictions(str(ancestor_id))
+                if ancestor_read:
+                    levels.append(ancestor_read)
+
+            if len(levels) <= (1 if own_read else 0):
+                return permissions  # no restricted ancestor - nothing inherited
+
+            effective = levels[0]
+            if len(levels) > 1:
+                # A viewer must pass every restricted level: keep principals common to all
+                key_sets = [{self._permission_principal_key(p) for p in level} for level in levels]
+                common = set.intersection(*key_sets)
+                if common:
+                    effective = [p for p in levels[0] if self._permission_principal_key(p) in common]
+                else:
+                    self.logger.warning(
+                        "Page %s: restricted levels share no principal; applying nearest level only",
+                        page_id,
+                    )
+
+            if own_read:
+                non_read = [p for p in permissions if p.type != PermissionType.READ]
+                return non_read + effective
+
+            self.logger.debug(
+                "Page %s inherits READ restriction from %s restricted ancestor level(s)",
+                page_id, len(levels),
+            )
+            return permissions + effective
+
+        except Exception as e:
+            self.logger.error(f"❌ Failed to resolve inherited restrictions for page {page_id}: {e}")
+            return permissions
+
+    async def _fetch_own_page_permissions(self, page_id: str) -> list[Permission]:
+        """
+        Fetch a page's own restrictions using the v1 API (no ancestor inheritance).
 
         Args:
             page_id: The page ID
@@ -2401,6 +2531,17 @@ class ConfluenceConnector(BaseConnector):
                     external_id=principal_id,
                 )
                 if not group:
+                    if create_pseudo_group_if_missing and CONFLUENCE_RESTRICTIONS_FAIL_CLOSED:
+                        # Record-level restriction on a group we have not synced yet: keep the
+                        # restriction (fail closed) via an empty placeholder group that the
+                        # next group sync upserts by the same external id.
+                        pseudo_group = await self._create_pseudo_group(principal_id, kind="group")
+                        if pseudo_group:
+                            return Permission(
+                                external_id=pseudo_group.source_user_group_id,
+                                type=permission_type,
+                                entity_type=EntityType.GROUP
+                            )
                     self.logger.debug(f"  ⚠️ Group {principal_id} not found in DB, skipping permission")
                     return None
 
@@ -2416,25 +2557,28 @@ class ConfluenceConnector(BaseConnector):
             self.logger.error(f"❌ Failed to create permission from principal: {e}")
             return None
 
-    async def _create_pseudo_group(self, account_id: str) -> AppUserGroup | None:
+    async def _create_pseudo_group(self, account_id: str, kind: str = "user") -> AppUserGroup | None:
         """
-        Create a pseudo-group for a user without email.
+        Create a pseudo-group for a user without email (``kind="user"``) or an empty
+        placeholder for a not-yet-synced group (``kind="group"``).
 
-        This preserves permissions for users who don't have email addresses yet.
-        The pseudo-group uses the user's accountId as source_user_group_id.
+        This preserves permissions for principals we cannot resolve yet.
+        The pseudo-group uses the principal's source id as source_user_group_id.
 
         Args:
-            account_id: Confluence user accountId
+            account_id: Confluence user accountId (or group id when kind="group")
+            kind: "user" or "group" (affects the display name only)
 
         Returns:
             Created AppUserGroup or None if creation fails
         """
         try:
+            prefix = PSEUDO_GROUP_PREFIX if kind == "group" else PSEUDO_USER_GROUP_PREFIX
             pseudo_group = AppUserGroup(
                 app_name=Connectors.CONFLUENCE,
                 connector_id=self.connector_id,
                 source_user_group_id=account_id,
-                name=f"{PSEUDO_USER_GROUP_PREFIX} {account_id}",
+                name=f"{prefix} {account_id}",
                 org_id=self.data_entities_processor.org_id,
             )
 
@@ -2738,7 +2882,8 @@ class ConfluenceConnector(BaseConnector):
                         "group",
                         principal_id,
                         permission_type,
-                        create_pseudo_group_if_missing=False  # Groups don't need pseudo-groups
+                        # Placeholder group for not-yet-synced groups (fail closed)
+                        create_pseudo_group_if_missing=True
                     )
                     if permission:
                         permissions.append(permission)
@@ -5121,8 +5266,11 @@ class ConfluenceConnector(BaseConnector):
             if not webpage_record:
                 return None
 
-            # Fetch fresh permissions
-            permissions = await self._fetch_page_permissions(page_id)
+            # Fetch fresh permissions (v2 payload only carries the direct parent)
+            parent_id = page_data.get("parentId")
+            permissions = await self._fetch_page_permissions(
+                page_id, ancestor_ids=[str(parent_id)] if parent_id else None
+            )
             # Only set inherit_permissions to False if there are READ restrictions
             # EDIT-only restrictions should still inherit from space for READ access
             read_permissions = [p for p in permissions if p.type == PermissionType.READ]

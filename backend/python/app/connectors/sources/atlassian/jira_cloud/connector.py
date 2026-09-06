@@ -1,6 +1,7 @@
 """Jira Cloud Connector Implementation"""
 import asyncio
 import base64
+import os
 import re
 from collections import defaultdict
 from collections.abc import AsyncGenerator, Awaitable, Callable
@@ -117,6 +118,23 @@ USER_PAGE_SIZE: int = 50
 GROUP_PAGE_SIZE: int = 50
 GROUP_MEMBER_PAGE_SIZE: int = 50
 AUDIT_PAGE_SIZE: int = 500
+
+
+def _env_flag(name: str, default: bool = True) -> bool:
+    """Read a boolean feature flag from the environment (Edrak safe-default toggles)."""
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+# Edrak (connector RBAC): an issue that carries a Jira *issue security level* is visible
+# only to the level's members, not to every BROWSE_PROJECTS holder. Upstream ignores the
+# level and lets such issues (and their attachments) inherit the project ACL, which
+# over-shares. Default = fail closed: secured issues are still indexed but get no ACL
+# (nobody can retrieve them) until security-level membership sync exists. Set
+# JIRA_SECURED_ISSUES_FAIL_CLOSED=false to restore upstream behaviour.
+JIRA_SECURED_ISSUES_FAIL_CLOSED: bool = _env_flag("JIRA_SECURED_ISSUES_FAIL_CLOSED", True)
 
 # JQL query constants
 ISSUE_SEARCH_FIELDS: list[str] = [
@@ -3318,11 +3336,18 @@ class JiraConnector(BaseConnector):
         created_at = self._parse_jira_timestamp(fields.get("created"))
         updated_at = self._parse_jira_timestamp(fields.get("updated"))
 
+        # Issue security level (None when the issue is not restricted)
+        security = fields.get("security")
+        security_level = None
+        if isinstance(security, dict):
+            security_level = security.get("name") or security.get("id")
+
         return {
             "issue_id": issue_id,
             "issue_key": issue_key,
             "issue_name": issue_name,
             "description": description,
+            "security_level": security_level,
             "issue_type": issue_type,
             "hierarchy_level": hierarchy_level,
             "is_epic": is_epic,
@@ -3358,6 +3383,7 @@ class JiraConnector(BaseConnector):
         """
         all_records: list[tuple[Record, list[Permission]]] = []
         skipped_unchanged_count = 0
+        secured_issue_count = 0
 
         # Use the user-facing site URL for weburl construction
         atlassian_domain = self.site_url if self.site_url else ""
@@ -3389,6 +3415,18 @@ class JiraConnector(BaseConnector):
 
             # Permissions: empty list - records inherit project-level permissions via inherit_permissions=True
             permissions = []
+
+            # Edrak: issues with a security level must not inherit the project ACL
+            # (see JIRA_SECURED_ISSUES_FAIL_CLOSED). No ACL == invisible to everyone.
+            inherit_project_permissions = not (
+                JIRA_SECURED_ISSUES_FAIL_CLOSED and issue_data.get("security_level")
+            )
+            if not inherit_project_permissions:
+                secured_issue_count += 1
+                self.logger.debug(
+                    "Issue %s has security level '%s' - indexing without project ACL (fail closed)",
+                    issue_key, issue_data.get("security_level"),
+                )
 
             # Get fields for attachments (needed by _fetch_issue_attachments)
             fields = issue.get("fields", {})
@@ -3475,7 +3513,7 @@ class JiraConnector(BaseConnector):
                 source_updated_at=updated_at,
                 created_at=created_at,
                 updated_at=updated_at,
-                inherit_permissions=True,
+                inherit_permissions=inherit_project_permissions,
                 preview_renderable=False,
                 is_dependent_node=False,  # Tickets are not dependent
                 parent_node_id=None,  # Tickets have no parent node
@@ -3505,6 +3543,10 @@ class JiraConnector(BaseConnector):
                     parent_node_id=issue_record.id,
                 )
                 if attachment_records:
+                    if not inherit_project_permissions:
+                        # Attachments of a secured issue must not fall back to the project ACL either
+                        for attachment_record, _ in attachment_records:
+                            attachment_record.inherit_permissions = False
                     all_records.extend(attachment_records)
             except Exception as e:
                 self.logger.error(f"❌ Failed to fetch attachments for issue {issue_key}: {e}")
@@ -3512,6 +3554,12 @@ class JiraConnector(BaseConnector):
         # Log summary only if there were skipped issues
         if skipped_unchanged_count > 0:
             self.logger.debug(f"⏭️ Skipped {skipped_unchanged_count} unchanged issue(s)")
+        if secured_issue_count > 0:
+            self.logger.info(
+                "🔒 %s issue(s) carry a Jira security level and were indexed without project ACL "
+                "(JIRA_SECURED_ISSUES_FAIL_CLOSED=true)",
+                secured_issue_count,
+            )
 
         return all_records
 
@@ -5059,6 +5107,10 @@ class JiraConnector(BaseConnector):
                 source_updated_at=current_updated_at,
                 created_at=issue_data["created_at"],
                 updated_at=current_updated_at,
+                # Edrak: secured issues never inherit the project ACL (JIRA_SECURED_ISSUES_FAIL_CLOSED)
+                inherit_permissions=not (
+                    JIRA_SECURED_ISSUES_FAIL_CLOSED and issue_data.get("security_level")
+                ),
                 preview_renderable=False,
                 is_dependent_node=False,  # Tickets are not dependent
                 parent_node_id=None,  # Tickets have no parent node
@@ -5180,6 +5232,10 @@ class JiraConnector(BaseConnector):
                 version=version,
                 skip_filter_check=True,
             )
+
+            # Edrak: attachments of a secured issue never inherit the project ACL
+            if JIRA_SECURED_ISSUES_FAIL_CLOSED and fields.get("security"):
+                attachment_record.inherit_permissions = False
 
             # Permissions: empty list - records inherit project-level permissions via inherit_permissions=True
             permissions = []
