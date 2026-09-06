@@ -77,6 +77,7 @@ from app.models.blocks import (
     GroupType,
 )
 from app.models.entities import (
+    AppRole,
     AppUser,
     AppUserGroup,
     FileRecord,
@@ -108,6 +109,13 @@ PLACEHOLDER_SWEEP_BATCH: int = 50
 PLACEHOLDER_SWEEP_MAX_DEPTH: int = 10
 PLACEHOLDER_SWEEP_CONCURRENCY: int = 10
 PLACEHOLDER_REVISION_PREFIX: str = "placeholder:"
+
+# Public Linear teams: who may read them in the knowledge graph.
+# Default (toggle off) = an AppRole holding every synced Linear user, so access stays
+# bounded by "has a Linear seat" (email join, fail closed). Toggle on = upstream behaviour
+# (EntityType.ORG → every CGraph org member, including users without a Linear account).
+PUBLIC_TEAMS_ORG_WIDE_FILTER: str = "public_teams_org_wide"
+LINEAR_WORKSPACE_MEMBER_ROLE_ID: str = "workspace_member"
 
 
 @ConnectorBuilder("Linear")\
@@ -196,6 +204,17 @@ PLACEHOLDER_REVISION_PREFIX: str = "placeholder:"
             category=FilterCategory.SYNC,
             description="Filter issues by team (leave empty for all teams)",
             option_source_type=OptionSourceType.DYNAMIC
+        ))
+        .add_filter_field(FilterField(
+            name=PUBLIC_TEAMS_ORG_WIDE_FILTER,
+            display_name="Public teams visible to whole org",
+            filter_type=FilterType.BOOLEAN,
+            category=FilterCategory.SYNC,
+            description=(
+                "Grant every organisation member read access to public Linear teams. "
+                "When off (default) only synced Linear users (workspace members) can read them."
+            ),
+            default_value=False
         ))
         .add_filter_field(CommonFields.modified_date_filter("Filter issues by modification date."))
         .add_filter_field(CommonFields.created_date_filter("Filter issues by creation date."))
@@ -539,6 +558,10 @@ class LinearConnector(BaseConnector):
                 await self.data_entities_processor.on_new_app_users(linear_users)
                 self.logger.info(f"👥 Synced {len(linear_users)} Linear users")
 
+            # Step 2b: Workspace-member AppRole (all active Linear users) — the default
+            # grantee for public teams (see PUBLIC_TEAMS_ORG_WIDE_FILTER).
+            await self._sync_workspace_member_role(linear_users)
+
             # Step 3: Get team_ids filter and fetch teams
             team_ids = None
             team_ids_operator = None
@@ -616,6 +639,37 @@ class LinearConnector(BaseConnector):
 
         except Exception as e:
             self.logger.error(f"❌ Error during Linear sync: {e}", exc_info=True)
+            raise
+
+    def _public_teams_org_wide(self) -> bool:
+        """True only when the admin explicitly opted into org-wide access for public teams."""
+        if not self.sync_filters:
+            return False
+        try:
+            return bool(self.sync_filters.is_enabled(PUBLIC_TEAMS_ORG_WIDE_FILTER, default=False))
+        except Exception:
+            return False
+
+    async def _sync_workspace_member_role(self, linear_users: List[AppUser]) -> None:
+        """
+        Upsert the ``workspace_member`` AppRole holding every active Linear user.
+        Membership is replaced on each sync (on_new_app_roles deletes stale edges), and only
+        users that exist in CGraph by email get an edge, so access stays fail-closed.
+        """
+        role = AppRole(
+            app_name=Connectors.LINEAR,
+            connector_id=self.connector_id,
+            source_role_id=LINEAR_WORKSPACE_MEMBER_ROLE_ID,
+            name="Workspace Member",
+            org_id=self.data_entities_processor.org_id,
+        )
+        try:
+            await self.data_entities_processor.on_new_app_roles([(role, list(linear_users or []))])
+            self.logger.info(
+                f"✅ Linear workspace_member role synced — {len(linear_users or [])} users"
+            )
+        except Exception as e:
+            self.logger.error(f"❌ Failed to sync Linear workspace_member role: {e}", exc_info=True)
             raise
 
     async def _fetch_users(self) -> List[AppUser]:
@@ -855,14 +909,22 @@ class LinearConnector(BaseConnector):
                     type=PermissionType.READ,
                 ))
                 self.logger.info(f"Team {team_key} is private - added UserGroup permission (external_id={team_id})")
-            else:
-                # For public teams: All org members can access
+            elif self._public_teams_org_wide():
+                # Upstream behaviour (opt-in): every CGraph org member can read public teams
                 permissions.append(Permission(
                     entity_type=EntityType.ORG,
                     type=PermissionType.READ,
                     external_id=None
                 ))
                 self.logger.info(f"Team {team_key} is public - added org-level permission for all org members")
+            else:
+                # Default: public teams are readable by synced Linear users only
+                permissions.append(Permission(
+                    entity_type=EntityType.ROLE,
+                    external_id=LINEAR_WORKSPACE_MEMBER_ROLE_ID,
+                    type=PermissionType.READ,
+                ))
+                self.logger.info(f"Team {team_key} is public - added workspace_member role permission")
 
             record_groups.append((record_group, permissions))
 
