@@ -13,6 +13,7 @@ Key differences from Azure Blob/S3:
 
 import base64
 import mimetypes
+import os
 import uuid
 from collections.abc import AsyncGenerator, Iterable
 from datetime import datetime, timedelta, timezone
@@ -88,6 +89,22 @@ from app.utils.time_conversion import datetime_to_epoch_ms, get_epoch_timestamp_
 
 # Default connector endpoint for signed URL generation
 DEFAULT_CONNECTOR_ENDPOINT = "http://localhost:8000"
+
+
+def _personal_org_fallback_enabled() -> bool:
+    """Edrak: opt-in switch restoring upstream's org-wide READ fallback in PERSONAL scope.
+
+    Upstream granted the whole org READ on a personal-scope object store whenever the
+    creator could not be resolved (or permission building raised). That is fail-open:
+    a member's private bucket became org-readable. Default here is fail-closed (no
+    permission edge; the creator still reaches records through the user->app edge).
+    Set CGRAPH_OBJECT_STORE_PERSONAL_ORG_FALLBACK=true to restore the upstream behaviour.
+    """
+    return os.getenv("CGRAPH_OBJECT_STORE_PERSONAL_ORG_FALLBACK", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
 
 
 def get_file_extension(file_path: str) -> str | None:
@@ -581,13 +598,19 @@ class AzureFilesConnector(BaseConnector):
                     )
 
                 if not permissions:
-                    permissions.append(
-                        Permission(
-                            type=PermissionType.READ,
-                            entity_type=EntityType.ORG,
-                            external_id=self.data_entities_processor.org_id,
+                    # Edrak: fail closed unless the upstream org-wide fallback is opted in.
+                    if _personal_org_fallback_enabled():
+                        permissions.append(
+                            Permission(
+                                type=PermissionType.READ,
+                                entity_type=EntityType.ORG,
+                                external_id=self.data_entities_processor.org_id,
+                            )
                         )
-                    )
+                    else:
+                        self.logger.debug(
+                            "Personal-scope connector: creator not resolvable; no permission edge written (fail closed)."
+                        )
 
             lm_ms = ts_map.get(share_name)
             record_group = RecordGroup(
@@ -1199,24 +1222,34 @@ class AzureFilesConnector(BaseConnector):
                     )
 
                 if not permissions:
-                    permissions.append(
-                        Permission(
-                            type=PermissionType.READ,
-                            entity_type=EntityType.ORG,
-                            external_id=self.data_entities_processor.org_id,
+                    # Edrak: fail closed unless the upstream org-wide fallback is opted in.
+                    if _personal_org_fallback_enabled():
+                        permissions.append(
+                            Permission(
+                                type=PermissionType.READ,
+                                entity_type=EntityType.ORG,
+                                external_id=self.data_entities_processor.org_id,
+                            )
                         )
-                    )
+                    else:
+                        self.logger.debug(
+                            "Personal-scope connector: creator not resolvable; no permission edge written (fail closed)."
+                        )
 
             return permissions
         except Exception as e:
             self.logger.warning(f"Error creating permissions for {item_path}: {e}")
-            return [
-                Permission(
-                    type=PermissionType.READ,
-                    entity_type=EntityType.ORG,
-                    external_id=self.data_entities_processor.org_id,
-                )
-            ]
+            # Edrak: team scope keeps its declared org-wide grant; personal scope fails closed
+            # unless CGRAPH_OBJECT_STORE_PERSONAL_ORG_FALLBACK opts back in.
+            if self.scope == ConnectorScope.TEAM.value or _personal_org_fallback_enabled():
+                return [
+                    Permission(
+                        type=PermissionType.READ,
+                        entity_type=EntityType.ORG,
+                        external_id=self.data_entities_processor.org_id,
+                    )
+                ]
+            return []
 
     async def test_connection_and_access(self) -> bool:
         """Test connection and access."""

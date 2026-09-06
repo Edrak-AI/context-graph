@@ -7,6 +7,7 @@ S3Connector and MinIOConnector to avoid code duplication.
 """
 
 import mimetypes
+import os
 import uuid
 from abc import abstractmethod
 from collections.abc import Callable
@@ -61,6 +62,22 @@ from app.models.entities import (
 from app.models.permission import EntityType, Permission, PermissionType
 from app.utils.streaming import create_stream_record_response, stream_content
 from app.utils.time_conversion import datetime_to_epoch_ms, get_epoch_timestamp_in_ms
+
+
+def _personal_org_fallback_enabled() -> bool:
+    """Edrak: opt-in switch restoring upstream's org-wide READ fallback in PERSONAL scope.
+
+    Upstream granted the whole org READ on a personal-scope object store whenever the
+    creator could not be resolved (or permission building raised). That is fail-open:
+    a member's private bucket became org-readable. Default here is fail-closed (no
+    permission edge; the creator still reaches records through the user->app edge).
+    Set CGRAPH_OBJECT_STORE_PERSONAL_ORG_FALLBACK=true to restore the upstream behaviour.
+    """
+    return os.getenv("CGRAPH_OBJECT_STORE_PERSONAL_ORG_FALLBACK", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
 
 
 def _bucket_creation_dates_from_list_buckets(
@@ -522,13 +539,19 @@ class S3CompatibleBaseConnector(BaseConnector):
                         self.logger.warning(f"Could not get user for created_by {self.created_by}: {e}")
 
                 if not permissions:
-                    permissions.append(
-                        Permission(
-                            type=PermissionType.READ,
-                            entity_type=EntityType.ORG,
-                            external_id=self.data_entities_processor.org_id
+                    # Edrak: fail closed unless the upstream org-wide fallback is opted in.
+                    if _personal_org_fallback_enabled():
+                        permissions.append(
+                            Permission(
+                                type=PermissionType.READ,
+                                entity_type=EntityType.ORG,
+                                external_id=self.data_entities_processor.org_id,
+                            )
                         )
-                    )
+                    else:
+                        self.logger.debug(
+                            "Personal-scope connector: creator not resolvable; no permission edge written (fail closed)."
+                        )
 
             creation_ms = creation_map.get(bucket_name)
             record_group = RecordGroup(
@@ -1077,24 +1100,34 @@ class S3CompatibleBaseConnector(BaseConnector):
                         self.logger.warning(f"Could not get user for created_by {self.created_by}: {e}")
 
                 if not permissions:
-                    permissions.append(
-                        Permission(
-                            type=PermissionType.READ,
-                            entity_type=EntityType.ORG,
-                            external_id=self.data_entities_processor.org_id
+                    # Edrak: fail closed unless the upstream org-wide fallback is opted in.
+                    if _personal_org_fallback_enabled():
+                        permissions.append(
+                            Permission(
+                                type=PermissionType.READ,
+                                entity_type=EntityType.ORG,
+                                external_id=self.data_entities_processor.org_id,
+                            )
                         )
-                    )
+                    else:
+                        self.logger.debug(
+                            "Personal-scope connector: creator not resolvable; no permission edge written (fail closed)."
+                        )
 
             return permissions
         except Exception as e:
             self.logger.warning(f"Error creating permissions for {key}: {e}")
-            return [
-                Permission(
-                    type=PermissionType.READ,
-                    entity_type=EntityType.ORG,
-                    external_id=self.data_entities_processor.org_id
-                )
-            ]
+            # Edrak: team scope keeps its declared org-wide grant; personal scope fails closed
+            # unless CGRAPH_OBJECT_STORE_PERSONAL_ORG_FALLBACK opts back in.
+            if self.scope == ConnectorScope.TEAM.value or _personal_org_fallback_enabled():
+                return [
+                    Permission(
+                        type=PermissionType.READ,
+                        entity_type=EntityType.ORG,
+                        external_id=self.data_entities_processor.org_id,
+                    )
+                ]
+            return []
 
     async def test_connection_and_access(self) -> bool:
         """Test connection and access."""
