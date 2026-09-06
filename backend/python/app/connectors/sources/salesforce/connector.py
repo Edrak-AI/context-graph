@@ -1,6 +1,7 @@
 import asyncio
 import json
 import mimetypes
+import os
 import httpx
 import re
 import base64
@@ -718,6 +719,20 @@ def _ts_in_bounds(
     if before_ms is not None and ts > before_ms:
         return False
     return True
+
+
+def _salesforce_files_org_read_enabled() -> bool:
+    """Edrak: upstream lets every file linked to an Opportunity/Case/Task (and every
+    unlinked file) inherit the org-wide READ grant of the "Salesforce Files" record
+    group, regardless of who may see the parent record in Salesforce. Off by default:
+    such files get ``inherit_permissions=False`` and receive the linked parent's
+    UserRecordAccess edges instead (see ``_sync_permissions_edges``); files with no
+    linked parent become visible to nobody. Set CGRAPH_SALESFORCE_FILES_ORG_READ=true
+    to restore the upstream org-wide behaviour.
+    """
+    return os.getenv("CGRAPH_SALESFORCE_FILES_ORG_READ", "").strip().lower() in (
+        "1", "true", "yes",
+    )
 
 
 @ConnectorBuilder("Salesforce")\
@@ -3481,7 +3496,19 @@ class SalesforceConnector(BaseConnector):
             parent_external_record_id=parent_id,
             parent_record_type=parent_record_type,
         )
+        # Files under the org-wide "Salesforce Files" group must not inherit its ORG READ
+        # grant; they get the linked parent's per-user edges in _sync_permissions_edges.
+        # Files under an Account record group keep inheriting that group's UserRecordAccess
+        # edges, which already reflect Salesforce sharing.
+        if (
+            external_record_group_id == self._files_record_group_external_id()
+            and not _salesforce_files_org_read_enabled()
+        ):
+            file_record.inherit_permissions = False
         return file_record
+
+    def _files_record_group_external_id(self) -> str:
+        return f"{self.data_entities_processor.org_id}-files"
 
     async def _fetch_salesforce_record_if_updated(
         self,
@@ -5871,6 +5898,27 @@ class SalesforceConnector(BaseConnector):
             )
             salesforce_records = [r for r in salesforce_records if r.get("connectorId") == self.connector_id]
 
+            # Edrak: files parked under the org-wide "Salesforce Files" group carry no
+            # ORG inheritance (see _build_file_record); they take their linked parent's
+            # access below. Keyed by internal id so the stale-edge wipe covers them too.
+            file_parent_by_internal_id: Dict[str, str] = {}
+            if not _salesforce_files_org_read_enabled():
+                file_records = await tx_store.get_nodes_by_field_in(
+                    collection=CollectionNames.RECORDS.value,
+                    field="recordType",
+                    values=[RecordType.FILE.value],
+                )
+                files_group_ext_id = self._files_record_group_external_id()
+                for f in file_records:
+                    if f.get("connectorId") != self.connector_id:
+                        continue
+                    if f.get("externalGroupId") != files_group_ext_id:
+                        continue
+                    internal_id = f.get("id") or f.get("_key")
+                    parent_ext_id = f.get("externalParentId")
+                    if internal_id and parent_ext_id:
+                        file_parent_by_internal_id[internal_id] = parent_ext_id
+
             salesforce_record_groups = await tx_store.get_nodes_by_field_in(
                 collection=CollectionNames.RECORD_GROUPS.value,
                 field="groupType",
@@ -5948,8 +5996,12 @@ class SalesforceConnector(BaseConnector):
         #    Deleting by target record/group (not by user) is O(records + groups) instead
         #    of O(users × records).  SALESFORCE_ORG record groups carry no ORG-level
         #    permission edges, so wiping all PERMISSION edges to them is safe.
-        all_record_internal_ids = list(ext_id_to_record_id.values())
+        all_record_internal_ids = list(ext_id_to_record_id.values()) + list(file_parent_by_internal_id.keys())
         all_rg_internal_ids = list(ext_id_to_rg_id.values())
+        # parent external id -> internal ids of the files that should mirror its access
+        parent_ext_id_to_file_ids: Dict[str, List[str]] = {}
+        for file_id, parent_ext_id in file_parent_by_internal_id.items():
+            parent_ext_id_to_file_ids.setdefault(parent_ext_id, []).append(file_id)
 
         async with self.data_store_provider.transaction() as tx_store:
             delete_tasks = [
@@ -6007,6 +6059,14 @@ class SalesforceConnector(BaseConnector):
                         to_id=target_id,
                         to_collection=CollectionNames.RECORDS.value,
                     ))
+                    # Files linked to this record see exactly what the record's viewers see.
+                    for file_internal_id in parent_ext_id_to_file_ids.get(ext_id, ()):
+                        record_edges.append(permission.to_arango_permission(
+                            from_id=user_internal_id,
+                            from_collection=CollectionNames.USERS.value,
+                            to_id=file_internal_id,
+                            to_collection=CollectionNames.RECORDS.value,
+                        ))
 
             if record_edges:
                 await tx_store.batch_create_edges(record_edges, collection=CollectionNames.PERMISSION.value)

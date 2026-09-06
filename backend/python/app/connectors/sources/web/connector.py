@@ -1,8 +1,11 @@
 import asyncio
 import base64
 import hashlib
+import ipaddress
+import os
 import random
 import re
+import socket
 import uuid
 from collections import deque
 from dataclasses import dataclass
@@ -166,6 +169,19 @@ IMAGE_MIME_TYPES = {
     MimeTypes.JPG.value,
     MimeTypes.GIF.value,
 }
+
+def _web_private_networks_allowed() -> bool:
+    """Edrak: the crawler runs inside the cluster, so without a guard any URL that
+    resolves to a private, loopback, link-local or otherwise non-public address
+    (intranet hosts, Kubernetes services, the cloud metadata endpoint) would be
+    indexed and — for a team-scope instance — granted org-wide READ. Blocked by
+    default; set CGRAPH_WEB_ALLOW_PRIVATE_NETWORKS=true for a deployment that
+    deliberately crawls internal sites.
+    """
+    return os.getenv("CGRAPH_WEB_ALLOW_PRIVATE_NETWORKS", "").strip().lower() in (
+        "1", "true", "yes",
+    )
+
 
 class WebApp(App):
     def __init__(self, connector_id: str) -> None:
@@ -376,6 +392,9 @@ class WebConnector(BaseConnector):
         self.sync_filters: FilterCollection = FilterCollection()
         self.indexing_filters: FilterCollection = FilterCollection()
 
+        # host -> True when it resolves to a non-public address (see _is_private_network_target)
+        self._private_host_cache: Dict[str, bool] = {}
+
     async def init(self) -> bool:
         """Initialize the web connector with configuration."""
         try:
@@ -392,6 +411,12 @@ class WebConnector(BaseConnector):
             self.start_path_prefix = config_values["start_path_prefix"]
             self.url_should_contain = config_values["url_should_contain"]
             self.use_headless_browser = config_values["use_headless_browser"]
+
+            if self.url and await self._is_private_network_target(self.url):
+                raise ValueError(
+                    f"Refusing to crawl {self.url}: host resolves to a private/internal address "
+                    "(set CGRAPH_WEB_ALLOW_PRIVATE_NETWORKS=true to allow)"
+                )
 
             # Load creator email if needed (for personal scope permission creation)
             await self._load_creator_email()
@@ -1455,6 +1480,10 @@ class WebConnector(BaseConnector):
 
         Side-effects: may mutate self.retry_urls and self.visited_urls.
         """
+        if await self._is_private_network_target(url):
+            self.visited_urls.add(self._normalize_url(url))
+            return None
+
         if result is None:
             normalized = self._normalize_url(url)
             existing_entry = self.retry_urls.get(normalized)
@@ -1470,6 +1499,10 @@ class WebConnector(BaseConnector):
             return None
 
         final_url = result.final_url
+
+        if final_url != url and await self._is_private_network_target(final_url):
+            self.visited_urls.add(self._normalize_url(final_url))
+            return None
 
         if self.base_domain and not self.follow_external:
             final_netloc = urlparse(final_url).netloc
@@ -2000,6 +2033,61 @@ class WebConnector(BaseConnector):
             is_disabled = not self.indexing_filters.is_enabled(IndexingFilterKey.IMAGES, default=True)
 
         return is_disabled
+
+    async def _is_private_network_target(self, url: str) -> bool:
+        """True when ``url`` must not be crawled because its host is not publicly routable.
+
+        Any resolved address that is not global (RFC1918, loopback, link-local incl. the
+        cloud metadata endpoint, unspecified, multicast, reserved) blocks the URL. A host
+        that fails to resolve is *not* treated as private — the fetch fails on its own.
+        Always False when CGRAPH_WEB_ALLOW_PRIVATE_NETWORKS is on. Results are cached per
+        host for the lifetime of the connector instance.
+        """
+        if _web_private_networks_allowed():
+            return False
+        try:
+            host = urlparse(url).hostname
+        except Exception:
+            return True
+        if not host:
+            return True
+        host = host.lower().rstrip(".")
+        cached = self._private_host_cache.get(host)
+        if cached is not None:
+            return cached
+
+        addresses: List[str] = []
+        try:
+            addresses = [str(ipaddress.ip_address(host))]
+        except ValueError:
+            try:
+                infos = await asyncio.get_running_loop().getaddrinfo(
+                    host, None, type=socket.SOCK_STREAM
+                )
+                addresses = [info[4][0] for info in infos if info and info[4]]
+            except Exception as e:
+                self.logger.debug("Could not resolve %s for private-network check: %s", host, e)
+                self._private_host_cache[host] = False
+                return False
+
+        blocked = host == "localhost"
+        for addr in addresses:
+            try:
+                ip = ipaddress.ip_address(addr.split("%", 1)[0])
+            except ValueError:
+                continue
+            if not ip.is_global:
+                blocked = True
+                break
+
+        if blocked:
+            self.logger.warning(
+                "Skipping %s: host %s resolves to a private/internal address "
+                "(CGRAPH_WEB_ALLOW_PRIVATE_NETWORKS is off)",
+                url, host,
+            )
+        self._private_host_cache[host] = blocked
+        return blocked
 
     def _is_valid_url(self, url: str, base_url: str) -> bool:
         """Check if a URL should be crawled."""
