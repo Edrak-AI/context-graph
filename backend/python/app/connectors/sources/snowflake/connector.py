@@ -371,7 +371,13 @@ class SnowflakeConnector(BaseConnector):
         data_store_provider: DataStoreProvider,
         config_service: ConfigurationService,
         connector_id: str,
+        scope: str = ConnectorScope.TEAM.value,
+        created_by: Optional[str] = None,
     ) -> None:
+        # ``scope`` / ``created_by`` are required by BaseConnector; the factory
+        # always passes them (ConnectorFactory.create_connector). Dropping them
+        # here raised TypeError at construction and, had it not, would have
+        # created the team-app edge for a personal connector.
         super().__init__(
             SnowflakeApp(connector_id),
             logger,
@@ -379,6 +385,8 @@ class SnowflakeConnector(BaseConnector):
             data_store_provider,
             config_service,
             connector_id,
+            scope,
+            created_by,
         )
         self.connector_id = connector_id
         self.connector_name = Connectors.SNOWFLAKE
@@ -460,8 +468,21 @@ class SnowflakeConnector(BaseConnector):
                 self.logger.error("Missing accountIdentifier in configuration")
                 return False
 
-            self.connector_scope = config.get("scope", ConnectorScope.PERSONAL.value)
-            self.created_by = config.get("created_by")
+            self.scope = config.get("scope", self.scope or ConnectorScope.TEAM.value)
+            self.connector_scope = self.scope
+            self.created_by = config.get("created_by", self.created_by)
+
+            if self.scope == ConnectorScope.PERSONAL.value:
+                # Personal scope: records are readable by the creator only. Without a
+                # resolvable creator the sync would produce records nobody can read
+                # (fail closed) - refuse to start instead of falling back to org-wide.
+                await self._load_creator_email()
+                if not self.creator_email:
+                    self.logger.error(
+                        "Personal Snowflake connector %s has no resolvable creator email; refusing to sync",
+                        self.connector_id,
+                    )
+                    return False
 
             # Determine authentication method
             pat_token = auth_config.get("patToken")
@@ -1466,15 +1487,31 @@ class SnowflakeConnector(BaseConnector):
         """
         Get permissions for Snowflake records.
 
-        For Snowflake connectors, permissions are granted at the organization level
-        since database objects are not owned by individual users. This allows
-        anyone in the organization to access the Snowflake data catalog.
+        Snowflake exposes no per-object ACL the connector could copy, so:
+
+        - team scope: one blanket ORG permission on every database record group
+          (tables / views / stage files inherit it) - every org member can read
+          everything the configured role can SELECT.
+        - personal scope: READER for the connector creator and nobody else. An
+          empty list (creator unknown) means the records are visible to no one,
+          never to the org.
 
         Returns:
-            List of Permission objects for the organization
+            List of Permission objects
         """
-        # Use org-level permissions for Snowflake
-        # Database connectors grant access to the entire organization
+        if self.scope == ConnectorScope.PERSONAL.value:
+            if not self.creator_email:
+                self.logger.warning(
+                    "Personal Snowflake connector %s: creator email unknown; granting no permissions",
+                    self.connector_id,
+                )
+                return []
+            return [Permission(
+                email=self.creator_email,
+                type=PermissionType.READ,
+                entity_type=EntityType.USER,
+            )]
+
         return [Permission(
             type=PermissionType.OWNER,
             entity_type=EntityType.ORG,
@@ -3003,4 +3040,6 @@ class SnowflakeConnector(BaseConnector):
             data_store_provider,
             config_service,
             connector_id,
+            kwargs.get("scope", ConnectorScope.TEAM.value),
+            kwargs.get("created_by"),
         )
