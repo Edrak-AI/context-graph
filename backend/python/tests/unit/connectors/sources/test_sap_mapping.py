@@ -18,7 +18,10 @@ from app.connectors.sources.sap.mapping import (  # noqa: E402
     ALL_FILTER_ENTITIES,
     ATTACHMENT_ID_PREFIX,
     DEFAULT_ENTITY_ORDER,
+    DEFAULT_RECONCILE_INTERVAL_HOURS,
     ENTITY_SPECS,
+    LANGUAGE_PREFERENCE,
+    RECONCILE_KEY_PAGE_SIZE,
     SCOPE_COMPANY_CODE,
     SCOPE_PLANT,
     SCOPE_SALES_ORG,
@@ -31,6 +34,7 @@ from app.connectors.sources.sap.mapping import (  # noqa: E402
     attachment_key,
     attachment_list_url,
     attachments_selected,
+    build_key_page_params,
     build_metadata,
     build_modified_filter,
     build_page_params,
@@ -39,29 +43,41 @@ from app.connectors.sources.sap.mapping import (  # noqa: E402
     derive_grants,
     entity_list_web_url,
     entity_url,
+    external_id_entity,
     fiori_web_url,
     group_display_name,
     group_ids_in_grants,
     key_predicate,
+    localized_texts,
     metadata_url,
     named_group_external_id,
     next_page_skip,
     normalize_base_url,
+    normalize_language_code,
     odata_collection,
     odata_datetime_literal,
     parse_authorization_mapping,
     parse_entity,
     parse_page,
+    parse_reconcile_interval_hours,
+    parse_retry_after,
     parse_sap_timestamp,
     parse_scope_key,
+    plan_reconcile,
+    preferred_text,
+    product_description,
+    product_descriptions,
+    reconcile_due,
     record_external_id,
     record_group_external_id,
     record_title,
     record_web_url,
     render_record_markdown,
     resolve_selected_entities,
+    retry_delay,
     scope_codes,
     scope_group_external_id,
+    slugify_group_name,
     split_external_id,
 )
 
@@ -486,6 +502,244 @@ class TestDeriveGrants(unittest.TestCase):
         a = PermissionGrant(GrantEntity.USER, GrantRole.OWNER, email="x@y.z", reason="one")
         b = PermissionGrant(GrantEntity.USER, GrantRole.OWNER, email="x@y.z", reason="two")
         self.assertEqual(a, b)
+
+
+AR_FINANCE = "الإدارة المالية"
+AR_SALES_RIYADH = "مبيعات الرياض"
+AR_SALES_JEDDAH = "مبيعات جدة"
+
+
+def _product_row(descriptions, **overrides) -> dict:
+    """SAP OData v2 shaped product with an inline ``to_Description`` feed."""
+    row = {
+        "Product": "MAT-100",
+        "ProductType": "FERT",
+        "ProductGroup": "01",
+        "to_Description": {"results": [
+            {"Product": "MAT-100", "Language": lang, "ProductDescription": text} for lang, text in descriptions
+        ]},
+    }
+    row.update(overrides)
+    return row
+
+
+class TestSlugifyGroupName(unittest.TestCase):
+    def test_ascii_names_are_unchanged_from_legacy_behaviour(self):
+        # No hash suffix: existing groups keep their external ids.
+        self.assertEqual(slugify_group_name("SAP Finance 1010"), "sap-finance-1010")
+        self.assertEqual(slugify_group_name("  Sales__Team (EMEA)!  "), "sales-team-emea")
+        self.assertEqual(slugify_group_name("0f3f6e1c-3f0e-4d3e-9a8b-3a1a4e0c7b21"), "0f3f6e1c-3f0e-4d3e-9a8b-3a1a4e0c7b21")
+        self.assertEqual(slugify_group_name(""), "group")
+        self.assertEqual(slugify_group_name("!!!"), "group")
+        self.assertEqual(named_group_external_id("SAP Finance 1010"), "sap:group:sap-finance-1010")
+
+    def test_arabic_names_keep_their_letters_and_do_not_collide(self):
+        finance = slugify_group_name(AR_FINANCE)
+        riyadh = slugify_group_name(AR_SALES_RIYADH)
+        jeddah = slugify_group_name(AR_SALES_JEDDAH)
+        for slug in (finance, riyadh, jeddah):
+            self.assertNotEqual(slug, "group")
+            self.assertNotIn(" ", slug)
+        self.assertTrue(finance.startswith("الإدارة-المالية-"), finance)
+        self.assertTrue(riyadh.startswith("مبيعات-الرياض-"), riyadh)
+        self.assertRegex(finance, r"-[0-9a-f]{8}$")
+        self.assertEqual(len({finance, riyadh, jeddah}), 3)
+        # Different names sharing every kept character still differ through the hash.
+        self.assertNotEqual(slugify_group_name("مبيعات الرياض"), slugify_group_name("مبيعات-الرياض!"))
+
+    def test_slugs_are_stable_across_runs_and_unicode_forms(self):
+        self.assertEqual(slugify_group_name(AR_FINANCE), slugify_group_name(AR_FINANCE))
+        # Whitespace around the name and NFKC-equivalent code points map to the same group.
+        self.assertEqual(slugify_group_name(f"  {AR_FINANCE}  "), slugify_group_name(AR_FINANCE))
+        self.assertEqual(slugify_group_name("ﻣﺒﻴﻌﺎﺕ"), slugify_group_name("مبيعات"))  # presentation forms → base letters
+        self.assertEqual(named_group_external_id(AR_FINANCE), f"sap:group:{slugify_group_name(AR_FINANCE)}")
+
+    def test_mixed_names_lowercase_latin_and_keep_arabic_and_digits(self):
+        slug = slugify_group_name("SAP فريق المالية 1010")
+        self.assertTrue(slug.startswith("sap-فريق-المالية-1010-"), slug)
+        self.assertRegex(slug, r"^sap-فريق-المالية-1010-[0-9a-f]{8}$")
+        digits = slugify_group_name("فرع ٠١٢")  # Arabic-Indic digits are digits, not folded to ASCII
+        self.assertTrue(digits.startswith("فرع-٠١٢-"), digits)
+        symbols_only = slugify_group_name("★☆")
+        self.assertRegex(symbols_only, r"^group-[0-9a-f]{8}$")
+        self.assertNotEqual(symbols_only, slugify_group_name("♥"))
+
+    def test_arabic_groups_resolve_in_mapping_and_get_readable_labels(self):
+        mapping = parse_authorization_mapping({
+            "companycode:1010": [f"group:{AR_FINANCE}"],
+            "salesorg:1010": [f"group:{AR_SALES_RIYADH}"],
+            "salesorg:1710": [f"group:{AR_SALES_JEDDAH}"],
+            "groups": {AR_FINANCE: ["cfo@edrak.com"], AR_SALES_RIYADH: ["riyadh@edrak.com"], AR_SALES_JEDDAH: ["jeddah@edrak.com"]},
+        })
+        expanded = mapping.expand(None)
+        self.assertEqual(expanded.members["sap:companycode:1010"], ["cfo@edrak.com"])
+        self.assertEqual(expanded.members["sap:salesorg:1010"], ["riyadh@edrak.com"])
+        self.assertEqual(expanded.members["sap:salesorg:1710"], ["jeddah@edrak.com"])
+        self.assertEqual(expanded.unresolved_groups, [])
+        finance_id = named_group_external_id(AR_FINANCE)
+        self.assertIn(finance_id, expanded.members)
+        self.assertEqual(len([g for g in mapping.group_ids() if g.startswith("sap:group:")]), 3)
+        self.assertEqual(group_display_name(finance_id, mapping), f"SAP · Group {AR_FINANCE}")
+        self.assertEqual(mapping.named_group_label(slugify_group_name(AR_FINANCE)), AR_FINANCE)
+        self.assertIsNone(mapping.named_group_label("nope"))
+        # Referenced-but-undefined groups are still labelled by their original name.
+        referenced = parse_authorization_mapping({"plant:1010": [f"group:{AR_SALES_JEDDAH}"]})
+        self.assertEqual(group_display_name(named_group_external_id(AR_SALES_JEDDAH), referenced), f"SAP · Group {AR_SALES_JEDDAH}")
+        self.assertEqual(group_display_name("sap:group:sap-finance-1010"), "SAP · Group sap-finance-1010")
+
+
+class TestLanguagePreference(unittest.TestCase):
+    AR = "مادة تجارية"
+    EN = "Trading good"
+    DE = "Handelsware"
+
+    def test_language_codes_normalise_without_touching_text(self):
+        self.assertEqual(LANGUAGE_PREFERENCE, ("AR", "EN"))
+        for raw in ("AR", "ar", "ar-SA", "ar_SA", "A"):
+            self.assertEqual(normalize_language_code(raw), "AR", raw)
+        for raw in ("EN", "en-US", "E"):
+            self.assertEqual(normalize_language_code(raw), "EN", raw)
+        self.assertEqual(normalize_language_code("D"), "DE")
+        self.assertEqual(normalize_language_code(None), "")
+        self.assertEqual(normalize_language_code("  "), "")
+
+    def test_arabic_wins_then_english_then_any(self):
+        row = _product_row([("DE", self.DE), ("EN", self.EN), ("AR", self.AR)])
+        self.assertEqual(product_description(row), self.AR)
+        self.assertEqual(product_descriptions(row), [("AR", self.AR), ("EN", self.EN), ("DE", self.DE)])
+        self.assertEqual(record_title(PROD, row), f"{self.AR} (MAT-100)")
+        self.assertEqual(product_description(_product_row([("DE", self.DE), ("EN", self.EN)])), self.EN)
+        self.assertEqual(product_description(_product_row([("DE", self.DE)])), self.DE)
+        self.assertIsNone(product_description(_product_row([])))
+        self.assertIsNone(product_description({"Product": "X", "to_Description": {"__deferred": {"uri": "x"}}}))
+        # explicit preference is honoured before the default order
+        self.assertEqual(product_description(row, preferred_language="EN"), self.EN)
+        self.assertEqual(product_description(row, preferred_language="fr"), self.AR)
+
+    def test_sap_one_letter_language_keys_and_empty_texts(self):
+        row = _product_row([("E", self.EN), ("A", self.AR), ("D", "")])
+        self.assertEqual(product_description(row), self.AR)
+        self.assertEqual(product_descriptions(row), [("AR", self.AR), ("EN", self.EN)])
+        self.assertEqual(preferred_text(row["to_Description"], "ProductDescription", preference=("EN",)), self.EN)
+        self.assertEqual(localized_texts([{"Language": "AR", "T": " نص "}, {"Language": "AR", "T": "dup"}], "T"), [("AR", "نص")])
+        self.assertEqual(localized_texts([{"T": "no lang"}], "T"), [("", "no lang")])
+
+    def test_markdown_keeps_both_languages_and_metadata_lists_them(self):
+        row = _product_row([("EN", self.EN), ("AR", self.AR)])
+        markdown, metadata = render_record_markdown(PROD, row, BASE)
+        self.assertTrue(markdown.startswith(f"# {self.AR} (MAT-100)\n"), markdown.splitlines()[0])
+        self.assertIn(f"- **Description (AR):** {self.AR}", markdown)
+        self.assertIn(f"- **Description (EN):** {self.EN}", markdown)
+        self.assertLess(markdown.index("Description (AR)"), markdown.index("Description (EN)"))
+        self.assertLess(markdown.index("Description (EN)"), markdown.index("- **Product type:**"))
+        self.assertEqual(metadata["descriptions"], {"AR": self.AR, "EN": self.EN})
+        # single language: plain label, no ASCII folding of the Arabic text
+        single, meta_single = render_record_markdown(PROD, _product_row([("AR", self.AR)]), BASE)
+        self.assertIn(f"- **Description:** {self.AR}", single)
+        self.assertNotIn("Description (", single)
+        self.assertEqual(meta_single["descriptions"], {"AR": self.AR})
+        self.assertEqual(build_metadata(SO, _so_row(), BASE)["descriptions"], {})
+
+    def test_arabic_business_partner_names_are_untouched(self):
+        row = {"BusinessPartner": "1", "BusinessPartnerFullName": "شركة أرامكو السعودية", "CreatedByUser": "ABDULLAH"}
+        self.assertEqual(record_title(BP, row), "شركة أرامكو السعودية")
+        markdown, _ = render_record_markdown(BP, row, BASE)
+        self.assertIn("# شركة أرامكو السعودية", markdown)
+
+
+class TestRetryAfter(unittest.TestCase):
+    def test_parse_delay_seconds_and_http_date(self):
+        self.assertEqual(parse_retry_after("30"), 30.0)
+        self.assertEqual(parse_retry_after(" 2.5 "), 2.5)
+        self.assertEqual(parse_retry_after(7), 7.0)
+        self.assertEqual(parse_retry_after("-3"), 0.0)
+        self.assertIsNone(parse_retry_after(None))
+        self.assertIsNone(parse_retry_after(""))
+        self.assertIsNone(parse_retry_after("soon"))
+        now = 1445412480.0  # Wed, 21 Oct 2015 07:28:00 GMT
+        self.assertEqual(parse_retry_after("Wed, 21 Oct 2015 07:28:30 GMT", now_s=now), 30.0)
+        self.assertEqual(parse_retry_after("Wed, 21 Oct 2015 07:27:00 GMT", now_s=now), 0.0)
+
+    def test_retry_delay_prefers_server_hint_and_clamps(self):
+        self.assertEqual(retry_delay("10", fallback=1.0), 10.0)
+        self.assertEqual(retry_delay(None, fallback=4.0), 4.0)
+        self.assertEqual(retry_delay("garbage", fallback=4.0), 4.0)
+        self.assertEqual(retry_delay("0", fallback=4.0), 0.5)
+        self.assertEqual(retry_delay("3600", fallback=1.0), 60.0)
+        self.assertEqual(retry_delay("Wed, 21 Oct 2015 07:28:20 GMT", fallback=1.0, now_s=1445412480.0), 20.0)
+
+
+class TestReconcile(unittest.TestCase):
+    def test_interval_parsing_and_due(self):
+        self.assertEqual(DEFAULT_RECONCILE_INTERVAL_HOURS, 24.0)
+        self.assertEqual(parse_reconcile_interval_hours(None), 24.0)
+        self.assertEqual(parse_reconcile_interval_hours(""), 24.0)
+        self.assertEqual(parse_reconcile_interval_hours("12"), 12.0)
+        self.assertEqual(parse_reconcile_interval_hours(6), 6.0)
+        self.assertEqual(parse_reconcile_interval_hours("0"), 0.0)
+        self.assertEqual(parse_reconcile_interval_hours("-5"), 0.0)
+        self.assertEqual(parse_reconcile_interval_hours("daily"), 24.0)
+        self.assertEqual(parse_reconcile_interval_hours(True), 24.0)
+        hour = 3_600_000
+        self.assertTrue(reconcile_due(None, 10 * hour, 24))
+        self.assertFalse(reconcile_due(0, 23 * hour, 24))
+        self.assertTrue(reconcile_due(0, 24 * hour, 24))
+        self.assertFalse(reconcile_due(None, 10 * hour, 0))
+        self.assertTrue(reconcile_due(10 * hour, 10 * hour + hour // 2, 0.5))
+
+    def test_key_page_params_select_keys_only(self):
+        params = build_key_page_params(INV, "CompanyCode eq '1010'", skip=5000)
+        self.assertEqual(params["$select"], "SupplierInvoice,FiscalYear")
+        self.assertEqual(params["$orderby"], "SupplierInvoice asc,FiscalYear asc")
+        self.assertEqual(params["$top"], str(RECONCILE_KEY_PAGE_SIZE))
+        self.assertEqual(params["$skip"], "5000")
+        self.assertEqual(params["$filter"], "CompanyCode eq '1010'")
+        self.assertEqual(params["$format"], "json")
+        self.assertEqual(params["$inlinecount"], "allpages")
+        self.assertNotIn("$expand", params)
+        self.assertNotIn("$filter", build_key_page_params(SO, None))
+
+    def test_external_id_entity(self):
+        self.assertEqual(external_id_entity("sales_order:123"), "sales_order")
+        self.assertEqual(external_id_entity("supplier_invoice:1/2024"), "supplier_invoice")
+        self.assertIsNone(external_id_entity(attachment_external_id(SO, ["123"], "LD1")))
+        self.assertIsNone(external_id_entity("unknown:1"))
+        self.assertIsNone(external_id_entity("garbage"))
+
+    def test_plan_marks_missing_documents_only(self):
+        live_payload = {"d": {"results": [{"SalesOrder": "1"}, {"SalesOrder": "3"}, {"SalesOrder": "5"}], "__count": "3"}}
+        live_ids = {record_external_id(SO, (r["SalesOrder"],)) for r in parse_page(live_payload).rows}
+        known = [
+            "sales_order:1", "sales_order:2", "sales_order:3", "sales_order:4",
+            attachment_external_id(SO, ["2"], "LD-2"),   # attachment: cascades with its parent, not planned
+            "purchase_order:4500000001",                  # other entity: untouched
+            "garbage",
+        ]
+        plan = plan_reconcile(SO, known, live_ids)
+        self.assertEqual(plan.entity, "sales_order")
+        self.assertEqual(plan.delete_external_ids, ("sales_order:2", "sales_order:4"))
+        self.assertEqual((plan.known, plan.live), (4, 3))
+        self.assertIsNone(plan.skipped_reason)
+        # live ids of other entities do not count
+        plan = plan_reconcile(SO, ["sales_order:1"], {"purchase_order:1", "sales_order:1"})
+        self.assertEqual(plan.delete_external_ids, ())
+        self.assertEqual(plan.live, 1)
+
+    def test_plan_refuses_to_wipe_when_sap_returns_nothing(self):
+        plan = plan_reconcile(PO, ["purchase_order:1", "purchase_order:2"], set())
+        self.assertEqual(plan.delete_external_ids, ())
+        self.assertIsNotNone(plan.skipped_reason)
+        self.assertEqual(plan.known, 2)
+        # nothing known and nothing live is simply a no-op, not a skip
+        empty = plan_reconcile(PO, [], set())
+        self.assertEqual(empty.delete_external_ids, ())
+        self.assertIsNone(empty.skipped_reason)
+
+    def test_plan_with_composite_keys_and_percent_encoding(self):
+        live = {record_external_id(INV, ("5105600001", "2024")), record_external_id(INV, ("A/B", "2024"))}
+        known = ["supplier_invoice:5105600001/2024", "supplier_invoice:A%2FB/2024", "supplier_invoice:5105600002/2024"]
+        plan = plan_reconcile(INV, known, live)
+        self.assertEqual(plan.delete_external_ids, ("supplier_invoice:5105600002/2024",))
 
 
 if __name__ == "__main__":

@@ -28,6 +28,18 @@ and grant the technical user display authorizations for the underlying objects.
 
 Read-only: every call is a ``GET``; SAP requires ``x-csrf-token`` only for
 modifying requests, so no token fetch is needed.  Writes are out of scope.
+
+Deletions: the ``API_*`` services have no delta/change tracking, so the
+incremental ``<change_field> gt <last sync>`` filter never sees a deleted row.
+Every ``reconcileIntervalHours`` (sync setting, default 24 h, ``0`` = off) the
+connector pulls the bare key set of each entity set, compares it with the record
+external ids it holds and deletes the missing ones through the standard cascade
+delete (``on_records_deleted_cascade``; attachments go with their document).  A
+full sync reconciles for free.  See ``mapping.plan_reconcile``.
+
+``sapClient`` is applied on every SAP request as both the ``sap-client`` query
+parameter (unless the URL — e.g. a server ``__next`` link — already carries it)
+and the ``sap-client`` header; it is never sent to the OAuth token endpoint.
 ``init()`` validates with ``GET <baseUrl>/sap/opu/odata/sap/API_BUSINESS_PARTNER/$metadata``
 (falls back to the first *selected* service when the BP scenario is not active).
 """
@@ -38,7 +50,8 @@ import asyncio
 import contextlib
 import re
 from logging import Logger
-from typing import Any, AsyncGenerator, Dict, List, Optional, Sequence, Tuple
+from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Sequence, Tuple
+from urllib.parse import parse_qsl, urlsplit
 
 import httpx
 from fastapi.responses import StreamingResponse
@@ -83,9 +96,12 @@ from app.connectors.sources.sap.mapping import (
     AUTH_MODE_BASIC,
     COMPANY_CODES_FILTER_KEY,
     DEFAULT_ENTITY_ORDER,
+    DEFAULT_RECONCILE_INTERVAL_HOURS,
     ENTITIES_FILTER_KEY,
     ENTITY_FILTER_LABELS,
     ENTITY_SPECS,
+    RECONCILE_INTERVAL_KEY,
+    RECONCILE_KEY_PAGE_SIZE,
     SALES_ORGS_FILTER_KEY,
     SAP_PAGE_SIZE,
     SCOPE_COMPANY_CODE,
@@ -104,6 +120,7 @@ from app.connectors.sources.sap.mapping import (
     attachment_key,
     attachment_list_url,
     attachments_selected,
+    build_key_page_params,
     build_modified_filter,
     build_page_params,
     build_scope_filter,
@@ -121,13 +138,17 @@ from app.connectors.sources.sap.mapping import (
     parse_authorization_mapping,
     parse_entity,
     parse_page,
+    parse_reconcile_interval_hours,
     parse_sap_timestamp,
+    plan_reconcile,
+    reconcile_due,
     record_external_id,
     record_group_external_id,
     record_title,
     record_web_url,
     render_record_markdown,
     resolve_selected_entities,
+    retry_delay,
     row_key_values,
     scope_codes,
     split_external_id,
@@ -150,11 +171,16 @@ CONNECTOR_KEY = "sap"  # ConnectorFactory registry key / filters config name
 USERS_SYNC_POINT_KEY = "users"
 GROUPS_SYNC_POINT_KEY = "groups"
 ENTITY_SYNC_POINT_PREFIX = "entity"
+RECONCILE_SYNC_POINT_PREFIX = "reconcile"
+RECONCILE_TIMESTAMP_FIELD = "lastReconcileTimestamp"
+SAP_CLIENT_PARAM = "sap-client"
 
 _MAX_HTTP_RETRIES = 5
 _RETRY_STATUS = {HttpStatusCode.TOO_MANY_REQUESTS.value, 502, HttpStatusCode.SERVICE_UNAVAILABLE.value, 504}
 _TOKEN_REFRESH_SKEW_S = 120
 _MAX_CONCURRENT_REQUESTS = 4
+_KNOWN_RECORDS_PAGE = 1000       # keyset page size when enumerating stored records
+_RECONCILE_DELETE_BATCH = 100    # record ids per cascade-delete call
 _GUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 
 GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0"
@@ -173,6 +199,10 @@ _GRANT_ENTITY_TO_PERMISSION = {
 
 def _entity_sync_point_key(spec: EntitySpec) -> str:
     return f"{ENTITY_SYNC_POINT_PREFIX}/{spec.name}"
+
+
+def _reconcile_sync_point_key(spec: EntitySpec) -> str:
+    return f"{RECONCILE_SYNC_POINT_PREFIX}/{spec.name}"
 
 
 def grants_to_permissions(grants: List[PermissionGrant]) -> List[Permission]:
@@ -351,6 +381,20 @@ def _shared_auth_fields() -> List[AuthField]:
             description="Maps SAP user ids to <sapuser>@<domain> for the document creator (OWNER). Leave empty to skip; use the 'users' map for technical ids.",
         ))
         .add_sync_custom_field(CustomField(
+            name=RECONCILE_INTERVAL_KEY,
+            display_name="Deletion check interval (hours)",
+            field_type="NUMBER",
+            required=False,
+            default_value=str(int(DEFAULT_RECONCILE_INTERVAL_HOURS)),
+            min_length=0,
+            max_length=8760,
+            description=(
+                "SAP OData exposes no deletions, so every N hours the connector re-reads the key list of each "
+                "synced entity set and removes records SAP no longer returns (attachments follow their document). "
+                "Default 24; 0 disables the check (deleted SAP documents then stay searchable until a full sync)."
+            ),
+        ))
+        .add_sync_custom_field(CustomField(
             name="entraTenantId",
             display_name="Entra tenant ID (optional)",
             field_type="TEXT",
@@ -434,6 +478,7 @@ class SapConnector(BaseConnector):
         self._known_groups: set[str] = set()
         self._known_users: set[str] = set()
         self._seen_codes: Dict[str, set[str]] = {}
+        self._full_read_entities: set[str] = set()  # entities read completely this run (see reconcile)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -474,11 +519,12 @@ class SapConnector(BaseConnector):
             self._basic_auth = None
 
         await self._close_http()
-        params = {"sap-client": self.sap_client} if self.sap_client else None
+        # ``sap-client`` is added per SAP request in ``_sap_request_args`` (param + header)
+        # rather than as a client default, so it never leaks onto the OAuth token POST and
+        # is not duplicated on ``__next`` links that already carry it.
         self._http = httpx.AsyncClient(
             timeout=httpx.Timeout(120.0, connect=15.0),
             headers={"Accept": "application/json"},
-            params=params,
             follow_redirects=False,
         )
         try:
@@ -557,14 +603,33 @@ class SapConnector(BaseConnector):
     # ------------------------------------------------------------------
 
     async def _refresh_token(self) -> str:
+        """Client-credentials grant.  The token endpoint (XSUAA / IAS) rate-limits too, so
+        429/503 are retried honouring ``Retry-After`` exactly like data requests."""
         if self._http is None or not self._oauth:
             raise RuntimeError("SAP connector not initialised for OAuth")
-        response = await self._http.post(
-            self._oauth["tokenUrl"],
-            data={"grant_type": "client_credentials"},
-            auth=(self._oauth["clientId"], self._oauth["clientSecret"]),
-            headers={"Accept": "application/json"},
-        )
+        delay = 1.0
+        for attempt in range(_MAX_HTTP_RETRIES + 1):
+            try:
+                response = await self._http.post(
+                    self._oauth["tokenUrl"],
+                    data={"grant_type": "client_credentials"},
+                    auth=(self._oauth["clientId"], self._oauth["clientSecret"]),
+                    headers={"Accept": "application/json"},
+                )
+            except (httpx.TimeoutException, httpx.TransportError) as e:
+                if attempt >= _MAX_HTTP_RETRIES:
+                    raise
+                self.logger.warning("SAP token request failed (%s), retrying in %.1fs", e, delay)
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 30.0)
+                continue
+            if response.status_code in _RETRY_STATUS and attempt < _MAX_HTTP_RETRIES:
+                wait = retry_delay(response.headers.get("Retry-After"), delay)
+                self.logger.warning("SAP token endpoint returned %s, retrying in %.1fs", response.status_code, wait)
+                await asyncio.sleep(wait)
+                delay = min(delay * 2, 30.0)
+                continue
+            break
         response.raise_for_status()
         payload = response.json()
         token = payload.get("access_token")
@@ -583,19 +648,38 @@ class SapConnector(BaseConnector):
             await self._refresh_token()
         return {"Authorization": f"Bearer {self._token}"}
 
+    def _sap_request_args(
+        self, url: str, params: Optional[Dict[str, str]]
+    ) -> Tuple[Optional[Dict[str, str]], Dict[str, str]]:
+        """``(params, headers)`` carrying ``sapClient`` consistently for every SAP call:
+        the ``sap-client`` query parameter (skipped when ``url`` already has one, as SAP's
+        ``__next`` links do) plus the equivalent ``sap-client`` header (honoured by the
+        ICF layer even when a proxy strips query strings).  Both auth modes share this."""
+        if not self.sap_client:
+            return params, {}
+        headers = {SAP_CLIENT_PARAM: self.sap_client}
+        query = urlsplit(url).query
+        if any(k == SAP_CLIENT_PARAM for k, _ in parse_qsl(query, keep_blank_values=True)):
+            return params, headers
+        merged = dict(params or {})
+        merged.setdefault(SAP_CLIENT_PARAM, self.sap_client)
+        return merged, headers
+
     async def _get_raw(
         self,
         url: str,
         params: Optional[Dict[str, str]] = None,
         accept: str = "application/json",
     ) -> httpx.Response:
-        """GET with basic/bearer auth, one 401 re-auth, bounded retry on 429/5xx (honours Retry-After)."""
+        """GET with basic/bearer auth, one 401 re-auth, bounded retry on 429/5xx honouring
+        ``Retry-After`` (delay-seconds or HTTP-date) — identical for BASIC and OAuth."""
         if self._http is None:
             raise RuntimeError("SAP connector not initialised")
         refreshed = False
         delay = 1.0
+        params, client_headers = self._sap_request_args(url, params)
         for attempt in range(_MAX_HTTP_RETRIES + 1):
-            headers = {"Accept": accept, **(await self._auth_headers())}
+            headers = {"Accept": accept, **client_headers, **(await self._auth_headers())}
             async with self._request_semaphore:
                 try:
                     response = await self._http.get(url, params=params, headers=headers, auth=self._basic_auth)
@@ -611,12 +695,7 @@ class SapConnector(BaseConnector):
                 await self._refresh_token()
                 continue
             if response.status_code in _RETRY_STATUS and attempt < _MAX_HTTP_RETRIES:
-                retry_after = response.headers.get("Retry-After")
-                try:
-                    wait = float(retry_after) if retry_after else delay
-                except ValueError:
-                    wait = delay
-                wait = min(max(wait, 0.5), 60.0)
+                wait = retry_delay(response.headers.get("Retry-After"), delay)
                 self.logger.warning("SAP returned %s for %s, retrying in %.1fs", response.status_code, url, wait)
                 await asyncio.sleep(wait)
                 delay = min(delay * 2, 30.0)
@@ -630,25 +709,34 @@ class SapConnector(BaseConnector):
         payload = response.json()
         return payload if isinstance(payload, dict) else {"d": payload}
 
-    async def _iter_pages(self, spec: EntitySpec, odata_filter: Optional[str]) -> AsyncGenerator[List[Dict[str, Any]], None]:
-        """``$top``/``$skip`` paging; a server-side ``__next`` / ``@odata.nextLink`` wins when present."""
+    async def _iter_pages(
+        self,
+        spec: EntitySpec,
+        odata_filter: Optional[str],
+        params_builder: Callable[..., Dict[str, str]] = build_page_params,
+        page_size: int = SAP_PAGE_SIZE,
+    ) -> AsyncGenerator[List[Dict[str, Any]], None]:
+        """``$top``/``$skip`` paging; a server-side ``__next`` / ``@odata.nextLink`` wins when present.
+        ``params_builder`` is :func:`build_page_params` (documents) or :func:`build_key_page_params` (reconcile)."""
         url = entity_set_url(self.base_url, spec)
         skip = 0
         while True:
-            params = build_page_params(spec, odata_filter, skip=skip, top=SAP_PAGE_SIZE)
+            params = params_builder(spec, odata_filter, skip=skip, top=page_size)
             page: Page = parse_page(await self._get_json(url, params=params), spec.odata_version)
             yield page.rows
             while page.next_link:
                 page = parse_page(await self._get_json(page.next_link), spec.odata_version)
                 yield page.rows
-            nxt = next_page_skip(page, skip, SAP_PAGE_SIZE)
+            nxt = next_page_skip(page, skip, page_size)
             if nxt is None:
                 return
             skip = nxt
 
     async def _iter_rows_with_fallback(self, spec: EntitySpec, odata_filter: Optional[str], scope_filter: Optional[str]) -> AsyncGenerator[List[Dict[str, Any]], None]:
         """Some releases lack the change-tracking property; on HTTP 400 retry without the
-        modified clause (full re-read) instead of failing the sync."""
+        modified clause (full re-read) instead of failing the sync.  A fallback read is
+        complete within scope, so it is recorded in ``_full_read_entities`` and lets the
+        entity reconcile deletions without a second key pull."""
         try:
             async for rows in self._iter_pages(spec, combine_filters(odata_filter, scope_filter)):
                 yield rows
@@ -659,8 +747,17 @@ class SapConnector(BaseConnector):
                 "SAP %s rejected the %s filter (HTTP 400); falling back to a full read of the entity",
                 spec.service, spec.change_field,
             )
+            self._full_read_entities.add(spec.name)
             async for rows in self._iter_pages(spec, scope_filter):
                 yield rows
+
+    async def _iter_live_external_ids(self, spec: EntitySpec, scope_filter: Optional[str]) -> AsyncGenerator[str, None]:
+        """Key-only pull of the whole entity set (within the scope filters) → record external ids."""
+        async for rows in self._iter_pages(spec, scope_filter, params_builder=build_key_page_params, page_size=RECONCILE_KEY_PAGE_SIZE):
+            for row in rows:
+                keys = row_key_values(spec, row)
+                if keys:
+                    yield record_external_id(spec, keys)
 
     async def _fetch_row(self, spec: EntitySpec, key_values: Sequence[str]) -> Optional[Dict[str, Any]]:
         params: Dict[str, str] = {}
@@ -689,8 +786,9 @@ class SapConnector(BaseConnector):
     async def run_incremental_sync(self) -> None:
         """Incremental: same pipeline, entity pages filtered by ``<change_field> gt <last sync>``.
 
-        Deletes are undetectable over the public OData APIs (no change tracking /
-        delta links on the ``API_*`` services); schedule a periodic full sync.
+        Deletes are undetectable through that filter (no change tracking / delta links
+        on the ``API_*`` services), so every ``reconcileIntervalHours`` the entity's key
+        set is re-read and records SAP no longer returns are deleted (``_reconcile_entity``).
         """
         await self._run(incremental=True)
 
@@ -706,10 +804,12 @@ class SapConnector(BaseConnector):
         specs = resolve_selected_entities(selected)
         with_attachments = attachments_selected(selected)
 
+        self._full_read_entities = set()
         await self._sync_authorization_model(specs)
         await self._sync_record_groups(specs)
         for spec in specs:
-            await self._sync_entity(spec, incremental=incremental, with_attachments=with_attachments)
+            seen_ids = await self._sync_entity(spec, incremental=incremental, with_attachments=with_attachments)
+            await self._maybe_reconcile_entity(spec, seen_ids)
         self.logger.info("SAP sync completed")
 
     def _selected_entity_names(self) -> Optional[List[str]]:
@@ -818,7 +918,7 @@ class SapConnector(BaseConnector):
                     app_name=self.connector_name,
                     connector_id=self.connector_id,
                     source_user_group_id=gid,
-                    name=group_display_name(gid),
+                    name=group_display_name(gid, self._auth_ctx.mapping if self._auth_ctx else None),
                     org_id=self.data_entities_processor.org_id,
                     description="SAP authorization group (membership from the connector's authorization mapping)",
                 ),
@@ -852,7 +952,10 @@ class SapConnector(BaseConnector):
         if groups:
             await self.data_entities_processor.on_new_record_groups(groups)
 
-    async def _sync_entity(self, spec: EntitySpec, incremental: bool, with_attachments: bool) -> None:
+    async def _sync_entity(self, spec: EntitySpec, incremental: bool, with_attachments: bool) -> Optional[set[str]]:
+        """Upsert every (changed) row of ``spec``.  Returns the external ids seen when the
+        pass read the *complete* entity set within scope (full sync, no modified window,
+        or the HTTP-400 fallback) — ``None`` when it was a partial, filtered read."""
         assert self._auth_ctx is not None
         key = _entity_sync_point_key(spec)
         since_ms: Optional[int] = None
@@ -867,8 +970,11 @@ class SapConnector(BaseConnector):
             sales_orgs=self._list_filter(SALES_ORGS_FILTER_KEY),
         )
         sync_started_ms = get_epoch_timestamp_in_ms()
+        if modified_filter is None:
+            self._full_read_entities.add(spec.name)
 
         total = 0
+        seen_ids: set[str] = set()
         async for rows in self._iter_rows_with_fallback(spec, modified_filter, scope_filter):
             batch: List[Tuple[Record, List[Permission]]] = []
             creators: List[str] = []
@@ -878,6 +984,7 @@ class SapConnector(BaseConnector):
                 if built is None:
                     continue
                 record, permissions, grants = built
+                seen_ids.add(record.external_record_id)
                 batch.append((record, permissions))
                 group_ids.extend(group_ids_in_grants(grants))
                 creators.extend(g.email for g in grants if g.entity_type == GrantEntity.USER and g.email)
@@ -892,6 +999,106 @@ class SapConnector(BaseConnector):
                 total += len(batch)
         await self.records_sync_point.update_sync_point(key, {"lastSyncTimestamp": sync_started_ms})
         self.logger.info("Synced %d %s records%s", total, spec.display_name.lower(), " (incremental)" if since_ms else "")
+        return seen_ids if spec.name in self._full_read_entities else None
+
+    # ------------------------------------------------------------------
+    # Deletion detection (periodic key-set reconcile)
+    # ------------------------------------------------------------------
+
+    def _reconcile_interval_hours(self) -> float:
+        return parse_reconcile_interval_hours(self._sync_setting(RECONCILE_INTERVAL_KEY, "reconcile_interval_hours"))
+
+    async def _maybe_reconcile_entity(self, spec: EntitySpec, seen_ids: Optional[set[str]]) -> None:
+        """Run the deletion check when the interval elapsed, or for free after a complete read."""
+        interval_hours = self._reconcile_interval_hours()
+        if interval_hours <= 0:
+            return
+        now_ms = get_epoch_timestamp_in_ms()
+        if seen_ids is None:
+            point = await self.records_sync_point.read_sync_point(_reconcile_sync_point_key(spec))
+            last_ms = point.get(RECONCILE_TIMESTAMP_FIELD) if point else None
+            if not reconcile_due(last_ms, now_ms, interval_hours):
+                return
+        try:
+            await self._reconcile_entity(spec, seen_ids)
+        except Exception as e:  # a failed deletion check must never fail the upsert sync
+            self.logger.error("SAP %s deletion check failed: %s", spec.display_name.lower(), e, exc_info=True)
+
+    async def _reconcile_entity(self, spec: EntitySpec, live_ids: Optional[set[str]] = None) -> int:
+        """Delete stored ``spec`` records whose key SAP no longer returns.
+
+        ``live_ids`` are the external ids of a complete read just performed; when
+        ``None`` the key set is pulled with ``$select=<keys>`` only (scope filters
+        applied, the modified-date window deliberately not — records outside the window
+        still exist in SAP).  Returns the number of records deleted.
+        """
+        started_ms = get_epoch_timestamp_in_ms()
+        if live_ids is None:
+            scope_filter = build_scope_filter(
+                spec,
+                company_codes=self._list_filter(COMPANY_CODES_FILTER_KEY),
+                sales_orgs=self._list_filter(SALES_ORGS_FILTER_KEY),
+            )
+            live_ids = set()
+            async for external_id in self._iter_live_external_ids(spec, scope_filter):
+                live_ids.add(external_id)
+        known = await self._known_record_ids(spec)
+        plan = plan_reconcile(spec, known.keys(), live_ids)
+        if plan.skipped_reason:
+            self.logger.warning("SAP %s deletion check skipped: %s (known=%d)", spec.display_name.lower(), plan.skipped_reason, plan.known)
+            return 0
+        deleted = 0
+        record_ids = [known[e] for e in plan.delete_external_ids if known.get(e)]
+        for start in range(0, len(record_ids), _RECONCILE_DELETE_BATCH):
+            chunk = record_ids[start:start + _RECONCILE_DELETE_BATCH]
+            deleted += await self._delete_records(chunk)
+        await self.records_sync_point.update_sync_point(_reconcile_sync_point_key(spec), {RECONCILE_TIMESTAMP_FIELD: started_ms})
+        self.logger.info(
+            "SAP %s deletion check: %d known, %d live, %d deleted",
+            spec.display_name.lower(), plan.known, plan.live, deleted,
+        )
+        return deleted
+
+    async def _known_record_ids(self, spec: EntitySpec) -> Dict[str, str]:
+        """``external_record_id -> record id`` of every stored document record of ``spec``
+        (keyset-paged over the connector's records; attachments and other entities skipped)."""
+        prefix = f"{spec.name}:"
+        out: Dict[str, str] = {}
+        after_key: Optional[str] = None
+        while True:
+            page = await self.data_entities_processor.get_records_by_status(
+                self.connector_id, status_filters=[], limit=_KNOWN_RECORDS_PAGE, after_key=after_key,
+            )
+            if not page:
+                break
+            for record in page:
+                external_id = record.external_record_id or ""
+                if external_id.startswith(prefix) and record.id:
+                    out[external_id] = record.id
+            after_key = page[-1].id
+            if len(page) < _KNOWN_RECORDS_PAGE or not after_key:
+                break
+        return out
+
+    async def _delete_records(self, record_ids: List[str]) -> int:
+        """Standard record-deletion path: cascade (document + attachment children); per-record
+        fallback when the cascade is unavailable."""
+        if not record_ids:
+            return 0
+        try:
+            result = await self.data_entities_processor.on_records_deleted_cascade(record_ids, self.connector_id)
+            count = (result or {}).get("successfully_deleted")
+            return int(count) if count is not None else len(record_ids)
+        except Exception as e:
+            self.logger.warning("SAP cascade delete failed (%s); deleting %d records one by one", e, len(record_ids))
+        deleted = 0
+        for record_id in record_ids:
+            try:
+                await self.data_entities_processor.on_record_deleted(record_id)
+                deleted += 1
+            except Exception as e:
+                self.logger.error("SAP could not delete record %s: %s", record_id, e)
+        return deleted
 
     def _build_record_with_permissions(
         self, spec: EntitySpec, row: Dict[str, Any]
@@ -1141,12 +1348,7 @@ class EntraGroupResolver:
         for attempt in range(_MAX_HTTP_RETRIES + 1):
             response = await self._http.get(url, params=params, headers=await self._token_header())
             if response.status_code in _RETRY_STATUS and attempt < _MAX_HTTP_RETRIES:
-                retry_after = response.headers.get("Retry-After")
-                try:
-                    wait = float(retry_after) if retry_after else delay
-                except ValueError:
-                    wait = delay
-                await asyncio.sleep(min(max(wait, 0.5), 60.0))
+                await asyncio.sleep(retry_delay(response.headers.get("Retry-After"), delay))
                 delay = min(delay * 2, 30.0)
                 continue
             response.raise_for_status()

@@ -81,10 +81,13 @@ Known approximations (documented gaps):
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from enum import Enum
 from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 from urllib.parse import quote, urlencode
@@ -104,6 +107,23 @@ SUPPORTED_AUTH_MODES: tuple[str, ...] = (AUTH_MODE_BASIC, AUTH_MODE_OAUTH)
 ENTITIES_FILTER_KEY = "entities"
 COMPANY_CODES_FILTER_KEY = "company_codes"
 SALES_ORGS_FILTER_KEY = "sales_orgs"
+
+# Sync custom field: hours between two full key-set reconciles of an entity set
+# (deletion detection, see :func:`plan_reconcile`).  ``0`` disables reconciling.
+RECONCILE_INTERVAL_KEY = "reconcileIntervalHours"
+DEFAULT_RECONCILE_INTERVAL_HOURS = 24.0
+RECONCILE_KEY_PAGE_SIZE = 5000  # keys only, no $expand: far cheaper than a document page
+
+# Language-keyed texts (product descriptions ...): Arabic first — Edrak's customers
+# keep Arabic master data — then English, then whatever the payload carries.  Every
+# language present is still rendered so retrieval works in both languages; nothing
+# is ASCII-folded.
+LANGUAGE_PREFERENCE: tuple[str, ...] = ("AR", "EN")
+# SAP one-letter language keys (SPRAS) seen on on-prem Gateway payloads.
+_SAP_LANGUAGE_KEYS: dict[str, str] = {
+    "A": "AR", "E": "EN", "D": "DE", "F": "FR", "I": "IT", "S": "ES", "P": "PT",
+    "T": "TR", "R": "RU", "J": "JA", "1": "ZH", "M": "ZF", "N": "NL", "L": "PL",
+}
 
 GROUP_PREFIX = "sap:"
 ADMINS_GROUP_ID = "sap:admins"
@@ -733,6 +753,158 @@ def combine_filters(*clauses: Optional[str]) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
+# HTTP retry helpers (pure; ``connector.py`` sleeps)
+# ---------------------------------------------------------------------------
+
+
+def parse_retry_after(value: Any, now_s: Optional[float] = None) -> Optional[float]:
+    """``Retry-After`` header → seconds to wait, or ``None`` when absent / unparsable.
+
+    Accepts both forms of RFC 7231 §7.1.3: delay-seconds (``"30"``, ``"2.5"``) and an
+    HTTP-date (``"Wed, 21 Oct 2015 07:28:00 GMT"``); SAP Gateway and the XSUAA token
+    endpoint use the former, some reverse proxies the latter.  Negative results clamp
+    to ``0``.
+    """
+    if value in (None, ""):
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return max(float(text), 0.0)
+    except ValueError:
+        pass
+    try:
+        when = parsedate_to_datetime(text)
+    except (TypeError, ValueError, IndexError):
+        return None
+    if when is None:
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    now = datetime.now(timezone.utc).timestamp() if now_s is None else now_s
+    return max(when.timestamp() - now, 0.0)
+
+
+def retry_delay(
+    retry_after: Any,
+    fallback: float,
+    minimum: float = 0.5,
+    maximum: float = 60.0,
+    now_s: Optional[float] = None,
+) -> float:
+    """Seconds to sleep before retrying a 429/503: the server's ``Retry-After`` when it
+    sent one, else the caller's exponential back-off, clamped to ``[minimum, maximum]``."""
+    wait = parse_retry_after(retry_after, now_s)
+    if wait is None:
+        wait = fallback
+    return min(max(wait, minimum), maximum)
+
+
+# ---------------------------------------------------------------------------
+# Deletion detection: periodic full key-set reconcile
+# ---------------------------------------------------------------------------
+#
+# The public ``API_*`` OData services expose no change tracking / delta links, so a
+# row deleted (or archived) in SAP is invisible to the ``<change_field> gt <last sync>``
+# incremental filter.  Every ``reconcileIntervalHours`` the connector therefore pulls
+# the *key set* of each entity set (``$select`` = key fields only, no ``$expand``),
+# compares it with the record external ids it already holds for that entity and
+# deletes the ones SAP no longer returns.  A full sync reconciles for free (it has
+# seen every row).  Attachments are not reconciled individually — they are children
+# of their document and go with it through the cascade delete.
+
+
+def parse_reconcile_interval_hours(value: Any, default: float = DEFAULT_RECONCILE_INTERVAL_HOURS) -> float:
+    """``reconcileIntervalHours`` sync setting → hours (``0`` = disabled).
+
+    Empty / missing → ``default``; unparsable → ``default``; negative → ``0``.
+    """
+    if value in (None, ""):
+        return default
+    if isinstance(value, bool):
+        return default
+    try:
+        hours = float(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+    if hours != hours:  # NaN
+        return default
+    return max(hours, 0.0)
+
+
+def reconcile_due(last_reconcile_ms: Optional[int], now_ms: int, interval_hours: float) -> bool:
+    """Whether a key-set reconcile should run now (never when ``interval_hours <= 0``)."""
+    if interval_hours <= 0:
+        return False
+    if last_reconcile_ms is None:
+        return True
+    return now_ms - int(last_reconcile_ms) >= int(interval_hours * 3_600_000)
+
+
+def build_key_page_params(
+    spec: EntitySpec,
+    odata_filter: Optional[str],
+    skip: int = 0,
+    top: int = RECONCILE_KEY_PAGE_SIZE,
+) -> dict[str, str]:
+    """Query options for one *key-only* page of ``spec`` (reconcile).  Ordered by the
+    key fields so ``$skip`` paging is stable while rows change underneath."""
+    params: dict[str, str] = {"$top": str(top), "$skip": str(skip)}
+    if spec.odata_version == 4:
+        params["$count"] = "true"
+    else:
+        params["$format"] = "json"
+        params["$inlinecount"] = "allpages"
+    params["$select"] = ",".join(spec.key_fields)
+    params["$orderby"] = ",".join(f"{k} asc" for k in spec.key_fields)
+    if odata_filter:
+        params["$filter"] = odata_filter
+    return params
+
+
+def external_id_entity(external_id: str) -> Optional[str]:
+    """Entity name of a *document* record external id (``None`` for attachments and
+    anything that is not an SAP id)."""
+    try:
+        entity, _keys, att_key = split_external_id(external_id)
+    except ValueError:
+        return None
+    if att_key is not None or entity not in ENTITY_SPECS:
+        return None
+    return entity
+
+
+@dataclass(frozen=True)
+class ReconcilePlan:
+    """Outcome of comparing the stored external ids of one entity with SAP's key set."""
+
+    entity: str
+    known: int                       # stored document records of this entity
+    live: int                        # keys SAP returned
+    delete_external_ids: tuple[str, ...]
+    skipped_reason: Optional[str] = None  # set when nothing may be deleted (safety guard)
+
+
+def plan_reconcile(spec: EntitySpec, known_external_ids: Iterable[str], live_external_ids: Iterable[str]) -> ReconcilePlan:
+    """Which stored records of ``spec`` to delete because SAP no longer lists their key.
+
+    Only document ids of *this* entity are considered (attachments cascade with their
+    parent; other entities are untouched).  Safety guard: an empty live key set while
+    records are known is treated as a failed/misconfigured pull, not as "everything
+    was deleted" — the plan is then skipped and nothing is removed.
+    """
+    known = {e for e in known_external_ids if external_id_entity(e) == spec.name}
+    live = {e for e in live_external_ids if external_id_entity(e) == spec.name}
+    missing = tuple(sorted(known - live))
+    skipped = None
+    if known and not live:
+        skipped = "SAP returned no keys for the entity set; refusing to delete every record"
+        missing = ()
+    return ReconcilePlan(entity=spec.name, known=len(known), live=len(live), delete_external_ids=missing, skipped_reason=skipped)
+
+
+# ---------------------------------------------------------------------------
 # Rendering
 # ---------------------------------------------------------------------------
 
@@ -752,15 +924,71 @@ def display_value(row: Mapping[str, Any], prop: str) -> Optional[str]:
     return str(raw)
 
 
-def product_description(row: Mapping[str, Any], preferred_language: str = "EN") -> Optional[str]:
-    descriptions = [d for d in odata_collection(row.get("to_Description")) if isinstance(d, Mapping)]
-    for d in descriptions:
-        if str(d.get("Language") or "").upper() == preferred_language.upper() and d.get("ProductDescription"):
-            return str(d["ProductDescription"])
-    for d in descriptions:
-        if d.get("ProductDescription"):
-            return str(d["ProductDescription"])
-    return None
+def normalize_language_code(value: Any) -> str:
+    """``"ar"`` / ``"ar-SA"`` / ``"AR"`` → ``"AR"``; SAP one-letter keys (``"A"``) → ISO;
+    unknown/empty → ``""``.  Never folds the *text*, only the language tag."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    upper = text.upper()
+    if len(upper) == 1:
+        return _SAP_LANGUAGE_KEYS.get(upper, upper)
+    return upper.replace("_", "-").split("-", 1)[0]
+
+
+def localized_texts(
+    entries: Any,
+    text_field: str,
+    language_field: str = "Language",
+    preference: Sequence[str] = LANGUAGE_PREFERENCE,
+) -> list[tuple[str, str]]:
+    """``(language, text)`` pairs of a language-keyed collection, preferred languages
+    first (``preference`` order), then the rest in payload order; one entry per language,
+    empty texts dropped, texts untouched (no ASCII folding)."""
+    by_lang: dict[str, str] = {}
+    for entry in odata_collection(entries):
+        if not isinstance(entry, Mapping):
+            continue
+        text = entry.get(text_field)
+        if text in (None, "") or isinstance(text, (Mapping, list)):
+            continue
+        text = str(text).strip()
+        if not text:
+            continue
+        lang = normalize_language_code(entry.get(language_field))
+        by_lang.setdefault(lang, text)
+    ordered: list[tuple[str, str]] = []
+    for lang in preference:
+        code = normalize_language_code(lang)
+        if code in by_lang:
+            ordered.append((code, by_lang.pop(code)))
+    ordered.extend(by_lang.items())
+    return ordered
+
+
+def preferred_text(
+    entries: Any,
+    text_field: str,
+    language_field: str = "Language",
+    preference: Sequence[str] = LANGUAGE_PREFERENCE,
+) -> Optional[str]:
+    """First text of :func:`localized_texts` (Arabic → English → any) or ``None``."""
+    texts = localized_texts(entries, text_field, language_field, preference)
+    return texts[0][1] if texts else None
+
+
+def product_descriptions(row: Mapping[str, Any]) -> list[tuple[str, str]]:
+    """All ``to_Description`` texts of a product, Arabic first, then English, then the rest."""
+    return localized_texts(row.get("to_Description"), "ProductDescription")
+
+
+def product_description(row: Mapping[str, Any], preferred_language: Optional[str] = None) -> Optional[str]:
+    """Title text of a product: ``AR`` → ``EN`` → any language.  ``preferred_language``
+    (when given) is tried before the default preference."""
+    preference: tuple[str, ...] = LANGUAGE_PREFERENCE
+    if preferred_language:
+        preference = (preferred_language,) + LANGUAGE_PREFERENCE
+    return preferred_text(row.get("to_Description"), "ProductDescription", preference=preference)
 
 
 def record_title(spec: EntitySpec, row: Mapping[str, Any]) -> str:
@@ -853,6 +1081,7 @@ def build_metadata(
         "scopes": {kind: sorted(values) for kind, values in sorted(scopes.items())},
         "url": record_web_url(base_url, spec, keys, fiori_base_url, sap_client) if keys else None,
         "odata_url": entity_url(base_url, spec, keys, sap_client) if keys else None,
+        "descriptions": dict(product_descriptions(row)) if spec.name == "product" else {},
     }
 
 
@@ -890,9 +1119,12 @@ def render_record_markdown(
         if value:
             details.append(f"- **{label}:** {value}")
     if spec.name == "product":
-        desc = product_description(row)
-        if desc:
-            details.insert(0, f"- **Description:** {desc}")
+        # Preferred language (Arabic when present) first, then every other language
+        # SAP carries, so the chunk matches queries in both Arabic and English.
+        texts = product_descriptions(row)
+        for offset, (lang, text) in enumerate(texts):
+            label = f"Description ({lang or 'other'})" if len(texts) > 1 else "Description"
+            details.insert(offset, f"- **{label}:** {text}")
     if details:
         lines.append("## Details")
         lines.extend(details)
@@ -1030,8 +1262,33 @@ def normalize_email(value: str) -> str:
     return value.strip().lower()
 
 
+_SLUG_HASH_LEN = 8
+_SLUG_KEEP_CATEGORIES = ("L", "M", "N")  # letters, combining marks (Arabic tashkeel), digits
+
+
 def slugify_group_name(name: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "-", name.strip().lower()).strip("-") or "group"
+    """Stable slug of a ``group:<name>`` reference → ``sap:group:<slug>``.
+
+    * **Pure-ASCII names are unchanged from the historical behaviour**
+      (``"SAP Finance 1010"`` → ``"sap-finance-1010"``) so existing groups keep their
+      external ids and are not re-keyed.
+    * **Names with any non-ASCII character** (Arabic group names are the norm for
+      Edrak's customers) keep their Unicode letters/digits: NFKC-normalised, Latin
+      lower-cased, whitespace/punctuation collapsed to ``-``, and suffixed with the
+      first 8 hex digits of ``sha1(NFKC(name))`` so two distinct names can never
+      collapse to the same slug and the slug is identical across runs.  The old
+      implementation reduced every Arabic name to the literal ``"group"``, merging
+      all Arabic groups into one.
+    """
+    text = (name or "").strip()
+    if text.isascii():
+        return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-") or "group"
+    normalized = unicodedata.normalize("NFKC", text)
+    lowered = normalized.lower()
+    slug = "".join(ch if unicodedata.category(ch)[0] in _SLUG_KEEP_CATEGORIES else "-" for ch in lowered)
+    slug = re.sub(r"-{2,}", "-", slug).strip("-")
+    digest = hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:_SLUG_HASH_LEN]
+    return f"{slug}-{digest}" if slug else f"group-{digest}"
 
 
 def scope_group_external_id(kind: str, code: str) -> str:
@@ -1102,6 +1359,14 @@ class AuthorizationMapping:
             if slugify_group_name(known) == slugify_group_name(name):
                 return list(members)
         return []
+
+    def named_group_label(self, slug: str) -> Optional[str]:
+        """Original (human) name behind ``sap:group:<slug>``: inline ``groups`` keys first,
+        then names referenced via ``group:`` anywhere in the mapping."""
+        for name in list(self.named_groups) + self.referenced_named_groups():
+            if slugify_group_name(name) == slug:
+                return name
+        return None
 
     def principals_of(self, group_external_id: str) -> list[str]:
         """Raw principals (e-mails and ``group:`` refs) configured for a ``sap:*`` group."""
@@ -1365,14 +1630,16 @@ def group_ids_in_grants(grants: Iterable[PermissionGrant]) -> list[str]:
     return out
 
 
-def group_display_name(group_external_id: str) -> str:
-    """Human label for a ``sap:*`` group id."""
+def group_display_name(group_external_id: str, mapping: Optional["AuthorizationMapping"] = None) -> str:
+    """Human label for a ``sap:*`` group id.  For ``sap:group:<slug>`` the original
+    name is used when ``mapping`` knows it (slugs of non-ASCII names carry a hash)."""
     body = group_external_id[len(GROUP_PREFIX):] if group_external_id.startswith(GROUP_PREFIX) else group_external_id
     kind, _, code = body.partition(":")
     if kind == "admins":
         return "SAP · Administrators"
     if kind == "group":
-        return f"SAP · Group {code}"
+        label = mapping.named_group_label(code) if mapping is not None else None
+        return f"SAP · Group {label or code}"
     if kind == SCOPE_ENTITY:
         spec = ENTITY_SPECS.get(code)
         return f"SAP · All {spec.display_name if spec else code}"
