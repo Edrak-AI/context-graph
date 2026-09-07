@@ -14,6 +14,16 @@ Dataverse environment (Power Platform admin center → Environments → Settings
 Users + permissions → Application users) and given a security role that can
 read the synced tables plus ``systemuser``, ``team``, ``businessunit``,
 ``role`` and ``principalobjectaccess``.  ``init()`` validates with ``WhoAmI``.
+
+Deletes: each entity set is pulled once with ``Prefer: odata.track-changes`` and
+the returned ``@odata.deltaLink`` is stored in the entity's sync point; later
+incremental syncs GET the delta link and receive upserts plus ``reason: deleted``
+entries, which are removed through ``on_records_deleted_cascade`` (the record's
+ACL edges and any attachment child go with it).  Tables without
+``ChangeTrackingEnabled`` (HTTP 400 / ``0x80060888``) fall back to the
+``modifiedon`` incremental filter plus a periodic full reconcile that prunes
+records no longer returned by Dataverse (``reconcile_interval_hours`` filter,
+default 24h).  The decision logic lives in ``change_tracking.py`` (pure).
 """
 
 from __future__ import annotations
@@ -62,6 +72,24 @@ from app.connectors.core.registry.filters import (
     load_connector_filters,
 )
 from app.connectors.sources.microsoft.common.apps import MicrosoftDynamics365App
+from app.connectors.sources.microsoft.dynamics365.change_tracking import (
+    DEFAULT_RECONCILE_INTERVAL_HOURS,
+    FIELD_DELTA_LINK,
+    RECONCILE_INTERVAL_FILTER_KEY,
+    TRACK_CHANGES_PREFERENCE,
+    ChangeTrackingStatus,
+    DeltaPage,
+    EntitySyncState,
+    SyncMode,
+    is_change_tracking_disabled_error,
+    missing_record_ids,
+    parse_delta_page,
+    plan_sync,
+    prune_is_safe,
+    resolve_reconcile_interval_hours,
+    row_in_modified_bounds,
+    seen_external_ids,
+)
 from app.connectors.sources.microsoft.dynamics365.mapping import (
     ATTACHMENT_ID_PREFIX,
     DATAVERSE_PAGE_SIZE,
@@ -78,8 +106,8 @@ from app.connectors.sources.microsoft.dynamics365.mapping import (
     SecurityContext,
     api_base_url,
     attachment_external_id,
-    build_modified_filter,
     bu_group_external_id,
+    build_modified_filter,
     derive_grants,
     display_value,
     entity_list_web_url,
@@ -125,6 +153,8 @@ _MAX_HTTP_RETRIES = 5
 _RETRY_STATUS = {HttpStatusCode.TOO_MANY_REQUESTS.value, 502, 503, 504}
 _TOKEN_REFRESH_SKEW_S = 120
 _MAX_CONCURRENT_REQUESTS = 4
+_KNOWN_RECORDS_PAGE_SIZE = 500
+_DELETE_BATCH_SIZE = 100
 
 _GRANT_ROLE_TO_PERMISSION = {
     GrantRole.READER: PermissionType.READ,
@@ -192,9 +222,12 @@ def grants_to_permissions(grants: List[PermissionGrant]) -> List[Permission]:
                 display_name="Dynamics 365 Environment URL",
                 placeholder="https://org.crm4.dynamics.com",
                 description=(
-                    "The Dataverse environment URL (no path). The app registration must be added "
+                    "The Dataverse environment URL (no path) of any region, e.g. "
+                    "https://org.crm4.dynamics.com (Europe) or the host shown in the Power Platform "
+                    "admin center for the Saudi Arabia region. The app registration must be added "
                     "as an Application User in this environment with a security role that can read "
-                    "the synced tables, users, teams, business units, roles and shares."
+                    "the synced tables, users, teams, business units, roles and shares. Enable "
+                    "'Track changes' on the synced tables so deleted rows are detected promptly."
                 ),
                 field_type="URL",
                 max_length=2048,
@@ -237,6 +270,19 @@ def grants_to_permissions(grants: List[PermissionGrant]) -> List[Permission]:
         ))
         .add_filter_field(CommonFields.modified_date_filter(
             "Only sync rows whose modifiedon falls in this range."
+        ))
+        .add_filter_field(FilterField(
+            name=RECONCILE_INTERVAL_FILTER_KEY,
+            display_name="Delete reconcile interval (hours)",
+            filter_type=FilterType.NUMBER,
+            category=FilterCategory.SYNC,
+            description=(
+                "Deleted rows are normally detected through Dataverse change tracking. For tables "
+                "where change tracking is not enabled, the connector instead re-reads the whole "
+                "table every N hours and removes records that no longer exist. Default 24; "
+                "0 disables the reconcile (deletes on such tables are then never detected)."
+            ),
+            default_value=DEFAULT_RECONCILE_INTERVAL_HOURS,
         ))
         .add_filter_field(CommonFields.enable_manual_sync_filter())
         .with_sync_strategies([SyncStrategy.SCHEDULED, SyncStrategy.MANUAL])
@@ -418,6 +464,7 @@ class MicrosoftDynamics365Connector(BaseConnector):
         params: Optional[Dict[str, str]] = None,
         page_size: Optional[int] = None,
         include_annotations: bool = False,
+        track_changes: bool = False,
     ) -> Dict[str, Any]:
         """GET with bearer auth, 401 re-auth, and bounded retry on 429/5xx (honours Retry-After)."""
         if self._http is None:
@@ -427,6 +474,8 @@ class MicrosoftDynamics365Connector(BaseConnector):
             prefer.append(f"odata.maxpagesize={page_size}")
         if include_annotations:
             prefer.append('odata.include-annotations="*"')
+        if track_changes:
+            prefer.append(TRACK_CHANGES_PREFERENCE)
         headers: Dict[str, str] = {}
         if prefer:
             headers["Prefer"] = ",".join(prefer)
@@ -482,6 +531,23 @@ class MicrosoftDynamics365Connector(BaseConnector):
                 return
             payload = await self._get_json(next_link, page_size=page_size, include_annotations=include_annotations)
 
+    async def _iter_delta_pages(
+        self, spec: EntitySpec, path_or_url: str, params: Optional[Dict[str, str]] = None
+    ) -> AsyncGenerator[DeltaPage, None]:
+        """Tracked pull / delta follow-up: every request (incl. ``@odata.nextLink`` pages)
+        carries ``Prefer: odata.track-changes``; the last page carries the delta link."""
+        payload = await self._get_json(
+            path_or_url, params=params, page_size=DATAVERSE_PAGE_SIZE, include_annotations=True, track_changes=True
+        )
+        while True:
+            page = parse_delta_page(payload, spec)
+            yield page
+            if not page.next_link:
+                return
+            payload = await self._get_json(
+                page.next_link, page_size=DATAVERSE_PAGE_SIZE, include_annotations=True, track_changes=True
+            )
+
     async def _fetch_all(self, entity_set: str, params: Optional[Dict[str, str]] = None) -> List[Dict[str, Any]]:
         rows: List[Dict[str, Any]] = []
         async for page in self._iter_pages(entity_set, params=params):
@@ -509,12 +575,9 @@ class MicrosoftDynamics365Connector(BaseConnector):
         await self._run(incremental=False)
 
     async def run_incremental_sync(self) -> None:
-        """Incremental: same pipeline, entity pages filtered by ``modifiedon gt <last sync>``.
-
-        TODO(dynamics365): switch to Dataverse change tracking
-        (``Prefer: odata.track-changes`` + ``@odata.deltaLink``) so deleted rows are
-        detected; ``modifiedon`` cannot see deletes — schedule a periodic full sync.
-        """
+        """Incremental: same pipeline; each entity set follows its stored delta link
+        (upserts + deletes) or, without change tracking, ``modifiedon gt <last sync>``
+        plus the periodic full reconcile.  See ``change_tracking.plan_sync``."""
         await self._run(incremental=True)
 
     async def _run(self, incremental: bool) -> None:
@@ -769,35 +832,237 @@ class MicrosoftDynamics365Connector(BaseConnector):
     async def _sync_entity(self, spec: EntitySpec, incremental: bool) -> None:
         assert self._security is not None
         key = _entity_sync_point_key(spec)
-        since_ms: Optional[int] = None
-        if incremental:
-            point = await self.records_sync_point.read_sync_point(key)
-            since_ms = point.get("lastSyncTimestamp") if point else None
-        start_ms, end_ms = self._modified_bounds()
-        odata_filter = build_modified_filter(since_ms=since_ms, start_ms=start_ms, end_ms=end_ms)
+        state = EntitySyncState.from_sync_point(await self.records_sync_point.read_sync_point(key))
+        interval_hours = self._reconcile_interval_hours()
         sync_started_ms = get_epoch_timestamp_in_ms()
+        mode = plan_sync(state, incremental=incremental, now_ms=sync_started_ms, interval_hours=interval_hours)
+        start_ms, end_ms = self._modified_bounds()
 
         await self._load_shares(spec, self._security)
 
+        if mode is SyncMode.DELTA:
+            try:
+                upserted, deleted = await self._apply_delta(spec, state, start_ms, end_ms)
+            except httpx.HTTPStatusError as e:
+                if is_change_tracking_disabled_error(e.response.status_code, _response_body(e.response)):
+                    self._mark_change_tracking_disabled(spec, state)
+                else:
+                    # Expired / invalid delta token: re-baseline. The full pull's reconcile
+                    # catches the deletes that happened while the link was unusable.
+                    self.logger.warning(
+                        "Dynamics 365 delta link for %s rejected (HTTP %s); re-baselining with a full pull",
+                        spec.entity_set, e.response.status_code,
+                    )
+                    state.delta_link = None
+                mode = SyncMode.FULL_RECONCILE
+            else:
+                state.last_sync_timestamp = sync_started_ms
+                await self._save_entity_state(key, state)
+                self.logger.info("Synced %d %s records, %d deleted (delta)", upserted, spec.display_name.lower(), deleted)
+                return
+
+        if mode is SyncMode.MODIFIED_ON:
+            upserted = await self._sync_entity_modified_on(spec, state.last_sync_timestamp, start_ms, end_ms)
+            state.last_sync_timestamp = sync_started_ms
+            await self._save_entity_state(key, state)
+            self.logger.info("Synced %d %s records (incremental, modifiedon)", upserted, spec.display_name.lower())
+            return
+
+        upserted, deleted = await self._full_pull_and_reconcile(spec, state, start_ms, end_ms)
+        state.last_sync_timestamp = sync_started_ms
+        state.last_reconcile_timestamp = sync_started_ms
+        await self._save_entity_state(key, state)
+        self.logger.info(
+            "Synced %d %s records, %d deleted (full, change tracking %s)",
+            upserted, spec.display_name.lower(), deleted, state.change_tracking.value,
+        )
+
+    async def _save_entity_state(self, key: str, state: EntitySyncState) -> None:
+        await self.records_sync_point.update_sync_point(key, state.to_sync_point(), encrypt_fields=[FIELD_DELTA_LINK])
+
+    def _reconcile_interval_hours(self) -> float:
+        interval = self.sync_filters.get(RECONCILE_INTERVAL_FILTER_KEY) if self.sync_filters else None
+        return resolve_reconcile_interval_hours(interval.get_value() if interval is not None else None)
+
+    def _mark_change_tracking_disabled(self, spec: EntitySpec, state: EntitySyncState) -> None:
+        state.mark_change_tracking_disabled()
+        self.logger.warning(
+            "Dynamics 365 table %s has change tracking disabled; deletes will only be detected by the "
+            "full reconcile every %.1fh. Enable 'Track changes' on the table (Power Apps → Tables → %s → "
+            "Properties → Advanced options) for delta-based delete detection.",
+            spec.logical_name, self._reconcile_interval_hours(), spec.display_name,
+        )
+
+    async def _apply_delta(
+        self, spec: EntitySpec, state: EntitySyncState, start_ms: Optional[int], end_ms: Optional[int]
+    ) -> Tuple[int, int]:
+        """GET the stored delta link; upsert changed rows, delete ``reason: deleted`` ones,
+        store the new delta link. Raises ``httpx.HTTPStatusError`` for the caller to classify."""
+        assert state.delta_link
+        upserted = deleted = 0
+        new_delta_link: Optional[str] = None
+        async for page in self._iter_delta_pages(spec, state.delta_link):
+            upserted += await self._process_rows(spec, page.upserts, start_ms, end_ms)
+            deleted += await self._delete_by_source_ids(spec, page.deleted_ids)
+            if page.delta_link:
+                new_delta_link = page.delta_link
+        if new_delta_link:
+            state.mark_change_tracking_enabled(new_delta_link)
+        else:
+            self.logger.warning("Dynamics 365 delta response for %s carried no new delta link; will re-baseline", spec.entity_set)
+            state.delta_link = None
+        return upserted, deleted
+
+    async def _sync_entity_modified_on(
+        self, spec: EntitySpec, since_ms: Optional[int], start_ms: Optional[int], end_ms: Optional[int]
+    ) -> int:
+        """Server-side ``modifiedon`` filter (no delete detection) for tables without change tracking."""
         params: Dict[str, str] = {"$select": ",".join(spec.select_fields), "$orderby": "modifiedon asc"}
+        odata_filter = build_modified_filter(since_ms=since_ms, start_ms=start_ms, end_ms=end_ms)
         if odata_filter:
             params["$filter"] = odata_filter
-        total = 0
-        async for page in self._iter_pages(spec.entity_set, params=params, include_annotations=True):
-            batch: List[Tuple[Record, List[Permission]]] = []
-            for row in page:
-                built = self._build_record_with_permissions(spec, row)
-                if built is None:
-                    continue
-                batch.append(built)
-                attachment = self._build_attachment_record(spec, row, built[1])
-                if attachment is not None:
-                    batch.append(attachment)
-            if batch:
-                await self.data_entities_processor.on_new_records(batch)
-                total += len(batch)
-        await self.records_sync_point.update_sync_point(key, {"lastSyncTimestamp": sync_started_ms})
-        self.logger.info("Synced %d %s records%s", total, spec.display_name.lower(), " (incremental)" if since_ms else "")
+        upserted = 0
+        async for rows in self._iter_pages(spec.entity_set, params=params, include_annotations=True):
+            upserted += await self._process_rows(spec, rows, start_ms, end_ms)
+        return upserted
+
+    async def _full_pull_and_reconcile(
+        self, spec: EntitySpec, state: EntitySyncState, start_ms: Optional[int], end_ms: Optional[int]
+    ) -> Tuple[int, int]:
+        """Every row of the table (tracked when Dataverse allows it, so a delta link comes
+        back), then prune graph records the pull did not return.
+
+        The user's modified-date bounds are applied client-side here: a tracked request
+        cannot carry ``$filter``, and the *seen* set must cover the whole table anyway so
+        rows outside the bounds are never mistaken for deletes.
+        """
+        known = await self._known_records(spec)
+        seen: set[str] = set()
+        upserted = 0
+        select = {"$select": ",".join(spec.select_fields)}
+
+        if state.change_tracking is not ChangeTrackingStatus.DISABLED:
+            try:
+                delta_link: Optional[str] = None
+                async for page in self._iter_delta_pages(spec, spec.entity_set, params=select):
+                    seen.update(seen_external_ids(spec, page.upserts))
+                    upserted += await self._process_rows(spec, page.upserts, start_ms, end_ms)
+                    if page.delta_link:
+                        delta_link = page.delta_link
+                state.mark_change_tracking_enabled(delta_link)
+                if not delta_link:
+                    self.logger.warning("Dynamics 365 tracked pull of %s returned no delta link", spec.entity_set)
+            except httpx.HTTPStatusError as e:
+                if not is_change_tracking_disabled_error(e.response.status_code, _response_body(e.response)):
+                    raise
+                self._mark_change_tracking_disabled(spec, state)
+                seen.clear()
+                upserted = 0
+
+        if state.change_tracking is ChangeTrackingStatus.DISABLED:
+            params = {**select, "$orderby": "modifiedon asc"}
+            async for rows in self._iter_pages(spec.entity_set, params=params, include_annotations=True):
+                seen.update(seen_external_ids(spec, rows))
+                upserted += await self._process_rows(spec, rows, start_ms, end_ms)
+
+        deleted = await self._prune_missing(spec, known, seen)
+        return upserted, deleted
+
+    async def _process_rows(
+        self, spec: EntitySpec, rows: List[Dict[str, Any]], start_ms: Optional[int], end_ms: Optional[int]
+    ) -> int:
+        batch: List[Tuple[Record, List[Permission]]] = []
+        for row in rows:
+            if not row_in_modified_bounds(row, start_ms, end_ms):
+                continue
+            built = self._build_record_with_permissions(spec, row)
+            if built is None:
+                continue
+            batch.append(built)
+            attachment = self._build_attachment_record(spec, row, built[1])
+            if attachment is not None:
+                batch.append(attachment)
+        if batch:
+            await self.data_entities_processor.on_new_records(batch)
+        return len(batch)
+
+    # ------------------------------------------------------------------
+    # Delete detection
+    # ------------------------------------------------------------------
+
+    async def _known_records(self, spec: EntitySpec) -> Dict[str, str]:
+        """``{external_record_id: record_id}`` for everything the graph holds under the
+        entity's record group (records and note attachments alike)."""
+        known: Dict[str, str] = {}
+        org_id = self.data_entities_processor.org_id
+        async with self.data_store_provider.transaction() as tx_store:
+            group = await tx_store.get_record_group_by_external_id(
+                connector_id=self.connector_id, external_id=self._record_group_external_id(spec)
+            )
+            if not group:
+                return known
+            offset = 0
+            while True:
+                page = await tx_store.get_records_by_status(
+                    org_id=org_id,
+                    connector_id=self.connector_id,
+                    status_filters=None,
+                    limit=_KNOWN_RECORDS_PAGE_SIZE,
+                    offset=offset,
+                    record_group_id=group.id,
+                )
+                if not page:
+                    break
+                for record in page:
+                    external_id = getattr(record, "external_record_id", None)
+                    record_id = getattr(record, "id", None)
+                    if external_id and record_id:
+                        known[str(external_id)] = str(record_id)
+                if len(page) < _KNOWN_RECORDS_PAGE_SIZE:
+                    break
+                offset += _KNOWN_RECORDS_PAGE_SIZE
+        return known
+
+    async def _prune_missing(self, spec: EntitySpec, known: Dict[str, str], seen: set[str]) -> int:
+        missing = missing_record_ids(known, seen)
+        if not missing:
+            return 0
+        if not prune_is_safe(len(known), len(seen)):
+            self.logger.warning(
+                "Refusing to prune %d %s records: the full pull returned no rows at all",
+                len(missing), spec.display_name.lower(),
+            )
+            return 0
+        self.logger.info("Pruning %d %s records no longer present in Dynamics 365", len(missing), spec.display_name.lower())
+        return await self._delete_record_ids(missing)
+
+    async def _delete_by_source_ids(self, spec: EntitySpec, source_ids: List[str]) -> int:
+        """Delta ``reason: deleted`` entries → graph records (unknown ids are ignored)."""
+        record_ids: List[str] = []
+        for source_id in source_ids:
+            record = await self.data_entities_processor.get_record_by_external_id(
+                self.connector_id, record_external_id(spec, source_id)
+            )
+            if record is not None and getattr(record, "id", None):
+                record_ids.append(str(record.id))
+        return await self._delete_record_ids(record_ids)
+
+    async def _delete_record_ids(self, record_ids: List[str]) -> int:
+        """Standard cascade delete: drops the record, its permission edges and children
+        (note attachments) and publishes the vector cleanup events."""
+        deleted = 0
+        for start in range(0, len(record_ids), _DELETE_BATCH_SIZE):
+            chunk = record_ids[start:start + _DELETE_BATCH_SIZE]
+            try:
+                result = await self.data_entities_processor.on_records_deleted_cascade(chunk, self.connector_id)
+            except Exception as e:
+                self.logger.error("Failed to delete %d Dynamics 365 records: %s", len(chunk), e, exc_info=True)
+                continue
+            deleted += int((result or {}).get("successfully_deleted") or 0)
+            failed = (result or {}).get("failed_records") or []
+            if failed:
+                self.logger.warning("%d Dynamics 365 record deletions failed: %s", len(failed), failed[:5])
+        return deleted
 
     def _build_record_with_permissions(self, spec: EntitySpec, row: Dict[str, Any]) -> Optional[Tuple[Record, List[Permission]]]:
         assert self._security is not None
@@ -995,6 +1260,13 @@ class MicrosoftDynamics365Connector(BaseConnector):
         start = max(page - 1, 0) * limit
         chunk = options[start:start + limit]
         return FilterOptionsResponse(success=True, options=chunk, page=page, limit=limit, has_more=start + limit < len(options))
+
+
+def _response_body(response: httpx.Response) -> Any:
+    try:
+        return response.json()
+    except ValueError:
+        return response.text
 
 
 def _as_float(value: Any) -> Optional[float]:

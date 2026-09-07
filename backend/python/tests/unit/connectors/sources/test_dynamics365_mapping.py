@@ -20,10 +20,11 @@ from app.connectors.sources.microsoft.dynamics365.mapping import (
     SecurityContext,
     ShareEntry,
     attachment_external_id,
+    bu_group_external_id,
     build_metadata,
     build_modified_filter,
-    bu_group_external_id,
     derive_grants,
+    display_value,
     epoch_ms_to_odata,
     index_shares,
     is_application_user,
@@ -376,6 +377,102 @@ class TestPermissionMapping:
         a = PermissionGrant(GrantEntity.USER, GrantRole.OWNER, email="x@y.z", reason="one")
         b = PermissionGrant(GrantEntity.USER, GrantRole.OWNER, email="x@y.z", reason="two")
         assert a == b
+
+
+class TestArabicContent:
+    """Arabic (RTL) names and text must reach the graph byte-for-byte: no ASCII
+    folding, transliteration or escaping anywhere in the mapping layer."""
+
+    ACCOUNT_NAME = "شركة الاتصالات السعودية"
+    CONTACT_NAME = "فاطمة بنت عبدالله الزهراني"
+    OWNER_NAME = "محمد بن سعود العلي"
+    ADDRESS = "طريق الملك فهد، الرياض ١٢٣٤٥، المملكة العربية السعودية"
+    DESCRIPTION = "عميل استراتيجي — تجديد العقد السنوي في الربع الثالث."
+
+    def _account_row(self) -> dict:
+        return {
+            "accountid": "a1",
+            "name": self.ACCOUNT_NAME,
+            "accountnumber": "ACC-٠٠١",  # Arabic-Indic digits
+            "description": self.DESCRIPTION,
+            "address1_composite": self.ADDRESS,
+            "statuscode": 1,
+            "statuscode@OData.Community.Display.V1.FormattedValue": "نشط",
+            "industrycode": 6,
+            "industrycode@OData.Community.Display.V1.FormattedValue": "الاتصالات",
+            "_ownerid_value": USER_A,
+            "_ownerid_value@OData.Community.Display.V1.FormattedValue": self.OWNER_NAME,
+            "_ownerid_value@Microsoft.Dynamics.CRM.lookuplogicalname": "systemuser",
+            "_owninguser_value": USER_A,
+            "_owningbusinessunit_value": BU_ROOT,
+            "_owningbusinessunit_value@OData.Community.Display.V1.FormattedValue": "الفرع الرئيسي",
+            "createdon": "2026-01-02T03:04:05Z",
+            "modifiedon": "2026-02-03T04:05:06Z",
+        }
+
+    def test_arabic_account_name_and_fields_pass_through_unchanged(self):
+        account = ENTITY_SPECS["account"]
+        row = self._account_row()
+        assert record_title(account, row) == self.ACCOUNT_NAME
+        assert display_value(row, "statuscode") == "نشط"
+        assert display_value(row, "accountnumber") == "ACC-٠٠١"
+
+        markdown, metadata = render_record_markdown(account, row, ENV)
+        assert markdown.startswith(f"# {self.ACCOUNT_NAME}\n")
+        assert "**Status:** نشط" in markdown
+        assert f"**Owner:** {self.OWNER_NAME}" in markdown
+        assert "- **Industry:** الاتصالات" in markdown
+        assert f"- **Address:** {self.ADDRESS}" in markdown
+        assert f"## Description\n{self.DESCRIPTION}" in markdown
+        assert "- Business unit: الفرع الرئيسي" in markdown
+        # nothing was folded, escaped or replaced
+        assert "\\u" not in markdown and "?" not in self.ACCOUNT_NAME
+        assert markdown.encode("utf-8").decode("utf-8") == markdown
+        assert metadata["id"] == "a1"
+
+    def test_arabic_contact_name_and_title(self):
+        contact = ENTITY_SPECS["contact"]
+        row = {
+            "contactid": "c1",
+            "fullname": self.CONTACT_NAME,
+            "firstname": "فاطمة",
+            "lastname": "الزهراني",
+            "jobtitle": "مديرة المشتريات",
+            "_parentcustomerid_value": "a1",
+            "_parentcustomerid_value@OData.Community.Display.V1.FormattedValue": self.ACCOUNT_NAME,
+            "_ownerid_value": USER_B,
+            "_owninguser_value": USER_B,
+            "_owningbusinessunit_value": BU_ROOT,
+            "modifiedon": "2026-02-03T04:05:06Z",
+        }
+        assert record_title(contact, row) == self.CONTACT_NAME
+        markdown, _ = render_record_markdown(contact, row, ENV)
+        assert markdown.startswith(f"# {self.CONTACT_NAME}\n")
+        assert "- **Job title:** مديرة المشتريات" in markdown
+        assert f"- **Company:** {self.ACCOUNT_NAME}" in markdown
+        # permissions do not depend on the (Arabic) display strings
+        grants = derive_grants(contact, row, _ctx())
+        assert (GrantEntity.USER, GrantRole.OWNER, None, "bob@contoso.com") in _grant_keys(grants)
+
+    def test_arabic_note_and_attachment_filename(self):
+        row = {
+            "annotationid": "n1",
+            "subject": "ملخص الاجتماع",
+            "notetext": "طلب العميل خصمًا بنسبة ١٠٪.",
+            "isdocument": True,
+            "filename": "عرض_السعر.pdf",
+            "mimetype": "application/pdf",
+        }
+        assert record_title(NOTE, row) == "ملخص الاجتماع"
+        assert record_title(NOTE, {"annotationid": "n2", "filename": "عرض_السعر.pdf"}) == "عرض_السعر.pdf"
+        markdown, _ = render_record_markdown(NOTE, row, ENV)
+        assert "## Note\nطلب العميل خصمًا بنسبة ١٠٪." in markdown
+        assert "- **Attachment:** عرض_السعر.pdf" in markdown
+
+    def test_mixed_rtl_ltr_text_is_not_reordered_or_trimmed(self):
+        value = "Contoso KSA — شركة كونتوسو (الرياض) v2.1"
+        assert display_value({"name": value}, "name") == value
+        assert record_title(ENTITY_SPECS["account"], {"accountid": "a1", "name": value}) == value
 
 
 class TestUsers:
