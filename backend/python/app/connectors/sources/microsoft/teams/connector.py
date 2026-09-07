@@ -3,9 +3,18 @@
 Indexes channel message threads (root + replies as one markdown record per
 thread) and, optionally, 1:1 / group chats, and mirrors team / channel / chat
 membership as READER permission edges so permission-aware search only surfaces
-messages the user could read in Teams.  The mapping itself lives in
-``mapping.py`` (pure, unit-tested); this module owns auth, HTTP, paging and the
-``BaseConnector`` lifecycle — the same split as ``..dynamics365``.
+messages the user could read in Teams.  Files shared in messages become child
+``FileRecord`` s of the thread / chat record (same shape and streaming path as
+the OneDrive connector: driveItem metadata, bytes from
+``@microsoft.graph.downloadUrl``), carrying exactly the parent's grants.  The
+mapping itself lives in ``mapping.py`` (pure, unit-tested); this module owns
+auth, HTTP, paging and the ``BaseConnector`` lifecycle — the same split as
+``..dynamics365``.
+
+Incremental channel sync = ``/messages/delta`` (roots only) **plus** a sweep of
+``/messages?$expand=replies`` — Graph sorts that listing by the last-modified
+time of the whole reply chain, so it is walked newest-first until a chain older
+than the previous run appears.  See ``mapping`` "Incremental sync model".
 
 Auth: Entra ID client-credentials (``ClientSecretCredential`` like OneDrive /
 Dynamics 365) for ``https://graph.microsoft.com/.default``.  Directory users
@@ -32,25 +41,25 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from logging import Logger
-from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
 
 import httpx
 from azure.identity.aio import ClientSecretCredential
-from fastapi.responses import StreamingResponse
+from fastapi import HTTPException
 from msgraph import GraphServiceClient
 
-from app.config.configuration_service import ConfigurationService
-from app.config.constants.arangodb import Connectors, MimeTypes, OriginTypes
+from app.config.constants.arangodb import (
+    Connectors,
+    MimeTypes,
+    OriginTypes,
+    ProgressStatus,
+)
 from app.config.constants.http_status_code import HttpStatusCode
 from app.connectors.core.base.connector.connector_service import (
     BaseConnector,
     ConnectorInitError,
 )
-from app.connectors.core.base.data_processor.data_source_entities_processor import (
-    DataSourceEntitiesProcessor,
-)
-from app.connectors.core.base.data_store.data_store import DataStoreProvider
 from app.connectors.core.base.sync_point.sync_point import SyncDataPointType, SyncPoint
 from app.connectors.core.constants import CONNECTOR_EMAIL_IDENTITY_INFO, IconPaths
 from app.connectors.core.registry.auth_builder import (
@@ -73,6 +82,7 @@ from app.connectors.core.registry.filters import (
     FilterOption,
     FilterOptionsResponse,
     FilterType,
+    IndexingFilterKey,
     OptionSourceType,
     load_connector_filters,
 )
@@ -81,6 +91,9 @@ from app.connectors.sources.microsoft.common.constants import (
     MicrosoftGraphScopes,
     MicrosoftOAuth,
     MicrosoftOAuthParams,
+)
+from app.connectors.sources.microsoft.common.content_type_utils import (
+    derive_attachment_extension,
 )
 from app.connectors.sources.microsoft.common.delegated_auth import (
     DelegatedTokenProvider,
@@ -98,18 +111,27 @@ from app.connectors.sources.microsoft.teams.mapping import (
     CHATS_RECORD_GROUP_NAME,
     CHATS_SYNC_POINT_KEY,
     DEFAULT_CHAT_LOOKBACK_DAYS,
+    FILE_APPLICATION_PERMISSIONS,
+    FILE_ID_PREFIX,
     GRAPH_BASE_URL,
     GRAPH_SCOPE,
+    HOSTED_ID_PREFIX,
+    HOSTED_IMAGE_EXTENSION,
+    HOSTED_IMAGE_MIME_TYPE,
     INCLUDE_CHATS_FILTER_KEY,
+    INCLUDE_INLINE_IMAGES_FILTER_KEY,
     INCLUDE_PRIVATE_CHANNELS_FILTER_KEY,
     PERSONAL_DELEGATED_PERMISSIONS,
     PROTECTED_API_PERMISSIONS,
     REQUIRED_APPLICATION_PERMISSIONS,
     TEAMS_FILTER_KEY,
     THREAD_ID_PREFIX,
+    Attachment,
     DeltaChanges,
+    FileInfo,
     GrantEntity,
     GrantRole,
+    HostedImage,
     Member,
     MessageView,
     PermissionGrant,
@@ -130,7 +152,14 @@ from app.connectors.sources.microsoft.teams.mapping import (
     chat_revision,
     chat_title,
     classify_delta_items,
+    classify_listing_items,
     delta_sync_point_data,
+    drive_item_file_info,
+    drive_item_url,
+    file_attachments,
+    hosted_content_value_url,
+    hosted_external_id,
+    hosted_images,
     is_delta_unsupported_status,
     is_private_or_shared_channel,
     lookback_start_ms,
@@ -148,7 +177,9 @@ from app.connectors.sources.microsoft.teams.mapping import (
     resolve_chat_lookback_days,
     select_chat_messages,
     select_teams,
+    shared_drive_item_url,
     should_sync_channel,
+    skipped_attachments,
     split_external_id,
     team_display_name,
     team_group_external_id,
@@ -162,6 +193,7 @@ from app.connectors.sources.microsoft.teams.mapping import (
 from app.models.entities import (
     AppUser,
     AppUserGroup,
+    FileRecord,
     MessageRecord,
     Record,
     RecordGroup,
@@ -169,8 +201,20 @@ from app.models.entities import (
     RecordType,
 )
 from app.models.permission import EntityType, Permission, PermissionType
-from app.utils.streaming import create_stream_record_response
+from app.utils.streaming import create_stream_record_response, stream_content
 from app.utils.time_conversion import get_epoch_timestamp_in_ms
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncGenerator
+    from logging import Logger
+
+    from fastapi.responses import StreamingResponse
+
+    from app.config.configuration_service import ConfigurationService
+    from app.connectors.core.base.data_processor.data_source_entities_processor import (
+        DataSourceEntitiesProcessor,
+    )
+    from app.connectors.core.base.data_store.data_store import DataStoreProvider
 
 CONNECTOR_KEY = "microsoftteams"  # ConnectorFactory registry key / filters config name
 USERS_SYNC_POINT_KEY = "users"
@@ -185,7 +229,7 @@ _GRANT_ROLE_TO_PERMISSION = {GrantRole.READER: PermissionType.READ}
 _GRANT_ENTITY_TO_PERMISSION = {GrantEntity.USER: EntityType.USER, GrantEntity.GROUP: EntityType.GROUP}
 
 
-def grants_to_permissions(grants: List[PermissionGrant]) -> List[Permission]:
+def grants_to_permissions(grants: list[PermissionGrant]) -> list[Permission]:
     """Convert connector-agnostic grants (mapping.py) into graph ``Permission`` objects."""
     return [
         Permission(
@@ -200,6 +244,17 @@ def grants_to_permissions(grants: List[PermissionGrant]) -> List[Permission]:
 
 class _GraphForbidden(Exception):
     """403 from Graph — missing application permission or unapproved protected API."""
+
+
+@dataclass(frozen=True)
+class _ChannelContext:
+    """What every thread of one channel shares: names for rendering, grants for its records."""
+
+    team_id: str
+    team_name: str
+    channel_id: str
+    channel_name: str
+    permissions: list[Permission]
 
 
 @ConnectorBuilder("Microsoft Teams")\
@@ -259,6 +314,7 @@ class _GraphForbidden(Exception):
             scopes=OAuthScopeConfig(
                 personal_sync=[
                     MicrosoftGraphScopes.CHAT_READ,
+                    MicrosoftGraphScopes.FILES_READ,  # files shared in the user's chats
                     MicrosoftGraphScopes.USER_READ,
                     MicrosoftGraphScopes.OFFLINE_ACCESS,
                 ],
@@ -329,6 +385,28 @@ class _GraphForbidden(Exception):
             description="How many days of chat history each chat record keeps.",
             default_value=DEFAULT_CHAT_LOOKBACK_DAYS,
         ))
+        .add_filter_field(FilterField(
+            name=INCLUDE_INLINE_IMAGES_FILTER_KEY,
+            display_name="Include pasted images",
+            filter_type=FilterType.BOOLEAN,
+            category=FilterCategory.SYNC,
+            description=(
+                "Also index pictures pasted into messages (screenshots) as image files of the "
+                "message. Every image is OCR'd, so this is off by default."
+            ),
+            default_value=False,
+        ))
+        .add_filter_field(FilterField(
+            name=IndexingFilterKey.ATTACHMENTS.value,
+            display_name="Index attachments",
+            filter_type=FilterType.BOOLEAN,
+            category=FilterCategory.INDEXING,
+            description=(
+                "Index files shared in channel and chat messages (SharePoint / OneDrive links). "
+                "Needs Files.Read.All; when off the files are still listed but not indexed."
+            ),
+            default_value=True,
+        ))
         .add_filter_field(CommonFields.enable_manual_sync_filter())
         .with_sync_strategies([SyncStrategy.SCHEDULED, SyncStrategy.MANUAL])
         .with_scheduled_config(True, 60)
@@ -372,24 +450,27 @@ class MicrosoftTeamsConnector(BaseConnector):
         self.user_sync_point = _sync_point(SyncDataPointType.USERS)
         self.records_sync_point = _sync_point(SyncDataPointType.RECORDS)
 
-        self.credential: Optional[ClientSecretCredential] = None
-        self.graph_client: Optional[GraphServiceClient] = None
-        self.msgraph_client: Optional[MSGraphClient] = None
-        self._http: Optional[httpx.AsyncClient] = None
-        self._token: Optional[str] = None
+        self.credential: ClientSecretCredential | None = None
+        self.graph_client: GraphServiceClient | None = None
+        self.msgraph_client: MSGraphClient | None = None
+        self._http: httpx.AsyncClient | None = None
+        self._token: str | None = None
         self._token_expires_on: int = 0
         self._request_semaphore = asyncio.Semaphore(_MAX_CONCURRENT_REQUESTS)
         # personal scope: delegated token provider (None in team scope)
-        self._delegated: Optional[DelegatedTokenProvider] = None
-        self._me_oid: Optional[str] = None
+        self._delegated: DelegatedTokenProvider | None = None
+        self._me_oid: str | None = None
 
         self.sync_filters: FilterCollection = FilterCollection()
         self.indexing_filters: FilterCollection = FilterCollection()
-        self._users_by_id: Dict[str, AppUser] = {}
-        self._user_email_by_id: Dict[str, str] = {}
-        self._team_names: Dict[str, str] = {}
-        self._channel_names: Dict[Tuple[str, str], str] = {}
+        self._users_by_id: dict[str, AppUser] = {}
+        self._user_email_by_id: dict[str, str] = {}
+        self._team_names: dict[str, str] = {}
+        self._channel_names: dict[tuple[str, str], str] = {}
         self._protected_api_logged = False
+        # per-run: the same SharePoint link shows up in many threads; None = unresolvable
+        self._shared_file_cache: dict[str, FileInfo | None] = {}
+        self._files_forbidden_logged = False
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -398,7 +479,7 @@ class MicrosoftTeamsConnector(BaseConnector):
     def _is_personal(self) -> bool:
         return is_personal_scope(self.scope)
 
-    def _personal_permissions(self) -> List[Permission]:
+    def _personal_permissions(self) -> list[Permission]:
         """Creator-only READER grants for personal-scope records and record groups."""
         return grants_to_permissions(personal_chat_grants(self.creator_email))
 
@@ -521,7 +602,7 @@ class MicrosoftTeamsConnector(BaseConnector):
         scope: str,
         created_by: str,
         data_entities_processor: DataSourceEntitiesProcessor,
-        **kwargs: Any,
+        **kwargs: object,
     ) -> "BaseConnector":
         return cls(
             logger,
@@ -558,14 +639,14 @@ class MicrosoftTeamsConnector(BaseConnector):
             return self._token
         return await self._refresh_token()
 
-    async def _get_json(self, path_or_url: str, params: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+    async def _get_json(self, path_or_url: str, params: dict[str, str] | None = None) -> dict[str, Any]:
         """GET with bearer auth, 401 re-auth and bounded retry on 429/5xx (honours Retry-After).
 
         ``path_or_url`` may be a relative Graph path or an absolute ``@odata.nextLink`` /
         ``@odata.deltaLink`` (which already carries its own query string)."""
         if self._http is None:
             raise RuntimeError("Microsoft Teams connector not initialised")
-        headers: Dict[str, str] = {}
+        headers: dict[str, str] = {}
         refreshed = False
         delay = 1.0
         for attempt in range(_MAX_HTTP_RETRIES + 1):
@@ -603,7 +684,7 @@ class MicrosoftTeamsConnector(BaseConnector):
             return response.json()
         raise RuntimeError(f"Microsoft Graph request to {path_or_url} exhausted retries")
 
-    async def _iter_pages(self, path_or_url: str, params: Optional[Dict[str, str]] = None) -> AsyncGenerator[List[Dict[str, Any]], None]:
+    async def _iter_pages(self, path_or_url: str, params: dict[str, str] | None = None) -> AsyncGenerator[list[dict[str, Any]], None]:
         """Follow ``@odata.nextLink`` (absolute URL that already carries the query)."""
         payload = await self._get_json(path_or_url, params=params)
         while True:
@@ -613,8 +694,8 @@ class MicrosoftTeamsConnector(BaseConnector):
                 return
             payload = await self._get_json(next_link)
 
-    async def _fetch_all(self, path_or_url: str, params: Optional[Dict[str, str]] = None) -> List[Dict[str, Any]]:
-        rows: List[Dict[str, Any]] = []
+    async def _fetch_all(self, path_or_url: str, params: dict[str, str] | None = None) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
         async for page in self._iter_pages(path_or_url, params=params):
             rows.extend(page)
         return rows
@@ -652,7 +733,7 @@ class MicrosoftTeamsConnector(BaseConnector):
         (``lastModifiedDateTime`` filter where delta is unsupported); chats by modified filter."""
         await self._run(incremental=True)
 
-    async def _run(self, incremental: bool) -> None:
+    async def _run(self, *, incremental: bool) -> None:
         if self._http is None:
             self.logger.error("Microsoft Teams connector not initialised")
             return
@@ -660,6 +741,8 @@ class MicrosoftTeamsConnector(BaseConnector):
         self.sync_filters, self.indexing_filters = await load_connector_filters(
             self.config_service, CONNECTOR_KEY, self.connector_id, self.logger
         )
+        self._shared_file_cache = {}
+        self._files_forbidden_logged = False
         if self._is_personal():
             # signed-in user's chats only: no directory, no teams / channels, creator-only permissions
             self.logger.info("Personal scope: syncing chats of %s only", self.creator_email)
@@ -688,13 +771,13 @@ class MicrosoftTeamsConnector(BaseConnector):
                 self._log_protected_api("chats", e)
         self.logger.info("Microsoft Teams sync completed")
 
-    def _selected_team_values(self) -> Optional[List[str]]:
+    def _selected_team_values(self) -> list[str] | None:
         team_filter = self.sync_filters.get(TEAMS_FILTER_KEY) if self.sync_filters else None
         if team_filter is None or team_filter.is_empty():
             return None
         return [str(v) for v in team_filter.as_list()]
 
-    def _bool_filter(self, key: str, default: bool) -> bool:
+    def _bool_filter(self, key: str, *, default: bool) -> bool:
         # not FilterCollection.is_enabled: that helper is for indexing filters and is
         # overridden by enable_manual_sync
         flag = self.sync_filters.get(key) if self.sync_filters else None
@@ -707,6 +790,14 @@ class MicrosoftTeamsConnector(BaseConnector):
 
     def _include_chats(self) -> bool:
         return self._bool_filter(INCLUDE_CHATS_FILTER_KEY, default=False)
+
+    def _include_inline_images(self) -> bool:
+        return self._bool_filter(INCLUDE_INLINE_IMAGES_FILTER_KEY, default=False)
+
+    def _index_attachments(self) -> bool:
+        if not self.indexing_filters:
+            return True
+        return self.indexing_filters.is_enabled(IndexingFilterKey.ATTACHMENTS, default=True)
 
     def _chat_lookback_days(self) -> int:
         value = self.sync_filters.get_value(CHAT_LOOKBACK_DAYS_FILTER_KEY) if self.sync_filters else None
@@ -726,7 +817,7 @@ class MicrosoftTeamsConnector(BaseConnector):
         except Exception as e:
             self.logger.warning("Could not list directory users (%s); continuing with roster data only", str(e)[:200])
             return
-        batch: List[AppUser] = []
+        batch: list[AppUser] = []
         for user in users:
             if not user.email or not user.source_user_id:
                 continue
@@ -739,14 +830,14 @@ class MicrosoftTeamsConnector(BaseConnector):
         await self.user_sync_point.update_sync_point(USERS_SYNC_POINT_KEY, {"lastSyncTimestamp": get_epoch_timestamp_in_ms()})
         self.logger.info("Synced %d Microsoft Teams users", len(batch))
 
-    async def _list_teams(self) -> List[Dict[str, Any]]:
+    async def _list_teams(self) -> list[dict[str, Any]]:
         teams = await self._fetch_all("teams", params={"$select": "id,displayName,description,webUrl,isArchived,createdDateTime"})
         for team in teams:
             if team.get("id"):
                 self._team_names[str(team["id"])] = team_display_name(team)
         return teams
 
-    async def _list_channels(self, team_id: str) -> List[Dict[str, Any]]:
+    async def _list_channels(self, team_id: str) -> list[dict[str, Any]]:
         channels = await self._fetch_all(
             f"teams/{team_id}/channels",
             params={"$select": "id,displayName,description,membershipType,webUrl,isArchived,createdDateTime"},
@@ -756,7 +847,7 @@ class MicrosoftTeamsConnector(BaseConnector):
                 self._channel_names[(team_id, str(channel["id"]))] = channel_display_name(channel)
         return channels
 
-    async def _team_members(self, team_id: str) -> List[Member]:
+    async def _team_members(self, team_id: str) -> list[Member]:
         try:
             return parse_conversation_members(await self._fetch_all(f"teams/{team_id}/members"))
         except _GraphForbidden:
@@ -764,11 +855,11 @@ class MicrosoftTeamsConnector(BaseConnector):
             rows = await self._fetch_all(f"groups/{team_id}/members", params={"$select": "id,displayName,mail,userPrincipalName"})
             return parse_group_members(rows)
 
-    async def _channel_members(self, team_id: str, channel_id: str) -> List[Member]:
+    async def _channel_members(self, team_id: str, channel_id: str) -> list[Member]:
         return parse_conversation_members(await self._fetch_all(f"teams/{team_id}/channels/{channel_id}/members"))
 
-    def _members_to_app_users(self, members: List[Member]) -> List[AppUser]:
-        app_users: List[AppUser] = []
+    def _members_to_app_users(self, members: list[Member]) -> list[AppUser]:
+        app_users: list[AppUser] = []
         for member in members:
             known = self._users_by_id.get(member.user_id)
             if known is not None:
@@ -790,7 +881,7 @@ class MicrosoftTeamsConnector(BaseConnector):
             app_users.append(app_user)
         return app_users
 
-    async def _sync_team(self, team: Dict[str, Any], incremental: bool) -> None:
+    async def _sync_team(self, team: dict[str, Any], *, incremental: bool) -> None:
         team_id = str(team["id"])
         team_name = team_display_name(team)
         org_id = self.data_entities_processor.org_id
@@ -809,11 +900,11 @@ class MicrosoftTeamsConnector(BaseConnector):
 
         channels = await self._list_channels(team_id)
         include_private = self._include_private_channels()
-        record_groups: List[Tuple[RecordGroup, List[Permission]]] = []
-        channel_groups: List[Tuple[AppUserGroup, List[AppUser]]] = []
-        synced_channels: List[Dict[str, Any]] = []
+        record_groups: list[tuple[RecordGroup, list[Permission]]] = []
+        channel_groups: list[tuple[AppUserGroup, list[AppUser]]] = []
+        synced_channels: list[dict[str, Any]] = []
         for channel in channels:
-            if not should_sync_channel(channel, include_private):
+            if not should_sync_channel(channel, include_private_channels=include_private):
                 continue
             channel_id = str(channel["id"])
             channel_name = channel_display_name(channel)
@@ -871,7 +962,7 @@ class MicrosoftTeamsConnector(BaseConnector):
     # Channel messages
     # ------------------------------------------------------------------
 
-    async def _sync_channel_messages(self, team_id: str, team_name: str, channel: Dict[str, Any], incremental: bool) -> None:
+    async def _sync_channel_messages(self, team_id: str, team_name: str, channel: dict[str, Any], *, incremental: bool) -> None:
         channel_id = str(channel["id"])
         channel_name = channel_display_name(channel)
         key = channel_sync_point_key(team_id, channel_id)
@@ -879,12 +970,12 @@ class MicrosoftTeamsConnector(BaseConnector):
         stored_delta = read_delta_link(point)
         last_sync_ms = read_last_sync_ms(point)
         started_ms = get_epoch_timestamp_in_ms()
-        permissions = grants_to_permissions(channel_grants(team_id, channel))
+        ctx = _ChannelContext(team_id, team_name, channel_id, channel_name, grants_to_permissions(channel_grants(team_id, channel)))
 
-        url = stored_delta or channel_delta_url(team_id, channel_id)
         use_delta = True
+        payload: dict[str, Any] | None = None
         try:
-            payload = await self._get_json(url)
+            payload = await self._get_json(stored_delta or channel_delta_url(team_id, channel_id))
         except httpx.HTTPStatusError as e:
             if stored_delta and e.response.status_code in (HttpStatusCode.BAD_REQUEST.value, 410):
                 # expired / invalid delta token: start a fresh delta enumeration
@@ -892,25 +983,34 @@ class MicrosoftTeamsConnector(BaseConnector):
                 payload = await self._get_json(channel_delta_url(team_id, channel_id))
             elif is_delta_unsupported_status(e.response.status_code):
                 use_delta = False
-                since = last_sync_ms if incremental else None
-                self.logger.info("Delta not supported for channel %s; using lastModifiedDateTime listing", channel_name)
-                payload = await self._get_json(channel_messages_url(team_id, channel_id, since_ms=since))
+                self.logger.info("Delta not supported for channel %s; using the reply-chain listing", channel_name)
             else:
                 raise
 
         total = 0
         deleted = 0
-        delta_link: Optional[str] = None
-        while True:
-            page = parse_delta_page(payload)
-            changes = classify_delta_items(page.items)
-            total += await self._process_thread_changes(team_id, team_name, channel_id, channel_name, changes, permissions)
-            deleted += await self._delete_threads(team_id, channel_id, changes.deleted_root_ids)
-            if page.next_link:
-                payload = await self._get_json(page.next_link)
-                continue
-            delta_link = page.delta_link
-            break
+        delta_link: str | None = None
+        handled: set[str] = set()
+        if use_delta and payload is not None:
+            while True:
+                page = parse_delta_page(payload)
+                changes = classify_delta_items(page.items)
+                handled.update(changes.dirty_root_ids)
+                handled.update(changes.deleted_root_ids)
+                indexed, gone = await self._process_thread_changes(ctx, changes)
+                total += indexed
+                deleted += gone
+                if page.next_link:
+                    payload = await self._get_json(page.next_link)
+                    continue
+                delta_link = page.delta_link
+                break
+        if not use_delta or last_sync_ms is not None:
+            # delta lists roots only and a reply leaves its root untouched: walk the listing
+            # Graph sorts by reply-chain modification until it gets older than the last run
+            indexed, gone = await self._sweep_channel_threads(ctx, since_ms=last_sync_ms, skip_root_ids=handled)
+            total += indexed
+            deleted += gone
 
         await self.records_sync_point.update_sync_point(
             key,
@@ -922,21 +1022,16 @@ class MicrosoftTeamsConnector(BaseConnector):
             total, deleted, team_name, channel_name, " (incremental)" if incremental else "",
         )
 
-    async def _process_thread_changes(
-        self,
-        team_id: str,
-        team_name: str,
-        channel_id: str,
-        channel_name: str,
-        changes: DeltaChanges,
-        permissions: List[Permission],
-    ) -> int:
-        async def _load(root_id: str) -> Optional[Thread]:
+    async def _process_thread_changes(self, ctx: _ChannelContext, changes: DeltaChanges) -> tuple[int, int]:
+        """Rebuild the dirty threads of one delta page; returns ``(indexed, deleted)``.
+        A dirty root that turns out soft-deleted, gone (404) or a system event drops its record."""
+
+        async def _load(root_id: str) -> Thread | None:
             root = changes.roots.get(root_id)
             try:
                 if root is None:
-                    root = await self._get_json(channel_message_url(team_id, channel_id, root_id))
-                replies = await self._fetch_all(message_replies_url(team_id, channel_id, root_id))
+                    root = await self._get_json(channel_message_url(ctx.team_id, ctx.channel_id, root_id))
+                replies = await self._fetch_all(message_replies_url(ctx.team_id, ctx.channel_id, root_id))
             except httpx.HTTPStatusError as e:
                 if e.response.status_code == HttpStatusCode.NOT_FOUND.value:
                     return None
@@ -944,31 +1039,205 @@ class MicrosoftTeamsConnector(BaseConnector):
             thread = build_thread(root, replies)
             return thread if thread.root.is_indexable else None
 
-        total = 0
+        indexed = 0
+        gone: list[str] = list(changes.deleted_root_ids)
         ids = list(changes.dirty_root_ids)
         for start in range(0, len(ids), _RECORD_BATCH_SIZE):
             chunk = ids[start:start + _RECORD_BATCH_SIZE]
             threads = await asyncio.gather(*(_load(root_id) for root_id in chunk))
-            batch: List[Tuple[Record, List[Permission]]] = [
-                (self._build_thread_record(team_id, team_name, channel_id, channel_name, thread), list(permissions))
-                for thread in threads
-                if thread is not None
-            ]
-            if batch:
-                await self.data_entities_processor.on_new_records(batch)
-                total += len(batch)
+            gone.extend(root_id for root_id, thread in zip(chunk, threads, strict=True) if thread is None)
+            indexed += await self._emit_threads(ctx, [t for t in threads if t is not None])
+        return indexed, await self._delete_threads(ctx, gone)
+
+    async def _sweep_channel_threads(self, ctx: _ChannelContext, *, since_ms: int | None, skip_root_ids: set[str]) -> tuple[int, int]:
+        """Page ``/messages?$expand=replies`` newest-chain-first and rebuild every thread with
+        activity after ``since_ms`` (``None`` = the whole channel); returns ``(indexed, deleted)``."""
+        indexed = 0
+        deleted = 0
+        payload = await self._get_json(channel_messages_url(ctx.team_id, ctx.channel_id, expand_replies=True))
+        while True:
+            page = parse_delta_page(payload)
+            changes = classify_listing_items(page.items, since_ms, skip_root_ids)
+            threads: list[Thread] = []
+            for root, inline_replies, more_replies in changes.threads:
+                # > 200 replies: Graph pages the rest behind replies@odata.nextLink
+                extra = await self._fetch_all(more_replies) if more_replies else []
+                threads.append(build_thread(root, [*inline_replies, *extra]))
+            indexed += await self._emit_threads(ctx, threads)
+            deleted += await self._delete_threads(ctx, changes.deleted_root_ids)
+            if changes.stale or not page.next_link:
+                return indexed, deleted
+            payload = await self._get_json(page.next_link)
+
+    async def _emit_threads(self, ctx: _ChannelContext, threads: list[Thread]) -> int:
+        total = 0
+        for start in range(0, len(threads), _RECORD_BATCH_SIZE):
+            batch: list[tuple[Record, list[Permission]]] = []
+            reconcile: list[tuple[str, set[str]]] = []
+            for thread in threads[start:start + _RECORD_BATCH_SIZE]:
+                record = self._build_thread_record(ctx.team_id, ctx.team_name, ctx.channel_id, ctx.channel_name, thread)
+                children = await self._attachment_records(record, thread.messages)
+                batch.append((record, list(ctx.permissions)))
+                batch.extend((child, list(ctx.permissions)) for child in children)
+                reconcile.append((record.external_record_id, {child.external_record_id for child in children}))
+            total += await self._flush_records(batch, reconcile)
         return total
 
-    async def _delete_threads(self, team_id: str, channel_id: str, root_ids: List[str]) -> int:
+    async def _flush_records(self, batch: list[tuple[Record, list[Permission]]], reconcile: list[tuple[str, set[str]]]) -> int:
+        """Upsert parents + their file children, then drop children of files no longer attached."""
+        if not batch:
+            return 0
+        await self.data_entities_processor.on_new_records(batch)
+        for parent_external_id, keep in reconcile:
+            await self._reconcile_children(parent_external_id, keep)
+        return len(reconcile)
+
+    async def _delete_threads(self, ctx: _ChannelContext, root_ids: list[str]) -> int:
         deleted = 0
         for root_id in root_ids:
-            record = await self.data_entities_processor.get_record_by_external_id(
-                self.connector_id, thread_external_id(team_id, channel_id, root_id)
-            )
-            if record is not None:
-                await self.data_entities_processor.on_record_deleted(record_id=record.id)
-                deleted += 1
+            deleted += await self._delete_record_tree(thread_external_id(ctx.team_id, ctx.channel_id, root_id))
         return deleted
+
+    async def _delete_record_tree(self, external_id: str) -> int:
+        """Delete a thread / chat record together with its attachment records; 1 if it existed."""
+        record = await self.data_entities_processor.get_record_by_external_id(self.connector_id, external_id)
+        if record is None:
+            return 0
+        for child in await self.data_entities_processor.get_records_by_parent(self.connector_id, external_id):
+            await self.data_entities_processor.on_record_deleted(record_id=child.id)
+        await self.data_entities_processor.on_record_deleted(record_id=record.id)
+        return 1
+
+    async def _reconcile_children(self, parent_external_id: str, keep: set[str]) -> None:
+        children = await self.data_entities_processor.get_records_by_parent(
+            self.connector_id, parent_external_id, RecordType.FILE.value
+        )
+        for child in children:
+            if child.external_record_id not in keep:
+                await self.data_entities_processor.on_record_deleted(record_id=child.id)
+
+    # ------------------------------------------------------------------
+    # Attachments (files shared in messages, pasted images)
+    # ------------------------------------------------------------------
+
+    async def _attachment_records(self, parent: MessageRecord, messages: list[MessageView]) -> list[FileRecord]:
+        """Child ``FileRecord`` s of a thread / chat record.  Cards, tabs and quoted
+        messages never become records."""
+        for attachment in skipped_attachments(messages):
+            self.logger.debug(
+                "Skipping non-file attachment %r (%s) on %s",
+                attachment.name, attachment.content_type or "unknown type", parent.external_record_id,
+            )
+        records: list[FileRecord] = []
+        seen: set[str] = set()
+        for attachment in file_attachments(messages):
+            info = await self._resolve_shared_file(attachment)
+            if info is None or info.external_id in seen:
+                continue
+            seen.add(info.external_id)
+            records.append(self._build_file_record(info, parent))
+        if self._include_inline_images():
+            records.extend(self._build_hosted_image_record(image, parent) for image in hosted_images(messages))
+        if records:
+            # children must point at the stored parent node, not at a fresh uuid
+            existing = await self.data_entities_processor.get_record_by_external_id(self.connector_id, parent.external_record_id)
+            if existing is not None:
+                parent.id = existing.id
+                for child in records:
+                    child.parent_node_id = existing.id
+        return records
+
+    async def _resolve_shared_file(self, attachment: Attachment) -> FileInfo | None:
+        url = attachment.url or ""
+        if url in self._shared_file_cache:
+            return self._shared_file_cache[url]
+        info: FileInfo | None = None
+        try:
+            info = drive_item_file_info(await self._get_json(shared_drive_item_url(url)))
+            if info is None:
+                self.logger.debug("Attachment %r is not a single file (folder / notebook); skipped", attachment.name)
+        except _GraphForbidden as e:
+            if not self._files_forbidden_logged:
+                self._files_forbidden_logged = True
+                needed = (
+                    "delegated Files.Read (re-authorise the personal connector)"
+                    if self._is_personal()
+                    else f"the application permission {', '.join(FILE_APPLICATION_PERMISSIONS)}"
+                )
+                self.logger.warning(
+                    "Microsoft Graph denied access to files shared in messages (403); attachments are "
+                    "skipped for the rest of this run. Grant %s. (%s)", needed, str(e)[:200],
+                )
+        except httpx.HTTPStatusError as e:
+            self.logger.debug("Could not resolve attachment %r: HTTP %s", attachment.name, e.response.status_code)
+        self._shared_file_cache[url] = info
+        return info
+
+    def _build_file_record(self, info: FileInfo, parent: MessageRecord) -> FileRecord:
+        record = FileRecord(
+            org_id=self.data_entities_processor.org_id,
+            record_name=info.name,
+            record_type=RecordType.FILE,
+            record_group_type=RecordGroupType.TEAMS_CHANNEL,
+            parent_record_type=RecordType.MESSAGE,
+            parent_external_record_id=parent.external_record_id,
+            external_record_id=info.external_id,
+            external_record_group_id=parent.external_record_group_id,
+            external_revision_id=info.etag,
+            version=0,
+            origin=OriginTypes.CONNECTOR,
+            connector_name=self.connector_name,
+            connector_id=self.connector_id,
+            mime_type=info.mime_type,
+            weburl=info.web_url,
+            source_created_at=info.created_ms,
+            source_updated_at=info.modified_ms,
+            size_in_bytes=info.size,
+            is_file=True,
+            extension=derive_attachment_extension(info.name, info.mime_type),
+            etag=info.etag,
+            ctag=info.ctag,
+            quick_xor_hash=info.quick_xor_hash,
+            crc32_hash=info.crc32_hash,
+            sha1_hash=info.sha1_hash,
+            sha256_hash=info.sha256_hash,
+            inherit_permissions=False,
+            is_dependent_node=True,
+            parent_node_id=parent.id,
+        )
+        return self._apply_attachment_indexing(record)
+
+    def _build_hosted_image_record(self, image: HostedImage, parent: MessageRecord) -> FileRecord:
+        record = FileRecord(
+            org_id=self.data_entities_processor.org_id,
+            record_name=image.file_name(),
+            record_type=RecordType.FILE,
+            record_group_type=RecordGroupType.TEAMS_CHANNEL,
+            parent_record_type=RecordType.MESSAGE,
+            parent_external_record_id=parent.external_record_id,
+            external_record_id=hosted_external_id(image.graph_path),
+            external_record_group_id=parent.external_record_group_id,
+            external_revision_id=image.hosted_id,  # hosted content is immutable
+            version=0,
+            origin=OriginTypes.CONNECTOR,
+            connector_name=self.connector_name,
+            connector_id=self.connector_id,
+            mime_type=HOSTED_IMAGE_MIME_TYPE,
+            weburl=parent.weburl,
+            source_created_at=parent.source_created_at,
+            source_updated_at=parent.source_created_at,
+            is_file=True,
+            extension=HOSTED_IMAGE_EXTENSION,
+            inherit_permissions=False,
+            is_dependent_node=True,
+            parent_node_id=parent.id,
+        )
+        return self._apply_attachment_indexing(record)
+
+    def _apply_attachment_indexing(self, record: FileRecord) -> FileRecord:
+        if not self._index_attachments():
+            record.indexing_status = ProgressStatus.AUTO_INDEX_OFF.value
+        return record
 
     def _build_thread_record(self, team_id: str, team_name: str, channel_id: str, channel_name: str, thread: Thread) -> MessageRecord:
         root = thread.root
@@ -1006,7 +1275,7 @@ class MicrosoftTeamsConnector(BaseConnector):
     # Chats
     # ------------------------------------------------------------------
 
-    async def _sync_chats(self, incremental: bool) -> None:
+    async def _sync_chats(self, *, incremental: bool) -> None:
         """One rolling record per chat.  App-only Graph has no tenant-wide ``/chats``
         listing, so chats are discovered through ``/users/{id}/chats`` of every
         synced user (O(users) calls — the filter defaults to off)."""
@@ -1035,7 +1304,7 @@ class MicrosoftTeamsConnector(BaseConnector):
             self._personal_permissions() if personal else [],
         )])
 
-        chats_by_id: Dict[str, Dict[str, Any]] = {}
+        chats_by_id: dict[str, dict[str, Any]] = {}
         if personal:
             for chat in await self._fetch_all(me_chats_url()):
                 if chat.get("id"):
@@ -1054,13 +1323,15 @@ class MicrosoftTeamsConnector(BaseConnector):
             self.logger.info("Discovered %d chat(s) across %d user(s)", len(chats_by_id), len(self._users_by_id))
 
         total = 0
-        batch: List[Tuple[Record, List[Permission]]] = []
+        deleted = 0
+        batch: list[tuple[Record, list[Permission]]] = []
+        reconcile: list[tuple[str, set[str]]] = []
         for chat_id, chat in chats_by_id.items():
             since = max(window_start_ms, last_sync_ms) if last_sync_ms is not None else window_start_ms
             raw_messages = await self._fetch_all(chat_messages_url(chat_id, since_ms=since))
             if incremental and last_sync_ms is not None:
                 if not raw_messages:
-                    continue  # nothing changed since the last run
+                    continue  # nothing changed since the last run (edits and deletes bump lastModifiedDateTime)
                 raw_messages = await self._fetch_all(chat_messages_url(chat_id, since_ms=window_start_ms))
             members = parse_conversation_members(chat.get("members") or [])
             for member in members:  # roster emails resolve author_email when no directory sync ran
@@ -1068,26 +1339,31 @@ class MicrosoftTeamsConnector(BaseConnector):
                     self._user_email_by_id.setdefault(member.user_id, member.email)
             messages = select_chat_messages(raw_messages, window_start_ms)
             if not messages:
+                # every message in the window was deleted or aged out: a stored record would be stale
+                deleted += await self._delete_record_tree(chat_external_id(chat_id))
                 continue
             permissions = self._personal_permissions() if personal else grants_to_permissions(chat_grants(members))
-            batch.append((self._build_chat_record(chat, members, messages, lookback_days), permissions))
-            if len(batch) >= _RECORD_BATCH_SIZE:
-                await self.data_entities_processor.on_new_records(batch)
-                total += len(batch)
-                batch = []
-        if batch:
-            await self.data_entities_processor.on_new_records(batch)
-            total += len(batch)
+            record = self._build_chat_record(chat, members, messages, lookback_days)
+            children = await self._attachment_records(record, messages)
+            batch.append((record, permissions))
+            batch.extend((child, list(permissions)) for child in children)
+            reconcile.append((record.external_record_id, {child.external_record_id for child in children}))
+            if len(reconcile) >= _RECORD_BATCH_SIZE:
+                total += await self._flush_records(batch, reconcile)
+                batch, reconcile = [], []
+        total += await self._flush_records(batch, reconcile)
         await self.records_sync_point.update_sync_point(CHATS_SYNC_POINT_KEY, {"lastSyncTimestamp": now_ms})
-        self.logger.info("Synced %d chat record(s)%s", total, " (incremental)" if incremental else "")
+        self.logger.info(
+            "Synced %d chat record(s) (%d deleted)%s", total, deleted, " (incremental)" if incremental else ""
+        )
 
-    def _build_chat_record(self, chat: Dict[str, Any], members: List[Member], messages: List[MessageView], lookback_days: int) -> MessageRecord:
+    def _build_chat_record(self, chat: dict[str, Any], members: list[Member], messages: list[MessageView], lookback_days: int) -> MessageRecord:
         markdown = render_chat_markdown(chat, members, messages, lookback_days)
-        authors: List[str] = []
+        authors: list[str] = []
         for view in messages:
             if view.author_id and view.author_id not in authors:
                 authors.append(view.author_id)
-        mentioned: List[str] = []
+        mentioned: list[str] = []
         for view in messages:
             for mention in view.mentions:
                 if mention.user_id and mention.user_id not in mentioned:
@@ -1124,8 +1400,59 @@ class MicrosoftTeamsConnector(BaseConnector):
     # Streaming / reindex
     # ------------------------------------------------------------------
 
-    async def get_signed_url(self, record: Record) -> Optional[str]:
-        return None  # content is rendered on demand from Graph
+    async def get_signed_url(self, record: Record) -> str | None:
+        """Shared files download from ``@microsoft.graph.downloadUrl`` (as in OneDrive);
+        messages and pasted images are served from Graph on demand."""
+        if record.record_type != RecordType.FILE:
+            return None
+        kind, parts = split_external_id(record.external_record_id)
+        if kind != FILE_ID_PREFIX:
+            return None
+        item = await self._get_json(drive_item_url(*parts))
+        return item.get("@microsoft.graph.downloadUrl") or None
+
+    async def _stream_graph_bytes(self, path: str) -> AsyncGenerator[bytes, None]:
+        """Bearer-authenticated download for content Graph serves itself (hosted images)."""
+        if self._http is None:
+            raise RuntimeError("Microsoft Teams connector not initialised")
+        for attempt in range(2):
+            headers = {"Authorization": f"Bearer {await self._get_token()}"}
+            async with self._request_semaphore, self._http.stream("GET", path, headers=headers) as response:
+                if response.status_code == HttpStatusCode.UNAUTHORIZED.value and attempt == 0:
+                    await self._refresh_token()
+                    continue
+                if response.status_code == HttpStatusCode.NOT_FOUND.value:
+                    raise HTTPException(status_code=HttpStatusCode.NOT_FOUND.value, detail="Hosted content no longer exists")
+                response.raise_for_status()
+                async for chunk in response.aiter_bytes():
+                    yield chunk
+                return
+
+    async def _stream_file(self, record: Record) -> StreamingResponse:
+        kind, parts = split_external_id(record.external_record_id)
+        extension = getattr(record, "extension", None) or "bin"
+        if kind == FILE_ID_PREFIX:
+            try:
+                download_url = await self.get_signed_url(record)
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == HttpStatusCode.NOT_FOUND.value:
+                    raise HTTPException(
+                        status_code=HttpStatusCode.NOT_FOUND.value, detail="File no longer exists in SharePoint / OneDrive"
+                    ) from e
+                raise
+            if not download_url:
+                raise HTTPException(status_code=HttpStatusCode.NOT_FOUND.value, detail="File not found or access denied")
+            stream = stream_content(download_url, record.id, record.record_name)
+        elif kind == HOSTED_ID_PREFIX:
+            stream = self._stream_graph_bytes(hosted_content_value_url(parts[0]))
+        else:
+            raise HTTPException(status_code=HttpStatusCode.BAD_REQUEST.value, detail=f"Unsupported Microsoft Teams file kind: {kind}")
+        return create_stream_record_response(
+            stream,
+            filename=record.record_name,
+            mime_type=record.mime_type,
+            fallback_filename=f"record_{record.id}.{extension}",
+        )
 
     async def _team_name(self, team_id: str) -> str:
         if team_id not in self._team_names:
@@ -1146,7 +1473,7 @@ class MicrosoftTeamsConnector(BaseConnector):
                 return channel_id
         return self._channel_names[key]
 
-    async def _load_thread(self, team_id: str, channel_id: str, message_id: str) -> Optional[Thread]:
+    async def _load_thread(self, team_id: str, channel_id: str, message_id: str) -> Thread | None:
         try:
             root = await self._get_json(channel_message_url(team_id, channel_id, message_id))
             replies = await self._fetch_all(message_replies_url(team_id, channel_id, message_id))
@@ -1156,7 +1483,7 @@ class MicrosoftTeamsConnector(BaseConnector):
             raise
         return build_thread(root, replies)
 
-    async def _render_record(self, record: Record) -> Tuple[str, Optional[str]]:
+    async def _render_record(self, record: Record) -> tuple[str, str | None]:
         """Return ``(markdown, revision)``; revision is ``None`` when the source is gone."""
         kind, parts = split_external_id(record.external_record_id)
         if kind == THREAD_ID_PREFIX:
@@ -1183,7 +1510,9 @@ class MicrosoftTeamsConnector(BaseConnector):
             return render_chat_markdown(chat, members, messages, lookback_days), chat_revision(messages)
         raise ValueError(f"Unsupported Microsoft Teams record kind: {kind}")
 
-    async def stream_record(self, record: Record, user_id: Optional[str] = None, convertTo: Optional[str] = None) -> StreamingResponse:
+    async def stream_record(self, record: Record, user_id: str | None = None, convertTo: str | None = None) -> StreamingResponse:
+        if record.record_type == RecordType.FILE:
+            return await self._stream_file(record)
         markdown, _ = await self._render_record(record)
         return create_stream_record_response(
             _bytes_stream(markdown.encode("utf-8")),
@@ -1192,12 +1521,15 @@ class MicrosoftTeamsConnector(BaseConnector):
             fallback_filename=f"record_{record.id}.md",
         )
 
-    async def reindex_records(self, record_results: List[Record]) -> None:
+    async def reindex_records(self, record_results: list[Record]) -> None:
         """Rebuild records whose thread/chat changed since the stored revision; reindex the rest as-is."""
         if not record_results:
             return
-        unchanged: List[Record] = []
+        unchanged: list[Record] = []
         for record in record_results:
+            if record.record_type == RecordType.FILE:
+                unchanged.append(record)  # file bytes are re-streamed from Graph; nothing to re-render
+                continue
             try:
                 markdown, revision = await self._render_record(record)
             except (ValueError, _GraphForbidden) as e:
@@ -1219,7 +1551,7 @@ class MicrosoftTeamsConnector(BaseConnector):
     # Webhooks / filters
     # ------------------------------------------------------------------
 
-    async def handle_webhook_notification(self, notification: Dict) -> bool:
+    async def handle_webhook_notification(self, notification: dict[str, Any]) -> bool:
         """Graph change notifications for chatMessage are not wired yet; acknowledge like Outlook does."""
         return True
 
@@ -1228,8 +1560,8 @@ class MicrosoftTeamsConnector(BaseConnector):
         filter_key: str,
         page: int = 1,
         limit: int = 20,
-        search: Optional[str] = None,
-        cursor: Optional[str] = None,
+        search: str | None = None,
+        cursor: str | None = None,
     ) -> FilterOptionsResponse:
         if filter_key != TEAMS_FILTER_KEY:
             raise ValueError(f"Unsupported filter key: {filter_key}")

@@ -17,10 +17,18 @@ What becomes a record
 * Optionally (``include_chats`` filter) one record per **1:1 / group chat**
   holding a rolling window of the last ``chat_lookback_days`` days.  Record
   group = ``"Teams chats"``.
-* Files posted to a channel arrive as ``reference`` attachments pointing at
-  SharePoint.  They are listed (name + URL) inside the thread markdown; they are
-  **not** emitted as child ``FileRecord`` s — see ``TODO(teams)`` in
-  ``connector.py``.
+* One child ``FileRecord`` per **file shared in a message** (``reference``
+  attachments — SharePoint / OneDrive links).  The link is resolved to its
+  ``driveItem`` through ``GET /shares/{encoded-url}/driveItem``
+  (``shared_drive_item_url``) and the record mirrors the OneDrive connector:
+  external id ``file:<driveId>/<itemId>``, the driveItem's mime type / size /
+  hashes / ``webUrl``, parent = the thread or chat record, bytes streamed from
+  ``@microsoft.graph.downloadUrl`` at indexing time.  Adaptive cards and quoted
+  messages (``messageReference``) are never records.
+* Optionally (``include_inline_images`` filter) one child ``FileRecord`` per
+  **picture pasted into a message** (Teams "hosted content", the
+  ``<img src=".../hostedContents/{id}/$value">`` tags in the HTML body).  Off by
+  default because every image goes through OCR.
 
 Permission model (Teams membership -> CGraph permission edges)
 =============================================================
@@ -38,6 +46,8 @@ every edge is READER and derived from membership only:
 | channel                                  | (members of ``/teams/{id}/channels/{cid}/   |        |
 |                                          | members``)                                  |        |
 | message in a 1:1 / group chat            | USER per chat participant (by email)        | READER |
+| file / image attached to a message       | exactly the grants of its parent record     | READER |
+|                                          | (the SharePoint ACL is *not* consulted)     |        |
 | message author                           | nothing beyond the membership edge          | —      |
 | team owners (``roles: ["owner"]``)       | same as members (no WRITER/OWNER edges)     | READER |
 +------------------------------------------+---------------------------------------------+--------+
@@ -46,8 +56,24 @@ Standard channels inherit the team group; private/shared channels get their own
 ``AppUserGroup``.  When a private channel's membership cannot be read the
 channel is skipped rather than falling back to the team group (fail closed).
 
-Microsoft Graph application permissions
-=======================================
+Incremental sync model
+======================
+
+* Channel ``/messages/delta`` (deltaLink persisted per channel) yields **root
+  messages only** — new, edited, reacted-to and soft-deleted roots.  A reply
+  does not change its root's ``lastModifiedDateTime``, so after the delta pass
+  the connector pages ``/messages?$expand=replies``, which Graph sorts by the
+  last-modified time of the *entire reply chain*, and rebuilds every thread with
+  activity after the previous run (``classify_listing_items``).  The same
+  listing is the fallback for channels without delta support (the plain listing
+  supports no ``$filter``).
+* Chats: ``/chats/{id}/messages?$filter=lastModifiedDateTime gt <cursor>``;
+  edits, reactions and soft deletes all bump ``lastModifiedDateTime`` so the
+  rolling record is re-rendered; a window with no indexable message left
+  deletes the record and its files.
+
+Microsoft Graph permissions
+===========================
 
 ``REQUIRED_APPLICATION_PERMISSIONS`` must be granted (admin consent) to the app
 registration; ``CHAT_APPLICATION_PERMISSIONS`` only when ``include_chats`` is
@@ -56,16 +82,23 @@ Microsoft must approve the tenant/app through the "Microsoft Teams protected
 APIs" request form before app-only calls stop returning 403
 (https://learn.microsoft.com/graph/teams-protected-apis).  The connector logs
 that and skips the channel/chat instead of failing the whole sync.
+``FILE_APPLICATION_PERMISSIONS`` (``Files.Read.All``) resolves shared files;
+without it attachments are skipped (logged once) and messages still index.
+Personal scope needs delegated ``Files.Read`` for the same reason.
 """
 
 from __future__ import annotations
 
+import base64
+import mimetypes
+import unicodedata
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from html.parser import HTMLParser
-from typing import Any, Iterable, Mapping, Optional, Sequence
-from urllib.parse import quote
+from typing import Any
+from urllib.parse import quote, urlsplit
 
 # ---------------------------------------------------------------------------
 # Graph constants
@@ -88,6 +121,15 @@ ATTACHMENT_REFERENCE = "reference"                # SharePoint / OneDrive file l
 ATTACHMENT_MESSAGE_REFERENCE = "messageReference"  # quoted message
 ATTACHMENT_CARD_PREFIX = "application/vnd.microsoft.card."
 
+# Pictures pasted into a message are served by Graph itself; the metadata
+# endpoint never reports a content type, and Teams stores them as PNG.
+HOSTED_CONTENTS_SEGMENT = "/hostedContents/"
+HOSTED_CONTENT_VALUE_SUFFIX = "/$value"
+HOSTED_IMAGE_MIME_TYPE = "image/png"
+HOSTED_IMAGE_EXTENSION = "png"
+GRAPH_HOSTS = ("graph.microsoft.com",)
+
+FILE_APPLICATION_PERMISSIONS: tuple[str, ...] = ("Files.Read.All",)  # /shares/{token}/driveItem
 REQUIRED_APPLICATION_PERMISSIONS: tuple[str, ...] = (
     "Team.ReadBasic.All",
     "Channel.ReadBasic.All",
@@ -96,16 +138,19 @@ REQUIRED_APPLICATION_PERMISSIONS: tuple[str, ...] = (
     "ChannelMember.Read.All",  # private / shared channel rosters
     "User.Read.All",
     "GroupMember.Read.All",    # fallback roster via /groups/{id}/members
+    *FILE_APPLICATION_PERMISSIONS,
 )
 CHAT_APPLICATION_PERMISSIONS: tuple[str, ...] = ("Chat.Read.All",)
 PROTECTED_API_PERMISSIONS: tuple[str, ...] = ("ChannelMessage.Read.All", "Chat.Read.All")
 # Personal scope (delegated OAuth, the signed-in user's own chats only). Not protected APIs.
-PERSONAL_DELEGATED_PERMISSIONS: tuple[str, ...] = ("Chat.Read", "User.Read", "offline_access")
+# Files.Read resolves files shared in those chats (/shares/{token}/driveItem).
+PERSONAL_DELEGATED_PERMISSIONS: tuple[str, ...] = ("Chat.Read", "Files.Read", "User.Read", "offline_access")
 
 # Filter keys (sync filters)
 TEAMS_FILTER_KEY = "teams"
 INCLUDE_PRIVATE_CHANNELS_FILTER_KEY = "include_private_channels"
 INCLUDE_CHATS_FILTER_KEY = "include_chats"
+INCLUDE_INLINE_IMAGES_FILTER_KEY = "include_inline_images"
 CHAT_LOOKBACK_DAYS_FILTER_KEY = "chat_lookback_days"
 DEFAULT_CHAT_LOOKBACK_DAYS = 30
 MAX_CHAT_LOOKBACK_DAYS = 3650
@@ -116,6 +161,8 @@ CHANNEL_MEMBERS_GROUP_PREFIX = "channel-members:"
 CHANNEL_RECORD_GROUP_PREFIX = "channel:"
 THREAD_ID_PREFIX = "thread"
 CHAT_ID_PREFIX = "chat"
+FILE_ID_PREFIX = "file"      # file:<driveId>/<itemId>  (shared SharePoint / OneDrive file)
+HOSTED_ID_PREFIX = "hosted"  # hosted:<graph path of the hostedContents item>
 CHATS_RECORD_GROUP_ID = "teams-chats"
 CHATS_RECORD_GROUP_NAME = "Teams chats"
 
@@ -130,7 +177,7 @@ _TITLE_MAX_CHARS = 80
 # ---------------------------------------------------------------------------
 
 
-def parse_graph_timestamp(value: Any) -> Optional[int]:
+def parse_graph_timestamp(value: object) -> int | None:
     """Graph returns ISO-8601 UTC with up to 7 fractional digits
     (``2024-05-01T10:15:30.1234567Z``); return epoch milliseconds."""
     if not value or not isinstance(value, str):
@@ -164,7 +211,7 @@ def epoch_ms_to_graph(epoch_ms: int) -> str:
     return datetime.fromtimestamp(epoch_ms / 1000.0, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def format_timestamp(epoch_ms: Optional[int]) -> str:
+def format_timestamp(epoch_ms: int | None) -> str:
     if epoch_ms is None:
         return "n/a"
     return datetime.fromtimestamp(epoch_ms / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -174,7 +221,7 @@ def lookback_start_ms(now_ms: int, days: int) -> int:
     return now_ms - int(timedelta(days=days).total_seconds() * 1000)
 
 
-def resolve_chat_lookback_days(value: Any) -> int:
+def resolve_chat_lookback_days(value: object) -> int:
     """Clamp the ``chat_lookback_days`` filter to ``1..MAX_CHAT_LOOKBACK_DAYS``;
     anything unparsable falls back to the default."""
     try:
@@ -211,11 +258,22 @@ def chat_external_id(chat_id: str) -> str:
     return f"{CHAT_ID_PREFIX}:{chat_id}"
 
 
+def file_external_id(drive_id: str, item_id: str) -> str:
+    """Shared file identity = the driveItem, so the same file posted twice is one record."""
+    return f"{FILE_ID_PREFIX}:{drive_id}/{item_id}"
+
+
+def hosted_external_id(graph_path: str) -> str:
+    return f"{HOSTED_ID_PREFIX}:{graph_path}"
+
+
 def split_external_id(external_id: str) -> tuple[str, tuple[str, ...]]:
-    """Inverse of ``thread_external_id`` / ``chat_external_id``.
+    """Inverse of the ``*_external_id`` builders.
 
     ``thread:<team>/<channel>/<message>`` -> ``("thread", (team, channel, message))``
     ``chat:<chatId>``                     -> ``("chat", (chatId,))``
+    ``file:<driveId>/<itemId>``           -> ``("file", (driveId, itemId))``
+    ``hosted:<graph path>``               -> ``("hosted", (graph path,))``
     """
     kind, sep, rest = external_id.partition(":")
     if not sep or not rest:
@@ -226,6 +284,13 @@ def split_external_id(external_id: str) -> tuple[str, tuple[str, ...]]:
             raise ValueError(f"Malformed Teams thread id: {external_id!r}")
         return kind, parts
     if kind == CHAT_ID_PREFIX:
+        return kind, (rest,)
+    if kind == FILE_ID_PREFIX:
+        parts = tuple(rest.split("/", 1))
+        if len(parts) != 2 or not all(parts):
+            raise ValueError(f"Malformed Teams file id: {external_id!r}")
+        return kind, parts
+    if kind == HOSTED_ID_PREFIX:
         return kind, (rest,)
     raise ValueError(f"Unknown Microsoft Teams external id kind: {kind!r}")
 
@@ -239,12 +304,14 @@ def channel_sync_point_key(team_id: str, channel_id: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def channel_messages_url(team_id: str, channel_id: str, since_ms: Optional[int] = None) -> str:
-    """Plain listing (root messages only).  With ``since_ms`` this is the
-    fallback for channels where ``/messages/delta`` is not supported."""
+def channel_messages_url(team_id: str, channel_id: str, *, expand_replies: bool = False) -> str:
+    """Root-message listing, sorted by Graph on the last-modified time of the
+    whole reply chain (newest first).  It supports no ``$filter``; with
+    ``expand_replies`` each root carries up to 200 replies inline plus a
+    ``replies@odata.nextLink`` for the rest (``expanded_replies``)."""
     url = f"teams/{quote(team_id)}/channels/{quote(channel_id, safe='')}/messages?$top={CHANNEL_MESSAGES_PAGE_SIZE}"
-    if since_ms is not None:
-        url += f"&$filter=lastModifiedDateTime gt {epoch_ms_to_graph(since_ms)}"
+    if expand_replies:
+        url += "&$expand=replies"
     return url
 
 
@@ -260,7 +327,7 @@ def message_replies_url(team_id: str, channel_id: str, message_id: str) -> str:
     return f"{channel_message_url(team_id, channel_id, message_id)}/replies?$top={CHANNEL_MESSAGES_PAGE_SIZE}"
 
 
-def chat_messages_url(chat_id: str, since_ms: Optional[int] = None, top: int = CHATS_PAGE_SIZE) -> str:
+def chat_messages_url(chat_id: str, since_ms: int | None = None, top: int = CHATS_PAGE_SIZE) -> str:
     url = f"chats/{quote(chat_id, safe='')}/messages?$top={top}"
     if since_ms is not None:
         url += f"&$filter=lastModifiedDateTime gt {epoch_ms_to_graph(since_ms)}"
@@ -275,6 +342,44 @@ def user_chats_url(user_id: str) -> str:
 def me_chats_url() -> str:
     """Personal scope: the signed-in user's chats through the delegated token (``Chat.Read``)."""
     return f"me/chats?$expand=members&$top={CHATS_PAGE_SIZE}"
+
+
+def encode_sharing_url(url: str) -> str:
+    """Graph sharing token for a URL: ``"u!" + unpadded base64url(url)``
+    (https://learn.microsoft.com/graph/api/shares-get#encoding-sharing-urls)."""
+    token = base64.b64encode(url.strip().encode("utf-8")).decode("ascii")
+    return "u!" + token.rstrip("=").replace("/", "_").replace("+", "-")
+
+
+def shared_drive_item_url(content_url: str) -> str:
+    """``driveItem`` behind a SharePoint / OneDrive link (a ``reference`` attachment's ``contentUrl``)."""
+    return f"shares/{encode_sharing_url(content_url)}/driveItem"
+
+
+def drive_item_url(drive_id: str, item_id: str) -> str:
+    """Same GET the OneDrive connector uses to read ``@microsoft.graph.downloadUrl``.
+    Drive ids look like ``b!Z3Jv...`` and item ids are base64url — URL-safe as-is."""
+    return f"drives/{drive_id}/items/{item_id}"
+
+
+def hosted_content_value_url(graph_path: str) -> str:
+    return f"{graph_path}{HOSTED_CONTENT_VALUE_SUFFIX}"
+
+
+def graph_relative_path(url: str | None) -> str | None:
+    """``https://graph.microsoft.com/v1.0/teams/...?x=y`` -> ``teams/...``; ``None`` for anything else."""
+    if not url or not isinstance(url, str):
+        return None
+    try:
+        parts = urlsplit(url.strip())
+    except ValueError:
+        return None
+    if parts.scheme != "https" or parts.netloc.lower() not in GRAPH_HOSTS:
+        return None
+    segments = parts.path.split("/", 2)  # ["", "v1.0" | "beta", "rest"]
+    if len(segments) < 3 or segments[1] not in ("v1.0", "beta") or not segments[2]:
+        return None
+    return segments[2]
 
 
 # ---------------------------------------------------------------------------
@@ -298,14 +403,14 @@ def is_private_or_shared_channel(channel: Mapping[str, Any]) -> bool:
     return channel_membership_type(channel) in (MEMBERSHIP_PRIVATE, MEMBERSHIP_SHARED)
 
 
-def should_sync_channel(channel: Mapping[str, Any], include_private_channels: bool) -> bool:
+def should_sync_channel(channel: Mapping[str, Any], *, include_private_channels: bool) -> bool:
     """Archived channels stay in (their history is still readable in Teams)."""
     if not channel.get("id"):
         return False
     return include_private_channels or not is_private_or_shared_channel(channel)
 
 
-def select_teams(teams: Iterable[Mapping[str, Any]], allow_list: Optional[Sequence[str]]) -> list[dict[str, Any]]:
+def select_teams(teams: Iterable[Mapping[str, Any]], allow_list: Sequence[str] | None) -> list[dict[str, Any]]:
     """Apply the ``teams`` allow-list (ids or display names, case-insensitive).
     Empty / ``None`` means every team the app can see."""
     rows = [dict(t) for t in teams if t.get("id")]
@@ -326,7 +431,7 @@ class Member:
     """A conversation member (team, channel or chat) resolved to a directory user."""
 
     user_id: str
-    email: Optional[str]
+    email: str | None
     display_name: str
     roles: tuple[str, ...] = ()
 
@@ -335,7 +440,7 @@ class Member:
         return "owner" in self.roles
 
 
-def _clean_email(value: Any) -> Optional[str]:
+def _clean_email(value: object) -> str | None:
     if value and isinstance(value, str) and "@" in value:
         return value.strip().lower()
     return None
@@ -390,18 +495,40 @@ class Attachment:
     id: str
     name: str
     content_type: str
-    url: Optional[str]
+    url: str | None
 
     @property
     def is_file_reference(self) -> bool:
-        return self.content_type == ATTACHMENT_REFERENCE
+        return self.content_type == ATTACHMENT_REFERENCE and bool(self.url)
+
+    @property
+    def is_card(self) -> bool:
+        return self.content_type.startswith(ATTACHMENT_CARD_PREFIX)
+
+
+@dataclass(frozen=True)
+class HostedImage:
+    """A picture pasted into a message body: ``<img src="https://graph.microsoft.com/v1.0/<graph_path>/$value">``."""
+
+    graph_path: str  # e.g. teams/<t>/channels/<c>/messages/<m>/hostedContents/<id>
+    alt: str | None = None
+
+    @property
+    def hosted_id(self) -> str:
+        return self.graph_path.rsplit("/", 1)[-1]
+
+    def file_name(self) -> str:
+        """Stable, extension-bearing name for the ``FileRecord``."""
+        alt = " ".join((self.alt or "").split())
+        stem = alt if alt and alt.lower() != "image" else f"image-{self.hosted_id[-12:]}"
+        return stem if stem.lower().endswith(f".{HOSTED_IMAGE_EXTENSION}") else f"{stem}.{HOSTED_IMAGE_EXTENSION}"
 
 
 @dataclass(frozen=True)
 class Mention:
-    id: Optional[int]
+    id: int | None
     text: str
-    user_id: Optional[str]
+    user_id: str | None
 
 
 @dataclass
@@ -409,36 +536,37 @@ class MessageView:
     """A ``chatMessage`` reduced to what rendering and permissions need."""
 
     id: str
-    reply_to_id: Optional[str]
+    reply_to_id: str | None
     message_type: str
     deleted: bool
-    created_ms: Optional[int]
-    modified_ms: Optional[int]
-    edited_ms: Optional[int]
-    author_id: Optional[str]
+    created_ms: int | None
+    modified_ms: int | None
+    edited_ms: int | None
+    author_id: str | None
     author_name: str
-    subject: Optional[str]
+    subject: str | None
     body_text: str
-    importance: Optional[str]
-    web_url: Optional[str]
+    importance: str | None
+    web_url: str | None
     mentions: tuple[Mention, ...] = ()
     reactions: dict[str, int] = field(default_factory=dict)
     attachments: tuple[Attachment, ...] = ()
-    team_id: Optional[str] = None
-    channel_id: Optional[str] = None
-    chat_id: Optional[str] = None
+    hosted_images: tuple[HostedImage, ...] = ()
+    team_id: str | None = None
+    channel_id: str | None = None
+    chat_id: str | None = None
 
     @property
     def is_indexable(self) -> bool:
         return self.message_type == MESSAGE_TYPE_MESSAGE and not self.deleted
 
     @property
-    def last_activity_ms(self) -> Optional[int]:
+    def last_activity_ms(self) -> int | None:
         candidates = [t for t in (self.modified_ms, self.edited_ms, self.created_ms) if t is not None]
         return max(candidates) if candidates else None
 
 
-def _author(raw: Mapping[str, Any]) -> tuple[Optional[str], str]:
+def _author(raw: Mapping[str, Any]) -> tuple[str | None, str]:
     sender = raw.get("from") or {}
     user = sender.get("user") or {}
     if user.get("id") or user.get("displayName"):
@@ -497,6 +625,7 @@ def normalize_message(raw: Mapping[str, Any]) -> MessageView:
     body = raw.get("body") or {}
     content = body.get("content") or ""
     content_type = str(body.get("contentType") or "html").lower()
+    is_html = content_type == "html"
     author_id, author_name = _author(raw)
     identity = raw.get("channelIdentity") or {}
     return MessageView(
@@ -510,16 +639,150 @@ def normalize_message(raw: Mapping[str, Any]) -> MessageView:
         author_id=author_id,
         author_name=author_name,
         subject=(str(raw["subject"]).strip() or None) if raw.get("subject") else None,
-        body_text=html_to_text(content) if content_type == "html" else str(content).strip(),
+        body_text=html_to_text(content) if is_html else str(content).strip(),
         importance=str(raw["importance"]).lower() if raw.get("importance") else None,
         web_url=raw.get("webUrl") or None,
         mentions=_mentions(raw),
         reactions=_reactions(raw),
         attachments=_attachments(raw),
+        hosted_images=hosted_images_in_html(content) if is_html else (),
         team_id=str(identity["teamId"]) if identity.get("teamId") else None,
         channel_id=str(identity["channelId"]) if identity.get("channelId") else None,
         chat_id=str(raw["chatId"]) if raw.get("chatId") else None,
     )
+
+
+# ---------------------------------------------------------------------------
+# Files shared in messages
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class FileInfo:
+    """The ``driveItem`` behind a shared file, reduced to what a ``FileRecord`` needs
+    (same fields the OneDrive connector reads off its kiota ``DriveItem``)."""
+
+    drive_id: str
+    item_id: str
+    name: str
+    mime_type: str
+    size: int | None
+    web_url: str | None
+    etag: str | None
+    ctag: str | None
+    created_ms: int | None
+    modified_ms: int | None
+    quick_xor_hash: str | None = None
+    crc32_hash: str | None = None
+    sha1_hash: str | None = None
+    sha256_hash: str | None = None
+    download_url: str | None = None
+
+    @property
+    def external_id(self) -> str:
+        return file_external_id(self.drive_id, self.item_id)
+
+
+def drive_item_file_info(item: Mapping[str, Any]) -> FileInfo | None:
+    """``None`` for folders, packages (OneNote notebooks) and anything without a
+    drive/item identity — those cannot be streamed as one file."""
+    if not isinstance(item, Mapping) or item.get("folder") is not None or item.get("package") is not None:
+        return None
+    item_id = item.get("id")
+    parent = item.get("parentReference") or {}
+    drive_id = parent.get("driveId")
+    if not item_id or not drive_id:
+        return None
+    name = str(item.get("name") or item_id)
+    file_facet = item.get("file") or {}
+    mime_type = str(file_facet.get("mimeType") or "").split(";", 1)[0].strip().lower()
+    if not mime_type:
+        guessed, _ = mimetypes.guess_type(name)
+        mime_type = guessed or "application/octet-stream"
+    hashes = file_facet.get("hashes") or {}
+    size = item.get("size")
+    return FileInfo(
+        drive_id=str(drive_id),
+        item_id=str(item_id),
+        name=name,
+        mime_type=mime_type,
+        size=int(size) if isinstance(size, (int, float)) and not isinstance(size, bool) else None,
+        web_url=item.get("webUrl") or None,
+        etag=item.get("eTag") or None,
+        ctag=item.get("cTag") or None,
+        created_ms=parse_graph_timestamp(item.get("createdDateTime")),
+        modified_ms=parse_graph_timestamp(item.get("lastModifiedDateTime")),
+        quick_xor_hash=hashes.get("quickXorHash") or None,
+        crc32_hash=hashes.get("crc32Hash") or None,
+        sha1_hash=hashes.get("sha1Hash") or None,
+        sha256_hash=hashes.get("sha256Hash") or None,
+        download_url=item.get("@microsoft.graph.downloadUrl") or None,
+    )
+
+
+def file_attachments(messages: Iterable[MessageView]) -> list[Attachment]:
+    """``reference`` attachments of the given messages, first occurrence per URL wins."""
+    out: list[Attachment] = []
+    seen: set[str] = set()
+    for view in messages:
+        for attachment in view.attachments:
+            if not attachment.is_file_reference or attachment.url in seen:
+                continue
+            seen.add(attachment.url or "")
+            out.append(attachment)
+    return out
+
+
+def skipped_attachments(messages: Iterable[MessageView]) -> list[Attachment]:
+    """Attachments that never become records (cards, tabs, meetings...) — for debug logging."""
+    return [a for view in messages for a in view.attachments if not a.is_file_reference]
+
+
+def hosted_images(messages: Iterable[MessageView]) -> list[HostedImage]:
+    out: list[HostedImage] = []
+    seen: set[str] = set()
+    for view in messages:
+        for image in view.hosted_images:
+            if image.graph_path in seen:
+                continue
+            seen.add(image.graph_path)
+            out.append(image)
+    return out
+
+
+class _HostedImageExtractor(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.images: list[HostedImage] = []
+        self._seen: set[str] = set()
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag != "img":
+            return
+        attributes = dict(attrs)
+        path = graph_relative_path(attributes.get("src"))
+        if not path or HOSTED_CONTENTS_SEGMENT not in path or not path.endswith(HOSTED_CONTENT_VALUE_SUFFIX):
+            return
+        path = path[: -len(HOSTED_CONTENT_VALUE_SUFFIX)]
+        if path in self._seen:
+            return
+        self._seen.add(path)
+        self.images.append(HostedImage(graph_path=path, alt=(attributes.get("alt") or "").strip() or None))
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self.handle_starttag(tag, attrs)
+
+
+def hosted_images_in_html(html: str | None) -> tuple[HostedImage, ...]:
+    if not html:
+        return ()
+    parser = _HostedImageExtractor()
+    try:
+        parser.feed(html)
+        parser.close()
+    except Exception:
+        return ()
+    return tuple(parser.images)
 
 
 # ---------------------------------------------------------------------------
@@ -533,16 +796,18 @@ _SKIP_TAGS = {"style", "script", "attachment"}
 class _TextExtractor(HTMLParser):
     """Minimal Teams-HTML flattener: block tags become newlines, ``<li>`` a
     bullet, ``<a>`` keeps its href, ``<img>``/``<emoji>`` their alt text.
+    Text is passed through verbatim (Unicode, bidi controls and Arabic
+    presentation forms included); only ASCII whitespace runs are collapsed.
     (BeautifulSoup is available at runtime but keeps this module stdlib-only.)"""
 
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self.parts: list[str] = []
         self._skip_depth = 0
-        self._href: Optional[str] = None
+        self._href: str | None = None
         self._link_text: list[str] = []
 
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, Optional[str]]]) -> None:
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         attributes = dict(attrs)
         if tag in _SKIP_TAGS:
             self._skip_depth += 1
@@ -562,7 +827,7 @@ class _TextExtractor(HTMLParser):
             alt = attributes.get("alt") or attributes.get("title")
             self.parts.append(alt if alt else ("[image]" if tag == "img" else ""))
 
-    def handle_startendtag(self, tag: str, attrs: list[tuple[str, Optional[str]]]) -> None:
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         self.handle_starttag(tag, attrs)
         if tag not in ("img", "emoji", "br", "hr"):
             self.handle_endtag(tag)
@@ -609,7 +874,7 @@ class _TextExtractor(HTMLParser):
         return "\n".join(out).strip()
 
 
-def html_to_text(html: Optional[str]) -> str:
+def html_to_text(html: str | None) -> str:
     if not html:
         return ""
     parser = _TextExtractor()
@@ -636,7 +901,7 @@ class Thread:
         return [self.root, *self.replies]
 
     @property
-    def last_activity_ms(self) -> Optional[int]:
+    def last_activity_ms(self) -> int | None:
         candidates = [m.last_activity_ms for m in self.messages if m.last_activity_ms is not None]
         return max(candidates) if candidates else None
 
@@ -657,9 +922,13 @@ def build_thread(root_raw: Mapping[str, Any], reply_raws: Iterable[Mapping[str, 
 
 def _first_line(text: str, limit: int = _TITLE_MAX_CHARS) -> str:
     line = next((ln.strip() for ln in text.splitlines() if ln.strip()), "")
-    if len(line) > limit:
-        return line[: limit - 1].rstrip() + "…"
-    return line
+    if len(line) <= limit:
+        return line
+    cut = limit - 1
+    # never separate a base letter from its combining marks (Arabic tashkeel, etc.)
+    while cut > 0 and unicodedata.combining(line[cut]):
+        cut -= 1
+    return line[:cut].rstrip() + "…"
 
 
 def thread_title(thread: Thread, channel_name: str) -> str:
@@ -718,8 +987,7 @@ def render_message_block(view: MessageView, heading: str) -> list[str]:
     if view.attachments:
         lines.append("")
         lines.append("Attachments:")
-        for a in view.attachments:
-            lines.append(f"- {a.name} — {a.url}" if a.url else f"- {a.name}")
+        lines.extend(f"- {a.name} — {a.url}" if a.url else f"- {a.name}" for a in view.attachments)
     if view.reactions:
         lines.append("")
         lines.append("Reactions: " + ", ".join(f"{kind} ×{count}" for kind, count in sorted(view.reactions.items())))
@@ -766,7 +1034,7 @@ def chat_title(chat: Mapping[str, Any], members: Sequence[Member]) -> str:
     return f"{kind}: {', '.join(names)}"
 
 
-def select_chat_messages(raw_messages: Iterable[Mapping[str, Any]], since_ms: Optional[int]) -> list[MessageView]:
+def select_chat_messages(raw_messages: Iterable[Mapping[str, Any]], since_ms: int | None) -> list[MessageView]:
     """Rolling window: indexable messages created at/after ``since_ms``, oldest first."""
     views = [normalize_message(r) for r in raw_messages]
     views = [v for v in views if v.is_indexable and (since_ms is None or (v.created_ms or 0) >= since_ms)]
@@ -826,8 +1094,8 @@ class PermissionGrant:
 
     entity_type: GrantEntity
     role: GrantRole
-    external_id: Optional[str] = None  # GROUP external id
-    email: Optional[str] = None        # USER
+    external_id: str | None = None  # GROUP external id
+    email: str | None = None        # USER
     reason: str = field(default="", compare=False)
 
 
@@ -859,7 +1127,7 @@ def chat_grants(members: Iterable[Member]) -> list[PermissionGrant]:
     return grants
 
 
-def personal_chat_grants(creator_email: Optional[str]) -> list[PermissionGrant]:
+def personal_chat_grants(creator_email: str | None) -> list[PermissionGrant]:
     """Personal scope: the connector creator is the only READER of every chat record
     (and of the chats record group); participants are never granted anything.
     Empty when the creator email is unknown so the caller fails closed."""
@@ -877,16 +1145,83 @@ def personal_chat_grants(creator_email: Optional[str]) -> list[PermissionGrant]:
 @dataclass
 class DeltaPage:
     items: list[dict[str, Any]]
-    next_link: Optional[str]
-    delta_link: Optional[str]
+    next_link: str | None
+    delta_link: str | None
 
 
 def parse_delta_page(payload: Mapping[str, Any]) -> DeltaPage:
+    """Also used for the plain listing (which never carries a ``@odata.deltaLink``)."""
     return DeltaPage(
         items=[dict(v) for v in (payload.get("value") or []) if isinstance(v, Mapping)],
         next_link=payload.get("@odata.nextLink") or None,
         delta_link=payload.get("@odata.deltaLink") or None,
     )
+
+
+def expanded_replies(root: Mapping[str, Any]) -> tuple[list[dict[str, Any]], str | None]:
+    """Inline ``replies`` of a ``$expand=replies`` root plus the ``replies@odata.nextLink``
+    Graph adds when the thread has more than one page (200) of replies."""
+    replies = [dict(r) for r in (root.get("replies") or []) if isinstance(r, Mapping)]
+    return replies, root.get("replies@odata.nextLink") or None
+
+
+def reply_chain_last_modified_ms(root: Mapping[str, Any], replies: Iterable[Mapping[str, Any]]) -> int:
+    """Newest ``lastModifiedDateTime`` / ``deletedDateTime`` across root and replies (0 if none) —
+    the key Graph sorts the channel listing by."""
+    latest = 0
+    for message in (root, *replies):
+        for key in ("lastModifiedDateTime", "deletedDateTime", "lastEditedDateTime", "createdDateTime"):
+            ts = parse_graph_timestamp(message.get(key))
+            if ts is not None and ts > latest:
+                latest = ts
+    return latest
+
+
+@dataclass
+class ListingChanges:
+    """One page of the reply-chain-sorted channel listing, classified.
+
+    ``threads``: ``(root, inline replies, replies@odata.nextLink)`` to rebuild;
+    ``deleted_root_ids``: roots that are gone (soft-deleted or non-message);
+    ``stale``: the page reached a chain older than ``since_ms`` — later pages are older still.
+    """
+
+    threads: list[tuple[dict[str, Any], list[dict[str, Any]], str | None]] = field(default_factory=list)
+    deleted_root_ids: list[str] = field(default_factory=list)
+    stale: bool = False
+
+
+def classify_listing_items(
+    items: Iterable[Mapping[str, Any]],
+    since_ms: int | None,
+    skip_root_ids: Iterable[str] = (),
+) -> ListingChanges:
+    """Fold one listing page (``channel_messages_url(expand_replies=True)``).
+
+    Roots already handled by the delta pass (``skip_root_ids``) are ignored but
+    still count for the stop condition.  ``since_ms=None`` classifies everything
+    (full sync of a channel without delta support).
+    """
+    skip = {str(s) for s in skip_root_ids}
+    changes = ListingChanges()
+    for item in items:
+        root_id = item.get("id")
+        if not root_id:
+            continue
+        root_id = str(root_id)
+        replies, more = expanded_replies(item)
+        if since_ms is not None and reply_chain_last_modified_ms(item, replies) <= since_ms:
+            changes.stale = True
+            break
+        if root_id in skip:
+            continue
+        view = normalize_message(item)
+        if not view.is_indexable:
+            if view.deleted or view.message_type != MESSAGE_TYPE_MESSAGE:
+                changes.deleted_root_ids.append(root_id)
+            continue
+        changes.threads.append((dict(item), replies, more))
+    return changes
 
 
 @dataclass
@@ -912,7 +1247,7 @@ class DeltaChanges:
             self.deleted_root_ids.append(root_id)
 
 
-def classify_delta_items(items: Iterable[Mapping[str, Any]], changes: Optional[DeltaChanges] = None) -> DeltaChanges:
+def classify_delta_items(items: Iterable[Mapping[str, Any]], changes: DeltaChanges | None = None) -> DeltaChanges:
     """Fold one delta page into ``changes``.
 
     * a reply (``replyToId`` set) — added, edited **or deleted** — dirties its
@@ -937,14 +1272,14 @@ def classify_delta_items(items: Iterable[Mapping[str, Any]], changes: Optional[D
     return changes
 
 
-def read_delta_link(sync_point: Optional[Mapping[str, Any]]) -> Optional[str]:
+def read_delta_link(sync_point: Mapping[str, Any] | None) -> str | None:
     if not sync_point:
         return None
     value = sync_point.get("deltaLink")
     return str(value) if value else None
 
 
-def read_last_sync_ms(sync_point: Optional[Mapping[str, Any]]) -> Optional[int]:
+def read_last_sync_ms(sync_point: Mapping[str, Any] | None) -> int | None:
     if not sync_point:
         return None
     value = sync_point.get("lastSyncTimestamp")
@@ -954,7 +1289,7 @@ def read_last_sync_ms(sync_point: Optional[Mapping[str, Any]]) -> Optional[int]:
         return None
 
 
-def delta_sync_point_data(delta_link: Optional[str], synced_at_ms: int) -> dict[str, Any]:
+def delta_sync_point_data(delta_link: str | None, synced_at_ms: int) -> dict[str, Any]:
     """Payload stored per channel.  ``deltaLink`` is ``None`` for channels that
     fell back to the ``lastModifiedDateTime`` filter."""
     return {"deltaLink": delta_link, "lastSyncTimestamp": synced_at_ms}
