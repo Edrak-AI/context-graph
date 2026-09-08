@@ -90,6 +90,10 @@ const createOAuthConfigSchema = z.object({
   body: z.object({
     oauthInstanceName: z.string().min(1, 'OAuth instance name is required'),
     config: z.any(),
+    // Read by createOAuthConfig ("Base URL is required") — the validator strips unknown keys,
+    // so without these the controller never sees them (Edrak fix 2026-09-08).
+    baseUrl: z.string().optional(),
+    connectorScope: z.string().optional(),
   }),
 });
 
@@ -114,6 +118,8 @@ const updateOAuthConfigSchema = z.object({
   body: z.object({
     oauthInstanceName: z.string().min(1, 'OAuth instance name is required').optional(),
     config: z.any().optional(),
+    baseUrl: z.string().optional(),
+    connectorScope: z.string().optional(),
   }),
 });
 
