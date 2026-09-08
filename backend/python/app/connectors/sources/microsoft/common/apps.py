@@ -30,6 +30,10 @@ class MicrosoftDynamics365App(App):
     def __init__(self, connector_id: str) -> None:
         super().__init__(Connectors.MICROSOFT_DYNAMICS_365, AppGroups.MICROSOFT, connector_id)
 
+class MicrosoftBusinessCentralApp(App):
+    def __init__(self, connector_id: str) -> None:
+        super().__init__(Connectors.MICROSOFT_BUSINESS_CENTRAL, AppGroups.MICROSOFT, connector_id)
+
 class MicrosoftAppGroup(AppGroup):
     def __init__(self, connector_id: str) -> None:
         super().__init__(AppGroups.MICROSOFT, [OneDriveApp(connector_id), SharePointOnlineApp(connector_id), OutlookApp(connector_id), OutlookCalendarApp(connector_id), MicrosoftTeamsApp(connector_id)])

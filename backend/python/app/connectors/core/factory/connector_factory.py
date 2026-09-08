@@ -60,6 +60,9 @@ from app.connectors.sources.google_cloud_storage.connector import GCSConnector
 from app.connectors.sources.linear.connector import LinearConnector
 from app.connectors.sources.localKB.connector import KnowledgeBaseConnector
 from app.connectors.sources.microsoft.onedrive.connector import OneDriveConnector
+from app.connectors.sources.microsoft.business_central.connector import (
+    MicrosoftBusinessCentralConnector,
+)
 from app.connectors.sources.microsoft.dynamics365.connector import (
     MicrosoftDynamics365Connector,
 )
@@ -106,6 +109,7 @@ class ConnectorFactory:
         "onedrive": OneDriveConnector,
         "sharepointonline": SharePointConnector,
         "microsoftdynamics365": MicrosoftDynamics365Connector,
+        "microsoftbusinesscentral": MicrosoftBusinessCentralConnector,
         "microsoftteams": MicrosoftTeamsConnector,
         "outlook": OutlookConnector,
         "outlookpersonal": OutlookIndividualConnector,
