@@ -75,6 +75,13 @@ from app.connectors.core.registry.filters import (
 )
 from app.connectors.core.registry.types import FieldType
 from app.connectors.sources.microsoft.common.apps import OutlookApp
+from app.connectors.sources.microsoft.common.change_notifications import (
+    MAIL_MAX_MINUTES,
+    GRAPH_TOKEN_SCOPE,
+    GraphResource,
+    remove_graph_subscriptions,
+    sync_graph_subscriptions,
+)
 from app.connectors.sources.microsoft.common.constants import (
     MicrosoftGraphScopes,
     MicrosoftOAuth,
@@ -624,6 +631,7 @@ class OutlookConnector(BaseConnector):
                 self.logger.info(status)
 
             self.logger.info("Outlook sync completed successfully")
+            await self._sync_change_notifications(users_to_sync)
 
         except Exception as e:
             self.logger.error(f"Error during Outlook sync: {e}")
@@ -2920,6 +2928,39 @@ class OutlookConnector(BaseConnector):
             self.logger.error(f"Error handling webhook notification: {e}")
             return False
 
+
+    async def _graph_token(self) -> str:
+        if self._delegated is not None:
+            return await self._delegated.get_token()
+        if not self.external_client:
+            raise RuntimeError("Outlook connector not initialised")
+        token = await self.external_client.get_client().credential.get_token(GRAPH_TOKEN_SCOPE)
+        return token.token
+
+    async def _sync_change_notifications(self, users: list[AppUser]) -> None:
+        """One ``users/{id}/messages`` subscription per mailbox this run processed (never raises)."""
+        user_ids = sorted({user.source_user_id for user in users if user.source_user_id})
+        resources = [
+            GraphResource(f"users/{user_id}/messages", "created,updated,deleted", MAIL_MAX_MINUTES)
+            for user_id in user_ids
+        ]
+        await sync_graph_subscriptions(
+            config_service=self.config_service,
+            connector_id=self.connector_id,
+            token_getter=self._graph_token,
+            sync_point=self.email_delta_sync_point,
+            resources=resources,
+            logger=self.logger,
+        )
+
+    async def remove_change_notifications(self) -> None:
+        await remove_graph_subscriptions(
+            config_service=self.config_service,
+            connector_id=self.connector_id,
+            token_getter=self._graph_token,
+            sync_point=self.email_delta_sync_point,
+            logger=self.logger,
+        )
 
     async def cleanup(self) -> None:
         """Clean up resources used by the connector."""

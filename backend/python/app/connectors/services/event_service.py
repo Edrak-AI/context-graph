@@ -14,15 +14,21 @@ from app.config.constants.arangodb import (
     EventTypes,
     ProgressStatus,
 )
-from app.connectors.core.constants import ConnectorStateKeys
 from app.connectors.core.base.connector.connector_service import BaseConnector
 from app.connectors.core.base.connector.instance_lock import connector_init_lock
 from app.connectors.core.base.data_store.graph_data_store import GraphDataStore
+from app.connectors.core.constants import ConnectorStateKeys
 from app.connectors.core.factory.connector_factory import ConnectorFactory
-from app.connectors.core.sync.task_manager import reindex_task_manager, sync_task_manager
+from app.connectors.core.sync.task_manager import (
+    reindex_task_manager,
+    sync_task_manager,
+)
+from app.connectors.services.notify_service import (
+    remove_change_notifications_best_effort,
+)
 from app.containers.connector import ConnectorAppContainer
-from app.services.cache.invalidation_hooks import notify_connector_sync_completed
 from app.edition_services import get_data_entities_processor_cls
+from app.services.cache.invalidation_hooks import notify_connector_sync_completed
 from app.services.graph_db.interface.graph_db_provider import IGraphDBProvider
 from app.utils.time_conversion import get_epoch_timestamp_in_ms
 
@@ -309,6 +315,9 @@ class EventService:
         org_id = payload.get("orgId")
         connector_id = payload.get("connectorId")
         full_sync = payload.get("fullSync", False)
+        # Set only by the change-notification path (notify_service); scheduled and
+        # manual runs keep calling run_sync() exactly as before.
+        incremental = payload.get("incremental") is True and not full_sync
 
         if not org_id:
             self.logger.error("orgId is required in start sync payload")
@@ -442,7 +451,7 @@ class EventService:
             # because asking for one is a deliberate act.
             started = await sync_task_manager.start_if_idle(
                 connector_id,
-                self._run_sync_and_clear_status(connector, connector_id, org_id),
+                self._run_sync_and_clear_status(connector, connector_id, org_id, incremental=incremental),
             )
             if started is None:
                 self.logger.info(
@@ -461,12 +470,17 @@ class EventService:
         connector: BaseConnector,
         connector_id: str,
         org_id: str | None = None,
+        *,
+        incremental: bool = False,
     ) -> None:
         """Wrap run_sync() so that status is cleared to null when the task finishes."""
         start = time.monotonic()
         cancelled = False
         try:
-            await connector.run_sync()
+            if incremental:
+                await connector.run_incremental_sync()
+            else:
+                await connector.run_sync()
         except asyncio.CancelledError:
             # Distinguished from completion: the finally below reports success,
             # so a pre-empted sync used to read in the logs exactly like one that
@@ -736,6 +750,7 @@ class EventService:
             # so neither keeps touching records that are about to disappear.
             await sync_task_manager.cancel_sync(connector_id)
             await reindex_task_manager.cancel_by_prefix(f"reindex:{connector_id}:")
+            await remove_change_notifications_best_effort(self.app_container, connector_id, self.logger)
 
             # Delete from graph DB
             result = await self.graph_provider.delete_connector_instance(

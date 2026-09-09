@@ -28,6 +28,8 @@ import {
 import { AppConfig, loadAppConfig } from '../config/config';
 import { Logger } from '../../../libs/services/logger.service';
 import { TokenScopes } from '../../../libs/enums/token-scopes.enum';
+import { HttpMethod } from '../../../libs/enums/http-methods.enum';
+import { executeConnectorCommand } from '../utils/connector.utils';
 import {
   getConnectorRegistry,
   getConnectorInstances,
@@ -1284,6 +1286,39 @@ export function createConnectorRouter(
         logger.error('Error updating connector configuration', {
           error: error instanceof Error ? error.message : String(error),
         });
+        next(error);
+      }
+    },
+  );
+
+  /**
+   * POST /internal/:connectorId/notify
+   * Edrak Layer 2: edrak-ai (public receiver) forwards Microsoft change
+   * notifications here; the Python connectors service coalesces them into one
+   * incremental sync. Scoped service token, no user — forwarded verbatim.
+   */
+  router.post(
+    '/internal/:connectorId/notify',
+    authMiddleware.scopedTokenValidator(TokenScopes.CONNECTOR_NOTIFY),
+    async (
+      req: AuthenticatedServiceRequest,
+      res: Response,
+      next: NextFunction,
+    ): Promise<void> => {
+      try {
+        const connectorId = req.params.connectorId ?? '';
+        if (connectorId === '') {
+          throw new BadRequestError('connectorId is required');
+        }
+        const authorization = req.headers.authorization ?? '';
+        const response = await executeConnectorCommand(
+          `${config.connectorBackend}/api/v1/connectors/internal/${encodeURIComponent(connectorId)}/notify`,
+          HttpMethod.POST,
+          authorization === '' ? {} : { authorization },
+          req.body,
+        );
+        res.status(response.statusCode).json(response.data ?? {});
+      } catch (error) {
         next(error);
       }
     },

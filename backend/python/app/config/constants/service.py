@@ -48,6 +48,9 @@ class TokenScopes(Enum):
     # Deliberately separate from STORAGE_TOKEN so a leaked storage token
     # cannot also grant connector record reads.
     RECORD_CONTENT = "record:content"
+    # Edrak: edrak-ai forwards Microsoft change notifications to the connectors
+    # service (`/api/v1/connectors/internal/{id}/notify`).
+    CONNECTOR_NOTIFY = "connector:notify"
 
 
 class OAuthScopes(str, Enum):

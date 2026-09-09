@@ -13,6 +13,9 @@ export const TokenScopes = Object.freeze({
   USER_PROVISION: 'user:provision',
   // Edrak identity bridge: one CGraph org per Edrak tenant (org `/internal/provision`).
   ORG_PROVISION: 'org:provision',
+  // Edrak Layer 2: edrak-ai forwards Microsoft change notifications to the
+  // connectors service (`/api/v1/connectors/internal/:connectorId/notify`).
+  CONNECTOR_NOTIFY: 'connector:notify',
 } as const);
 
 // Create a type for the TokenScopes keys

@@ -27,6 +27,7 @@ set_service_suffix("-cs")
 from app.agents.mcp.registry import get_mcp_registry
 from app.agents.registry.toolset_registry import get_toolset_registry
 from app.api.routes.entity import router as entity_router
+from app.connectors.api.notify_router import router as notify_router
 from app.api.routes.mcp_servers import router as mcp_servers_router
 from app.api.routes.toolsets import router as toolsets_router
 from app.config.constants.arangodb import AccountType, CollectionNames
@@ -39,6 +40,7 @@ from app.connectors.core.base.data_store.graph_data_store import GraphDataStore
 from app.connectors.core.base.token_service.startup_service import startup_service
 from app.connectors.core.factory.connector_factory import ConnectorFactory
 from app.connectors.core.sync.task_manager import reindex_task_manager, sync_task_manager
+from app.connectors.services.notify_service import notify_scheduler
 from app.connectors.core.thread_pool import get_shared_connector_thread_pool
 from app.connectors.sources.localKB.api.kb_router import kb_router
 from app.connectors.sources.localKB.api.knowledge_hub_router import (
@@ -377,6 +379,11 @@ async def shutdown_container_resources(container: ConnectorAppContainer) -> None
             await reindex_task_manager.cancel_all()
         except Exception as e:
             logger.warning(f"Error cancelling reindex tasks at shutdown: {e}")
+
+        try:
+            await notify_scheduler.cancel_all()
+        except Exception as e:
+            logger.warning(f"Error cancelling pending notification runs at shutdown: {e}")
 
         # Stop message consumers
         await stop_kafka_consumers(container)
@@ -873,6 +880,7 @@ app.include_router(mcp_servers_router)
 app.include_router(kb_router)
 app.include_router(knowledge_hub_router)
 app.include_router(connector_router)
+app.include_router(notify_router)
 if oauth_apps_router is not None:
     app.include_router(oauth_apps_router)
 if sharing_router is not None:

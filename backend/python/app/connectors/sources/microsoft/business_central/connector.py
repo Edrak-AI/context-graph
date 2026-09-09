@@ -117,7 +117,17 @@ from app.connectors.sources.microsoft.business_central.mapping import (
     split_external_id,
     token_url,
 )
+from app.connectors.sources.microsoft.business_central.webhooks import (
+    BC_RENEW_WITHIN_MINUTES,
+    BcSubscriptionTransport,
+    bc_resources,
+)
 from app.connectors.sources.microsoft.common.apps import MicrosoftBusinessCentralApp
+from app.connectors.sources.microsoft.common.change_notifications import (
+    GraphSubscriptionManager,
+    SubscriptionStore,
+    load_webhook_settings,
+)
 from app.connectors.sources.sap.connector import EntraGroupResolver
 from app.models.entities import (
     AppUser,
@@ -443,6 +453,38 @@ class MicrosoftBusinessCentralConnector(BaseConnector):
     async def cleanup(self) -> None:
         await self._close_http()
 
+    async def _subscription_manager(self) -> GraphSubscriptionManager | None:
+        settings = await load_webhook_settings(self.config_service, self.connector_id, "bc", self.logger)
+        if settings is None:
+            return None
+        return GraphSubscriptionManager(
+            BcSubscriptionTransport(self._send_json),
+            self.connector_id,
+            settings.notification_url,
+            settings.client_state,
+            self.logger,
+            store=SubscriptionStore(self.records_sync_point),
+        )
+
+    async def _sync_change_notifications(self, specs: list[EntitySpec]) -> None:
+        """One BC API subscription per synced company × entity set, renewed when < 12 h remain; never raises."""
+        try:
+            manager = await self._subscription_manager()
+            if manager is None:
+                return
+            await manager.ensure(bc_resources(self._companies, specs))
+            await manager.renew_expiring(BC_RENEW_WITHIN_MINUTES)
+        except Exception as e:
+            self.logger.warning("Business Central subscription upkeep failed for connector %s: %s", self.connector_id, e)
+
+    async def remove_change_notifications(self) -> None:
+        try:
+            manager = await self._subscription_manager()
+            if manager is not None:
+                await manager.remove_all()
+        except Exception as e:
+            self.logger.warning("Could not remove Business Central subscriptions for connector %s: %s", self.connector_id, e)
+
     async def _close_http(self) -> None:
         if self._http is not None:
             with contextlib.suppress(Exception):
@@ -553,6 +595,30 @@ class MicrosoftBusinessCentralConnector(BaseConnector):
             return response.json()
         raise RuntimeError(f"Business Central request to {path_or_url} exhausted retries")
 
+    async def _send_json(
+        self,
+        method: str,
+        path: str,
+        body: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> tuple[int, dict[str, Any]]:
+        """Write request (POST/PATCH/DELETE) with bearer auth and one 401 re-auth; returns (status, JSON object)."""
+        if self._http is None:
+            raise RuntimeError("%s connector not initialised" % self.connector_name.value)
+        request_headers: dict[str, str] = {"Content-Type": "application/json", "Prefer": "return=representation"}
+        request_headers.update(headers or {})
+        refreshed = False
+        while True:
+            request_headers["Authorization"] = f"Bearer {await self._get_token()}"
+            async with self._request_semaphore:
+                response = await self._http.request(method, path, json=body, headers=request_headers)
+            if response.status_code == HttpStatusCode.UNAUTHORIZED.value and not refreshed:
+                refreshed = True
+                await self._refresh_token()
+                continue
+            payload = _response_json(response)
+            return response.status_code, payload if isinstance(payload, dict) else {}
+
     async def _iter_pages(
         self, path: str, params: dict[str, str] | None = None
     ) -> AsyncGenerator[list[dict[str, Any]], None]:
@@ -625,6 +691,7 @@ class MicrosoftBusinessCentralConnector(BaseConnector):
             for spec in specs:
                 await self._sync_entity(company, spec, incremental=incremental)
         self.logger.info("Business Central sync completed")
+        await self._sync_change_notifications(specs)
 
     def _selected_entity_names(self) -> list[str] | None:
         entity_filter = self.sync_filters.get(ENTITIES_FILTER_KEY) if self.sync_filters else None
@@ -973,6 +1040,13 @@ class MicrosoftBusinessCentralConnector(BaseConnector):
         start = max(page - 1, 0) * limit
         chunk = options[start:start + limit]
         return FilterOptionsResponse(success=True, options=chunk, page=page, limit=limit, has_more=start + limit < len(options))
+
+
+def _response_json(response: httpx.Response) -> object:
+    try:
+        return response.json()
+    except ValueError:
+        return response.text
 
 
 def _as_float(value: object) -> float | None:

@@ -114,6 +114,7 @@ from app.connectors.sources.local_fs.models import (
     LocalFsFileEventSubmissionResponse,
 )
 from app.connectors.services.kafka_service import KafkaService
+from app.connectors.services.notify_service import remove_change_notifications_best_effort
 from app.connectors.services.vector_store_rebuild import (
     VectorStoreRebuildBusyError,
     VectorStoreRebuildConflictError,
@@ -7313,6 +7314,9 @@ async def toggle_connector_instance(
             )
 
         logger.info(f"Successfully toggled connector instance {connector_id} {toggle_type} to {target_status}")
+
+        if toggle_type == "sync" and not target_status:
+            await remove_change_notifications_best_effort(request.app.container, connector_id, logger)
 
         if toggle_type == "sync":
             # Prepare event messaging

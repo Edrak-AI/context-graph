@@ -85,6 +85,9 @@ from app.connectors.core.registry.filters import (
     load_connector_filters,
 )
 from app.connectors.sources.microsoft.common.apps import MicrosoftDynamics365App
+from app.connectors.sources.microsoft.common.change_notifications import (
+    load_webhook_settings,
+)
 from app.connectors.sources.microsoft.common.entra_identity import (
     EntraUserEmailResolver,
 )
@@ -148,6 +151,9 @@ from app.connectors.sources.microsoft.dynamics365.mapping import (
     team_group_external_id,
     token_scope,
 )
+from app.connectors.sources.microsoft.dynamics365.webhooks import (
+    DataverseWebhookRegistrar,
+)
 from app.models.entities import (
     AppRole,
     AppUser,
@@ -174,6 +180,7 @@ _RETRY_STATUS = {HttpStatusCode.TOO_MANY_REQUESTS.value, 502, 503, 504}
 _TOKEN_REFRESH_SKEW_S = 120
 _MAX_CONCURRENT_REQUESTS = 4
 _KNOWN_RECORDS_PAGE_SIZE = 500
+_WEBHOOK_REVERIFY_MS = 6 * 60 * 60 * 1000
 _DELETE_BATCH_SIZE = 100
 
 _GRANT_ROLE_TO_PERMISSION = {
@@ -365,6 +372,9 @@ class MicrosoftDynamics365Connector(BaseConnector):
         self.indexing_filters: FilterCollection = FilterCollection()
         self._security: Optional[SecurityContext] = None
         self._shares_unavailable_logged = False
+        # receiver URL the Dataverse webhook was last verified against (per process)
+        self._webhooks_verified_for: str | None = None
+        self._webhooks_verified_at_ms: int = 0
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -433,6 +443,49 @@ class MicrosoftDynamics365Connector(BaseConnector):
     async def cleanup(self) -> None:
         await self._close_http()
         self._security = None
+
+    def _webhook_registrar(self, notification_url: str, header_value: str, tables: list[str]) -> DataverseWebhookRegistrar:
+        return DataverseWebhookRegistrar(
+            get_json=self._get_json,
+            send_json=self._send_json,
+            connector_id=self.connector_id,
+            notification_url=notification_url,
+            header_value=header_value,
+            logger=self.logger,
+            tables=tables,
+        )
+
+    async def _sync_change_notifications(self, specs: list[EntitySpec]) -> None:
+        """Ensure the Dataverse webhook (service endpoint + steps) for the synced tables; never raises.
+        Re-verified once per process and then every ``_WEBHOOK_REVERIFY_MS``."""
+        try:
+            settings = await load_webhook_settings(self.config_service, self.connector_id, "dataverse", self.logger)
+            if settings is None:
+                return
+            now_ms = get_epoch_timestamp_in_ms()
+            if (
+                self._webhooks_verified_for == settings.notification_url
+                and now_ms - self._webhooks_verified_at_ms < _WEBHOOK_REVERIFY_MS
+            ):
+                return
+            registrar = self._webhook_registrar(
+                settings.notification_url, settings.client_state, [spec.logical_name for spec in specs]
+            )
+            if await registrar.ensure() is not None:
+                self._webhooks_verified_for = settings.notification_url
+                self._webhooks_verified_at_ms = now_ms
+        except Exception as e:
+            self.logger.warning("Dataverse webhook upkeep failed for connector %s: %s", self.connector_id, e)
+
+    async def remove_change_notifications(self) -> None:
+        try:
+            settings = await load_webhook_settings(self.config_service, self.connector_id, "dataverse", self.logger)
+            if settings is None:
+                return
+            await self._webhook_registrar(settings.notification_url, settings.client_state, []).remove_all()
+        except Exception as e:
+            self.logger.warning("Could not remove the Dataverse webhook for connector %s: %s", self.connector_id, e)
+        self._webhooks_verified_for = None
 
     async def _close_http(self) -> None:
         if self._http is not None:
@@ -546,6 +599,30 @@ class MicrosoftDynamics365Connector(BaseConnector):
             return response.json()
         raise RuntimeError(f"Dynamics 365 request to {path_or_url} exhausted retries")
 
+    async def _send_json(
+        self,
+        method: str,
+        path: str,
+        body: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> tuple[int, dict[str, Any]]:
+        """Write request (POST/PATCH/DELETE) with bearer auth and one 401 re-auth; returns (status, JSON object)."""
+        if self._http is None:
+            raise RuntimeError("%s connector not initialised" % self.connector_name.value)
+        request_headers: dict[str, str] = {"Content-Type": "application/json", "Prefer": "return=representation"}
+        request_headers.update(headers or {})
+        refreshed = False
+        while True:
+            request_headers["Authorization"] = f"Bearer {await self._get_token()}"
+            async with self._request_semaphore:
+                response = await self._http.request(method, path, json=body, headers=request_headers)
+            if response.status_code == HttpStatusCode.UNAUTHORIZED.value and not refreshed:
+                refreshed = True
+                await self._refresh_token()
+                continue
+            payload = _response_body(response)
+            return response.status_code, payload if isinstance(payload, dict) else {}
+
     async def _iter_pages(
         self,
         entity_set: str,
@@ -626,6 +703,7 @@ class MicrosoftDynamics365Connector(BaseConnector):
         for spec in specs:
             await self._sync_entity(spec, incremental=incremental)
         self.logger.info("Dynamics 365 sync completed")
+        await self._sync_change_notifications(specs)
 
     def _selected_entity_names(self) -> Optional[List[str]]:
         entity_filter = self.sync_filters.get(ENTITIES_FILTER_KEY) if self.sync_filters else None

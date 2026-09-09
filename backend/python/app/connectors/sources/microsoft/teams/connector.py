@@ -87,6 +87,13 @@ from app.connectors.core.registry.filters import (
     load_connector_filters,
 )
 from app.connectors.sources.microsoft.common.apps import MicrosoftTeamsApp
+from app.connectors.sources.microsoft.common.change_notifications import (
+    CHAT_MESSAGE_MAX_MINUTES,
+    DIRECTORY_MAX_MINUTES,
+    GraphResource,
+    remove_graph_subscriptions,
+    sync_graph_subscriptions,
+)
 from app.connectors.sources.microsoft.common.constants import (
     MicrosoftGraphScopes,
     MicrosoftOAuth,
@@ -468,6 +475,8 @@ class MicrosoftTeamsConnector(BaseConnector):
         self._team_names: dict[str, str] = {}
         self._channel_names: dict[tuple[str, str], str] = {}
         self._protected_api_logged = False
+        # (team_id, channel_id) synced by the current run; Graph change-notification subscriptions follow them
+        self._touched_channels: set[tuple[str, str]] = set()
         # per-run: the same SharePoint link shows up in many threads; None = unresolvable
         self._shared_file_cache: dict[str, FileInfo | None] = {}
         self._files_forbidden_logged = False
@@ -573,6 +582,38 @@ class MicrosoftTeamsConnector(BaseConnector):
         except Exception as e:
             self.logger.error("Microsoft Teams connection test failed: %s", e)
             return False
+
+    async def _sync_change_notifications(self) -> None:
+        """Channel-message subscriptions for the channels this run synced plus ``groups`` for
+        membership (team scope only; never raises). Channel messages need the protected
+        ``ChannelMessage.Read.All`` — a 403 is logged once and polling remains."""
+        if self._is_personal():
+            return
+        resources = [
+            GraphResource(f"teams/{team_id}/channels/{channel_id}/messages", "created,updated,deleted", CHAT_MESSAGE_MAX_MINUTES)
+            for team_id, channel_id in sorted(self._touched_channels)
+        ]
+        resources.append(GraphResource("groups", "updated", DIRECTORY_MAX_MINUTES))
+        self._touched_channels = set()
+        await sync_graph_subscriptions(
+            config_service=self.config_service,
+            connector_id=self.connector_id,
+            token_getter=self._get_token,
+            sync_point=self.records_sync_point,
+            resources=resources,
+            logger=self.logger,
+        )
+
+    async def remove_change_notifications(self) -> None:
+        if self._is_personal():
+            return
+        await remove_graph_subscriptions(
+            config_service=self.config_service,
+            connector_id=self.connector_id,
+            token_getter=self._get_token,
+            sync_point=self.records_sync_point,
+            logger=self.logger,
+        )
 
     async def cleanup(self) -> None:
         await self._close_http()
@@ -770,6 +811,7 @@ class MicrosoftTeamsConnector(BaseConnector):
             except _GraphForbidden as e:
                 self._log_protected_api("chats", e)
         self.logger.info("Microsoft Teams sync completed")
+        await self._sync_change_notifications()
 
     def _selected_team_values(self) -> list[str] | None:
         team_filter = self.sync_filters.get(TEAMS_FILTER_KEY) if self.sync_filters else None
@@ -956,6 +998,7 @@ class MicrosoftTeamsConnector(BaseConnector):
                 self.logger.error(
                     "Failed to sync channel %s › %s: %s", team_name, channel_display_name(channel), e, exc_info=True
                 )
+        self._touched_channels.update((team_id, str(channel["id"])) for channel in synced_channels)
         self.logger.info("Synced team %s (%d channel(s), %d member(s))", team_name, len(synced_channels), len(members))
 
     # ------------------------------------------------------------------

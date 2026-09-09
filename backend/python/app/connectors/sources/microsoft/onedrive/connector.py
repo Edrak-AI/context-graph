@@ -57,6 +57,13 @@ from app.connectors.core.registry.filters import (
     load_connector_filters,
 )
 from app.connectors.sources.microsoft.common.apps import OneDriveApp
+from app.connectors.sources.microsoft.common.change_notifications import (
+    DRIVE_ITEM_MAX_MINUTES,
+    GRAPH_TOKEN_SCOPE,
+    GraphResource,
+    remove_graph_subscriptions,
+    sync_graph_subscriptions,
+)
 from app.connectors.sources.microsoft.common.constants import (
     MicrosoftGraphScopes,
     MicrosoftOAuth,
@@ -263,6 +270,8 @@ class OneDriveConnector(BaseConnector):
         self.credential: Optional[ClientSecretCredential] = None
         self._delegated: Optional[DelegatedTokenProvider] = None
         self._me_user: Optional[AppUser] = None
+        # drives touched by the current run; Graph change-notification subscriptions follow them
+        self._touched_user_ids: set[str] = set()
 
     def _is_personal(self) -> bool:
         return is_personal_scope(self.scope)
@@ -1253,6 +1262,7 @@ class OneDriveConnector(BaseConnector):
         """
         try:
             self.logger.info(f"Starting sync for user {user_id}")
+            self._touched_user_ids.add(user_id)
 
             # Get current sync state
             root_url = f"/users/{user_id}/drive/root/delta"
@@ -1623,6 +1633,7 @@ class OneDriveConnector(BaseConnector):
             await self._process_users_in_batches(users)
 
             self.logger.info("OneDrive connector sync completed successfully")
+            await self._sync_change_notifications()
             if self.onedrive_users_synced > 0:
                 await self.notify(
                     type=NotificationType.CONNECTOR_SUCCESS,
@@ -1732,10 +1743,43 @@ class OneDriveConnector(BaseConnector):
             await self._process_users_in_batches(users)
 
             self.logger.info("Incremental sync completed")
+            await self._sync_change_notifications()
 
         except Exception as e:
             self.logger.error(f"❌ Error in incremental sync: {e}")
             raise
+
+    async def _graph_token(self) -> str:
+        if self._delegated is not None:
+            return await self._delegated.get_token()
+        if self.credential is None:
+            raise RuntimeError("OneDrive connector not initialised")
+        return (await self.credential.get_token(GRAPH_TOKEN_SCOPE)).token
+
+    async def _sync_change_notifications(self) -> None:
+        """One ``users/{id}/drive/root`` subscription per drive this run touched (never raises)."""
+        resources = [
+            GraphResource(f"users/{user_id}/drive/root", "updated", DRIVE_ITEM_MAX_MINUTES)
+            for user_id in sorted(self._touched_user_ids)
+        ]
+        self._touched_user_ids = set()
+        await sync_graph_subscriptions(
+            config_service=self.config_service,
+            connector_id=self.connector_id,
+            token_getter=self._graph_token,
+            sync_point=self.drive_delta_sync_point,
+            resources=resources,
+            logger=self.logger,
+        )
+
+    async def remove_change_notifications(self) -> None:
+        await remove_graph_subscriptions(
+            config_service=self.config_service,
+            connector_id=self.connector_id,
+            token_getter=self._graph_token,
+            sync_point=self.drive_delta_sync_point,
+            logger=self.logger,
+        )
 
     async def cleanup(self) -> None:
         """

@@ -307,3 +307,40 @@ def require_scopes(*required_scopes: str) -> Callable[..., Coroutine[Any, Any, N
             )
 
     return _check_scopes
+
+
+def require_internal_scope(scope: str) -> Callable[..., Coroutine[Any, Any, dict[str, Any]]]:
+    """Dependency for service-to-service routes that have no user.
+
+    Accepts only an HS256 JWT signed with ``scopedJwtSecret`` whose ``scopes``
+    claim contains ``scope``; never falls back to the user JWT secret. Returns the
+    decoded payload. 401 on any token problem, 500 when the secret is missing.
+    """
+    async def _check(request: Request) -> dict[str, Any]:
+        token = extract_bearer_token(request.headers.get("Authorization"))
+        config_service = await get_config_service(request)
+        secret_keys = await config_service.get_config(config_node_constants.SECRET_KEYS.value)
+        secret = (secret_keys or {}).get("scopedJwtSecret") if isinstance(secret_keys, dict) else None
+        if not secret:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Authentication configuration error",
+            )
+        try:
+            payload = jwt.decode(token, secret, algorithms=["HS256"])
+        except JWTError as e:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Could not validate credentials",
+                headers={"WWW-Authenticate": "Bearer"},
+            ) from e
+        scopes = payload.get("scopes")
+        if not isinstance(scopes, list) or scope not in scopes:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=f"Token is missing required scope: {scope}",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        return payload
+
+    return _check

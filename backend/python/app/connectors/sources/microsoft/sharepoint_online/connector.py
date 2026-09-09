@@ -81,6 +81,13 @@ from app.connectors.core.registry.filters import (
     load_connector_filters,
 )
 from app.connectors.sources.microsoft.common.apps import SharePointOnlineApp
+from app.connectors.sources.microsoft.common.change_notifications import (
+    DRIVE_ITEM_MAX_MINUTES,
+    GRAPH_TOKEN_SCOPE,
+    GraphResource,
+    remove_graph_subscriptions,
+    sync_graph_subscriptions,
+)
 from app.connectors.sources.microsoft.common.msgraph_client import (
     MSGraphClient,
     RecordUpdate,
@@ -532,6 +539,8 @@ class SharePointConnector(BaseConnector):
         self.connector_id = connector_id
 
         self.filters = {"exclude_onedrive_sites": True, "exclude_pages": True, "exclude_lists": True, "exclude_document_libraries": False}
+        # (site_id, drive_id) touched by the current run; Graph change-notification subscriptions follow them
+        self._touched_drives: set[tuple[str, str]] = set()
         # Batch processing configuration
         self.batch_size = 50  # Reduced for better memory management
         self.max_concurrent_batches = 1 # set to 1 for now to avoid write write conflicts for small number of records
@@ -1215,6 +1224,7 @@ class SharePointConnector(BaseConnector):
         """
         Process drive items using delta API for a specific drive.
         """
+        self._touched_drives.add((site_id, drive_id))
         try:
             sync_point_key = generate_record_sync_point_key(
                 SharePointRecordType.DOCUMENT_LIBRARY.value,
@@ -3855,6 +3865,7 @@ class SharePointConnector(BaseConnector):
             duration = datetime.now() - start_time
             self.logger.info(f"🎉 SharePoint connector sync completed in {duration}")
             self.logger.info(f"📈 Statistics: {self.stats}")
+            await self._sync_change_notifications()
 
             # await self.notify(
             #     type=NotificationType.CONNECTOR_SUCCESS,
@@ -3889,6 +3900,7 @@ class SharePointConnector(BaseConnector):
                     continue
 
             self.logger.info("✅ SharePoint incremental sync completed")
+            await self._sync_change_notifications()
 
         except Exception as e:
             self.logger.error(f"❌ Error in SharePoint incremental sync: {e}")
@@ -4140,6 +4152,36 @@ class SharePointConnector(BaseConnector):
         except Exception as e:
             self.logger.error(f"❌ Error creating signed URL for record {record.id}: {e}")
             raise
+
+    async def _graph_token(self) -> str:
+        if self.credential is None:
+            raise RuntimeError("SharePoint connector not initialised")
+        return (await self.credential.get_token(GRAPH_TOKEN_SCOPE)).token
+
+    async def _sync_change_notifications(self) -> None:
+        """One ``sites/{site}/drives/{drive}/root`` subscription per library this run touched (never raises)."""
+        resources = [
+            GraphResource(f"sites/{site_id}/drives/{drive_id}/root", "updated", DRIVE_ITEM_MAX_MINUTES)
+            for site_id, drive_id in sorted(self._touched_drives)
+        ]
+        self._touched_drives = set()
+        await sync_graph_subscriptions(
+            config_service=self.config_service,
+            connector_id=self.connector_id,
+            token_getter=self._graph_token,
+            sync_point=self.drive_delta_sync_point,
+            resources=resources,
+            logger=self.logger,
+        )
+
+    async def remove_change_notifications(self) -> None:
+        await remove_graph_subscriptions(
+            config_service=self.config_service,
+            connector_id=self.connector_id,
+            token_getter=self._graph_token,
+            sync_point=self.drive_delta_sync_point,
+            logger=self.logger,
+        )
 
     async def cleanup(self) -> None:
         """Cleanup resources when shutting down the connector."""
