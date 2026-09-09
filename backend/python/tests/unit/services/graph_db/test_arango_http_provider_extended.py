@@ -447,6 +447,19 @@ class TestGetFilteredConnectorInstances:
         assert len(docs) == 2
 
     @pytest.mark.asyncio
+    async def test_every_query_is_scoped_to_the_callers_org(self, connected_provider):
+        connected_provider.execute_query = AsyncMock(side_effect=[[0], []])
+        await connected_provider.get_filtered_connector_instances(
+            collection="apps", edge_collection="orgAppRelation",
+            org_id="org-A", user_id="admin1", scope="team", is_admin=True,
+        )
+        for call in connected_provider.execute_query.await_args_list:
+            query = call.args[0]
+            bind_vars = call.kwargs.get("bind_vars") or call.args[1]
+            assert "FILTER doc.orgId == @org_id" in query
+            assert bind_vars["org_id"] == "org-A"
+
+    @pytest.mark.asyncio
     async def test_personal_scope_filter(self, connected_provider):
         connected_provider.execute_query = AsyncMock(side_effect=[
             [3],  # count

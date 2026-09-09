@@ -1402,12 +1402,16 @@ class ArangoHTTPProvider(IGraphDBProvider):
             accessible_team_keys: list[str] | None = None
 
             # Build base query
+            # Tenant filter first: without it an admin of one org lists every other org's
+            # team connectors.
             query = """
             FOR doc IN @@collection
                 FILTER doc._id != null
+                FILTER doc.orgId == @org_id
             """
             bind_vars = {
                 "@collection": collection,
+                "org_id": org_id,
             }
 
             # Exclude KB if requested

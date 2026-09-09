@@ -3220,6 +3220,20 @@ class TestNeo4jGetFilteredConnectorInstances:
         assert len(docs) == 3
 
     @pytest.mark.asyncio
+    async def test_every_query_is_scoped_to_the_callers_org(self, neo4j_provider: Neo4jProvider):
+        """Multi-org deployments: an admin must never list another org's team connectors."""
+        neo4j_provider.client.execute_query = AsyncMock(side_effect=[[{"total": 0}], []])
+        await neo4j_provider.get_filtered_connector_instances(
+            collection="App", edge_collection="orgAppRelation",
+            org_id="org-A", user_id="admin1", scope="team", is_admin=True,
+        )
+        for call in neo4j_provider.client.execute_query.await_args_list:
+            query = call.args[0]
+            params = call.kwargs.get("parameters") or call.args[1]
+            assert "doc.orgId = $org_id" in query
+            assert params["org_id"] == "org-A"
+
+    @pytest.mark.asyncio
     async def test_personal_scope_filter(self, neo4j_provider: Neo4jProvider):
         """personal scope appends scope and createdBy conditions."""
         neo4j_provider.client.execute_query = AsyncMock(side_effect=[

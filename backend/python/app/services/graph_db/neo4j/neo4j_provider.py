@@ -12944,9 +12944,10 @@ class Neo4jProvider(IGraphDBProvider):
             # can actually see.
             accessible_team_ids: list[str] | None = None
 
-            # Build WHERE conditions
-            conditions = ["doc.id IS NOT NULL"]
-            params = {}
+            # Build WHERE conditions. Tenant filter first: without it an admin of one org
+            # lists (and then tries to toggle) every other org's team connectors.
+            conditions = ["doc.id IS NOT NULL", "doc.orgId = $org_id"]
+            params = {"org_id": org_id}
 
             # Exclude KB if requested
             if exclude_kb and kb_connector_type:
