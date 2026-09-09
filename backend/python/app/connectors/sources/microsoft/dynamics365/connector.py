@@ -25,6 +25,12 @@ ACL edges and any attachment child go with it).  Tables without
 records no longer returned by Dataverse (``reconcile_interval_hours`` filter,
 default 24h).  The decision logic lives in ``change_tracking.py`` (pure).
 
+Shares: ``principalobjectaccess`` is re-read every run, but sharing a record changes
+neither its ``modifiedon`` nor the delta feed.  A per-record digest of the share list
+(``mapping.share_digests``) is kept in the entity's sync point; records whose digest
+moved and that the incremental pull did not already cover are re-fetched by primary
+key and re-processed so their permission edges follow the share.
+
 Identity: ``systemuser`` rows are matched to platform accounts by the person's
 Entra primary address (Graph ``getByIds`` via ``EntraUserEmailResolver``, needs the
 application permission ``User.Read.All``) and only fall back to the address stored
@@ -106,6 +112,7 @@ from app.connectors.sources.microsoft.dynamics365.mapping import (
     DEFAULT_ENTITY_ORDER,
     ENTITIES_FILTER_KEY,
     ENTITY_SPECS,
+    PRIMARY_ID_FILTER_BATCH_SIZE,
     STATE_LOST_OR_CANCELLED,
     STATE_WON_OR_RESOLVED,
     SYSTEM_ADMINISTRATOR_ROLE_NAME,
@@ -118,6 +125,8 @@ from app.connectors.sources.microsoft.dynamics365.mapping import (
     attachment_external_id,
     bu_group_external_id,
     build_modified_filter,
+    build_primary_id_filter,
+    changed_share_record_ids,
     derive_grants,
     display_value,
     entity_list_web_url,
@@ -133,6 +142,7 @@ from app.connectors.sources.microsoft.dynamics365.mapping import (
     resolve_selected_entities,
     role_external_id,
     role_has_global_read,
+    share_digests,
     split_external_id,
     systemuser_email,
     team_group_external_id,
@@ -815,9 +825,10 @@ class MicrosoftDynamics365Connector(BaseConnector):
         self.logger.info("Synced %d Dynamics 365 security roles", len(app_roles))
         return ctx
 
-    async def _load_shares(self, spec: EntitySpec, ctx: SecurityContext) -> None:
+    async def _load_shares(self, spec: EntitySpec, ctx: SecurityContext) -> bool:
         """``principalobjectaccess`` rows for one table; skipped gracefully when the
-        application user's role cannot read the POA table."""
+        application user's role cannot read the POA table.  Returns whether shares
+        were readable (a failed read must not be mistaken for "everything unshared")."""
         try:
             rows = await self._fetch_all(
                 "principalobjectaccessset",
@@ -835,8 +846,9 @@ class MicrosoftDynamics365Connector(BaseConnector):
                     "PrincipalObjectAccess table to enable them.", e.response.status_code,
                 )
             ctx.shares_by_entity[spec.logical_name] = {}
-            return
+            return False
         ctx.shares_by_entity[spec.logical_name] = index_shares(rows)
+        return True
 
     # ------------------------------------------------------------------
     # Record groups and records
@@ -875,11 +887,12 @@ class MicrosoftDynamics365Connector(BaseConnector):
         mode = plan_sync(state, incremental=incremental, now_ms=sync_started_ms, interval_hours=interval_hours)
         start_ms, end_ms = self._modified_bounds()
 
-        await self._load_shares(spec, self._security)
+        shares_available = await self._load_shares(spec, self._security)
+        current_digests = share_digests(self._security.shares_by_entity.get(spec.logical_name, {}))
 
         if mode is SyncMode.DELTA:
             try:
-                upserted, deleted = await self._apply_delta(spec, state, start_ms, end_ms)
+                upserted, deleted, handled = await self._apply_delta(spec, state, start_ms, end_ms)
             except httpx.HTTPStatusError as e:
                 if is_change_tracking_disabled_error(e.response.status_code, _response_body(e.response)):
                     self._mark_change_tracking_disabled(spec, state)
@@ -893,19 +906,25 @@ class MicrosoftDynamics365Connector(BaseConnector):
                     state.delta_link = None
                 mode = SyncMode.FULL_RECONCILE
             else:
+                if shares_available:
+                    await self._reapply_changed_shares(spec, state, current_digests, handled, start_ms, end_ms)
                 state.last_sync_timestamp = sync_started_ms
                 await self._save_entity_state(key, state)
                 self.logger.info("Synced %d %s records, %d deleted (delta)", upserted, spec.display_name.lower(), deleted)
                 return
 
         if mode is SyncMode.MODIFIED_ON:
-            upserted = await self._sync_entity_modified_on(spec, state.last_sync_timestamp, start_ms, end_ms)
+            upserted, handled = await self._sync_entity_modified_on(spec, state.last_sync_timestamp, start_ms, end_ms)
+            if shares_available:
+                await self._reapply_changed_shares(spec, state, current_digests, handled, start_ms, end_ms)
             state.last_sync_timestamp = sync_started_ms
             await self._save_entity_state(key, state)
             self.logger.info("Synced %d %s records (incremental, modifiedon)", upserted, spec.display_name.lower())
             return
 
         upserted, deleted = await self._full_pull_and_reconcile(spec, state, start_ms, end_ms)
+        # The full pull applied whatever shares were readable (none, when the POA read failed).
+        state.share_digests = current_digests
         state.last_sync_timestamp = sync_started_ms
         state.last_reconcile_timestamp = sync_started_ms
         await self._save_entity_state(key, state)
@@ -931,14 +950,18 @@ class MicrosoftDynamics365Connector(BaseConnector):
         )
 
     async def _apply_delta(
-        self, spec: EntitySpec, state: EntitySyncState, start_ms: Optional[int], end_ms: Optional[int]
-    ) -> Tuple[int, int]:
+        self, spec: EntitySpec, state: EntitySyncState, start_ms: int | None, end_ms: int | None
+    ) -> tuple[int, int, set[str]]:
         """GET the stored delta link; upsert changed rows, delete ``reason: deleted`` ones,
-        store the new delta link. Raises ``httpx.HTTPStatusError`` for the caller to classify."""
+        store the new delta link. Raises ``httpx.HTTPStatusError`` for the caller to classify.
+        The returned set holds the source ids the delta covered (upserts and deletes)."""
         assert state.delta_link
         upserted = deleted = 0
+        handled: set[str] = set()
         new_delta_link: Optional[str] = None
         async for page in self._iter_delta_pages(spec, state.delta_link):
+            handled.update(_row_ids(spec, page.upserts))
+            handled.update(page.deleted_ids)
             upserted += await self._process_rows(spec, page.upserts, start_ms, end_ms)
             deleted += await self._delete_by_source_ids(spec, page.deleted_ids)
             if page.delta_link:
@@ -948,20 +971,56 @@ class MicrosoftDynamics365Connector(BaseConnector):
         else:
             self.logger.warning("Dynamics 365 delta response for %s carried no new delta link; will re-baseline", spec.entity_set)
             state.delta_link = None
-        return upserted, deleted
+        return upserted, deleted, handled
 
     async def _sync_entity_modified_on(
         self, spec: EntitySpec, since_ms: Optional[int], start_ms: Optional[int], end_ms: Optional[int]
-    ) -> int:
+    ) -> tuple[int, set[str]]:
         """Server-side ``modifiedon`` filter (no delete detection) for tables without change tracking."""
         params: Dict[str, str] = {"$select": ",".join(spec.select_fields), "$orderby": "modifiedon asc"}
         odata_filter = build_modified_filter(since_ms=since_ms, start_ms=start_ms, end_ms=end_ms)
         if odata_filter:
             params["$filter"] = odata_filter
         upserted = 0
+        handled: set[str] = set()
         async for rows in self._iter_pages(spec.entity_set, params=params, include_annotations=True):
+            handled.update(_row_ids(spec, rows))
             upserted += await self._process_rows(spec, rows, start_ms, end_ms)
-        return upserted
+        return upserted, handled
+
+    async def _reapply_changed_shares(
+        self,
+        spec: EntitySpec,
+        state: EntitySyncState,
+        current_digests: dict[str, str],
+        handled: set[str],
+        start_ms: int | None,
+        end_ms: int | None,
+    ) -> int:
+        """Sharing / unsharing a record does not touch its ``modifiedon`` and is invisible
+        to change tracking, so records whose share list differs from the stored baseline
+        are re-read by primary key and re-processed; rows the incremental pull already
+        covered are skipped.  Ids that Dataverse no longer returns were deleted meanwhile."""
+        changed = sorted(changed_share_record_ids(state.share_digests, current_digests) - handled)
+        reapplied = 0
+        for start in range(0, len(changed), PRIMARY_ID_FILTER_BATCH_SIZE):
+            rows = await self._fetch_rows_by_id(spec, changed[start:start + PRIMARY_ID_FILTER_BATCH_SIZE])
+            reapplied += len(rows)
+            await self._process_rows(spec, rows, start_ms, end_ms)
+        state.share_digests = current_digests
+        self.logger.info("Re-applied grants for %d %s records whose shares changed", reapplied, spec.display_name.lower())
+        return reapplied
+
+    async def _fetch_rows_by_id(self, spec: EntitySpec, row_ids: list[str]) -> list[dict[str, Any]]:
+        """Same ``$select`` and annotations as the regular pull, so the rows render identically."""
+        odata_filter = build_primary_id_filter(spec, row_ids)
+        if not odata_filter:
+            return []
+        params = {"$select": ",".join(spec.select_fields), "$filter": odata_filter}
+        rows: list[dict[str, Any]] = []
+        async for page in self._iter_pages(spec.entity_set, params=params, include_annotations=True):
+            rows.extend(page)
+        return rows
 
     async def _full_pull_and_reconcile(
         self, spec: EntitySpec, state: EntitySyncState, start_ms: Optional[int], end_ms: Optional[int]
@@ -1297,6 +1356,10 @@ class MicrosoftDynamics365Connector(BaseConnector):
         start = max(page - 1, 0) * limit
         chunk = options[start:start + limit]
         return FilterOptionsResponse(success=True, options=chunk, page=page, limit=limit, has_more=start + limit < len(options))
+
+
+def _row_ids(spec: EntitySpec, rows: list[dict[str, Any]]) -> list[str]:
+    return [str(row[spec.primary_id]) for row in rows if row.get(spec.primary_id)]
 
 
 def _response_body(response: httpx.Response) -> Any:

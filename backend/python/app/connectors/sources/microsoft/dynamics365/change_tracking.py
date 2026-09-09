@@ -62,6 +62,8 @@ FIELD_LAST_SYNC = "lastSyncTimestamp"
 FIELD_DELTA_LINK = "deltaLink"
 FIELD_CHANGE_TRACKING = "changeTracking"
 FIELD_LAST_RECONCILE = "lastReconcileTimestamp"
+# JSON text, not a nested map: Neo4j node properties must be primitives.
+FIELD_SHARE_DIGESTS = "shareDigests"
 
 
 class ChangeTrackingStatus(str, Enum):
@@ -89,6 +91,8 @@ class EntitySyncState:
     delta_link: str | None = None
     change_tracking: ChangeTrackingStatus = ChangeTrackingStatus.UNKNOWN
     last_reconcile_timestamp: int | None = None
+    # record id -> share digest (``mapping.share_digests``) as last applied to the graph
+    share_digests: dict[str, str] = field(default_factory=dict)
 
     @classmethod
     def from_sync_point(cls, data: Mapping[str, object] | None) -> EntitySyncState:
@@ -103,6 +107,7 @@ class EntitySyncState:
             delta_link=str(delta_link) if delta_link else None,
             change_tracking=status,
             last_reconcile_timestamp=_as_int(data.get(FIELD_LAST_RECONCILE)),
+            share_digests=_parse_share_digests(data.get(FIELD_SHARE_DIGESTS)),
         )
 
     def to_sync_point(self) -> dict[str, object]:
@@ -112,6 +117,7 @@ class EntitySyncState:
             FIELD_DELTA_LINK: self.delta_link,
             FIELD_CHANGE_TRACKING: self.change_tracking.value,
             FIELD_LAST_RECONCILE: self.last_reconcile_timestamp,
+            FIELD_SHARE_DIGESTS: json.dumps(self.share_digests, separators=(",", ":"), sort_keys=True),
         }
 
     def mark_change_tracking_disabled(self) -> None:
@@ -278,6 +284,18 @@ def prune_is_safe(known_count: int, seen_count: int) -> bool:
     """Refuse to prune when a pull saw nothing while the graph knows records: an
     empty pull is far more likely a misconfiguration than a table wiped clean."""
     return not (known_count > 0 and seen_count == 0)
+
+
+def _parse_share_digests(value: object) -> dict[str, str]:
+    """Accept the stored JSON text (or an already-decoded map); anything else is an empty baseline."""
+    if isinstance(value, (str, bytes, bytearray)):
+        try:
+            value = json.loads(value)
+        except ValueError:
+            return {}
+    if not isinstance(value, Mapping):
+        return {}
+    return {str(k): str(v) for k, v in value.items() if isinstance(v, str) and v}
 
 
 def _as_int(value: object) -> int | None:

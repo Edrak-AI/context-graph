@@ -16,6 +16,7 @@ from app.connectors.sources.microsoft.dynamics365.change_tracking import (
     FIELD_DELTA_LINK,
     FIELD_LAST_RECONCILE,
     FIELD_LAST_SYNC,
+    FIELD_SHARE_DIGESTS,
     MS_PER_HOUR,
     TRACK_CHANGES_PREFERENCE,
     ChangeTrackingStatus,
@@ -151,6 +152,7 @@ class TestSyncStatePersistence:
             delta_link=DELTA_LINK_1,
             change_tracking=ChangeTrackingStatus.ENABLED,
             last_reconcile_timestamp=1_699_000_000_000,
+            share_digests={ACC_2: "0123456789ab", ACC_1: "ba9876543210"},
         )
         doc = state.to_sync_point()
         assert doc == {
@@ -158,8 +160,19 @@ class TestSyncStatePersistence:
             FIELD_DELTA_LINK: DELTA_LINK_1,
             FIELD_CHANGE_TRACKING: "enabled",
             FIELD_LAST_RECONCILE: 1_699_000_000_000,
+            # JSON text (sorted keys) rather than a nested map: Neo4j properties must be primitives
+            FIELD_SHARE_DIGESTS: f'{{"{ACC_1}":"ba9876543210","{ACC_2}":"0123456789ab"}}',
         }
+        assert isinstance(doc[FIELD_SHARE_DIGESTS], str)
         assert EntitySyncState.from_sync_point(doc) == state
+
+    def test_share_digests_default_and_tolerant_loading(self) -> None:
+        assert EntitySyncState().to_sync_point()[FIELD_SHARE_DIGESTS] == "{}"
+        assert EntitySyncState.from_sync_point({FIELD_SHARE_DIGESTS: "{}"}).share_digests == {}
+        # legacy sync point without the field, garbage text, and a store that decoded the map already
+        assert EntitySyncState.from_sync_point({FIELD_LAST_SYNC: 1}).share_digests == {}
+        assert EntitySyncState.from_sync_point({FIELD_SHARE_DIGESTS: "not json"}).share_digests == {}
+        assert EntitySyncState.from_sync_point({FIELD_SHARE_DIGESTS: {ACC_1: "abc", ACC_2: "", ACC_3: 7}}).share_digests == {ACC_1: "abc"}
 
     def test_cleared_delta_link_is_written_explicitly(self):
         # SyncPoint.update_sync_point replaces the document; an absent key would not

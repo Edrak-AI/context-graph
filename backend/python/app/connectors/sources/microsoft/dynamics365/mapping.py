@@ -39,6 +39,8 @@ Known approximations (documented gaps):
 
 from __future__ import annotations
 
+import hashlib
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -50,6 +52,11 @@ from typing import Any, Iterable, Mapping, Optional, Sequence
 
 DATAVERSE_API_VERSION = "v9.2"
 DATAVERSE_PAGE_SIZE = 5000  # Dataverse hard cap per page (Prefer: odata.maxpagesize)
+# ``<pk> eq <guid> or ...`` clauses per request; keeps the URL well under Dataverse's limit.
+PRIMARY_ID_FILTER_BATCH_SIZE = 25
+SHARE_DIGEST_HEX_CHARS = 12
+
+_GUID_RE = re.compile(r"^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$")
 
 FORMATTED_VALUE_SUFFIX = "@OData.Community.Display.V1.FormattedValue"
 LOOKUP_LOGICALNAME_SUFFIX = "@Microsoft.Dynamics.CRM.lookuplogicalname"
@@ -431,6 +438,15 @@ def build_modified_filter(
     return " and ".join(clauses) if clauses else None
 
 
+def build_primary_id_filter(spec: EntitySpec, row_ids: Iterable[str]) -> str | None:
+    """``$filter`` selecting rows by primary key (Edm.Guid literals are unquoted).
+    Non-GUID values are dropped so nothing but a key can reach the query."""
+    guids = [str(v) for v in row_ids if _GUID_RE.match(str(v or ""))]
+    if not guids:
+        return None
+    return " or ".join(f"{spec.primary_id} eq {guid}" for guid in guids)
+
+
 # ---------------------------------------------------------------------------
 # Rendering
 # ---------------------------------------------------------------------------
@@ -693,6 +709,29 @@ def index_shares(rows: Iterable[Mapping[str, Any]]) -> dict[str, list[ShareEntry
             continue
         out.setdefault(str(object_id), []).append(ShareEntry(str(principal_id), principal_type, mask))
     return out
+
+
+def share_digest(shares: Iterable[ShareEntry]) -> str:
+    """Short, order-independent fingerprint of one record's share list."""
+    entries = sorted({(s.principal_id, s.principal_type, s.access_mask) for s in shares})
+    payload = "\n".join(f"{pid}\t{ptype}\t{mask}" for pid, ptype, mask in entries)
+    return hashlib.blake2b(payload.encode("utf-8"), digest_size=SHARE_DIGEST_HEX_CHARS // 2).hexdigest()
+
+
+def share_digests(shares: Mapping[str, Iterable[ShareEntry]]) -> dict[str, str]:
+    """``{object_id: digest}`` for records that have at least one share; the map is
+    persisted between syncs so unshared records cost nothing."""
+    out: dict[str, str] = {}
+    for object_id, shared_with in shares.items():
+        entries = list(shared_with)
+        if entries:
+            out[str(object_id)] = share_digest(entries)
+    return out
+
+
+def changed_share_record_ids(previous: Mapping[str, str], current: Mapping[str, str]) -> set[str]:
+    """Record ids whose share digest was added, removed or changed between two syncs."""
+    return {rid for rid in set(previous) | set(current) if previous.get(rid) != current.get(rid)}
 
 
 def systemuser_email(row: Mapping[str, Any]) -> Optional[str]:

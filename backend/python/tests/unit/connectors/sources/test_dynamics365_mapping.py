@@ -23,6 +23,8 @@ from app.connectors.sources.microsoft.dynamics365.mapping import (
     bu_group_external_id,
     build_metadata,
     build_modified_filter,
+    build_primary_id_filter,
+    changed_share_record_ids,
     derive_grants,
     display_value,
     epoch_ms_to_odata,
@@ -38,6 +40,8 @@ from app.connectors.sources.microsoft.dynamics365.mapping import (
     resolve_selected_entities,
     role_external_id,
     role_has_global_read,
+    share_digest,
+    share_digests,
     share_role,
     split_external_id,
     systemuser_email,
@@ -200,6 +204,14 @@ class TestTimeAndFilters:
             "modifiedon ge 1970-01-01T00:00:01Z and modifiedon le 1970-01-01T00:00:05Z"
         )
         assert build_modified_filter(end_ms=5000) == "modifiedon le 1970-01-01T00:00:05Z"
+
+    def test_build_primary_id_filter(self) -> None:
+        assert build_primary_id_filter(OPP, [OPP_ID]) == f"opportunityid eq {OPP_ID}"
+        assert build_primary_id_filter(INC, [USER_A, USER_B]) == f"incidentid eq {USER_A} or incidentid eq {USER_B}"
+        # only GUIDs can reach the query; anything else is dropped
+        assert build_primary_id_filter(OPP, ["x' or 1 eq 1", "", OPP_ID]) == f"opportunityid eq {OPP_ID}"
+        assert build_primary_id_filter(OPP, []) is None
+        assert build_primary_id_filter(OPP, ["not-a-guid"]) is None
 
 
 # ---------------------------------------------------------------------------
@@ -364,6 +376,39 @@ class TestPermissionMapping:
             ShareEntry(USER_B, 8, ACCESS_READ),
             ShareEntry(TEAM_X, 9, ACCESS_READ | ACCESS_WRITE),
         ]
+
+    def test_share_digest_is_stable_and_order_independent(self) -> None:
+        a = ShareEntry(USER_B, PRINCIPAL_TYPE_SYSTEMUSER, ACCESS_READ)
+        b = ShareEntry(TEAM_X, PRINCIPAL_TYPE_TEAM, ACCESS_READ | ACCESS_WRITE)
+        digest = share_digest([a, b])
+        assert len(digest) == 12 and int(digest, 16) >= 0
+        assert share_digest([b, a]) == digest
+        assert share_digest([a, b, a]) == digest                 # duplicate POA rows do not matter
+        assert share_digest([a]) != digest                       # principal removed
+        assert share_digest([a, ShareEntry(TEAM_X, PRINCIPAL_TYPE_TEAM, ACCESS_READ)]) != digest  # mask changed
+        assert share_digest([a, ShareEntry(TEAM_X, PRINCIPAL_TYPE_SYSTEMUSER, ACCESS_READ | ACCESS_WRITE)]) != digest  # type changed
+        assert share_digest([]) == share_digest(())
+
+    def test_share_digests_only_cover_shared_records(self) -> None:
+        shares = {
+            OPP_ID: [ShareEntry(USER_B, PRINCIPAL_TYPE_SYSTEMUSER, ACCESS_READ)],
+            USER_A: [],  # indexed but empty → absent from the map
+        }
+        digests = share_digests(shares)
+        assert set(digests) == {OPP_ID}
+        assert digests[OPP_ID] == share_digest(shares[OPP_ID])
+        assert share_digests({}) == {}
+        assert share_digests(index_shares([])) == {}
+
+    def test_changed_share_record_ids(self) -> None:
+        previous = {"a": "111111111111", "b": "222222222222", "c": "333333333333"}
+        current = {"a": "111111111111", "b": "bbbbbbbbbbbb", "d": "444444444444"}
+        # b changed, c unshared (removed), d newly shared (added); a untouched
+        assert changed_share_record_ids(previous, current) == {"b", "c", "d"}
+        assert changed_share_record_ids({}, {}) == set()
+        assert changed_share_record_ids(previous, previous) == set()
+        assert changed_share_record_ids({}, current) == set(current)
+        assert changed_share_record_ids(previous, {}) == set(previous)
 
     def test_entity_role_grants_for_record_groups(self):
         grants = _ctx().entity_role_grants(OPP)
