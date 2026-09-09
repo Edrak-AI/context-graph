@@ -90,6 +90,12 @@ from app.connectors.core.registry.filters import (
     SyncFilterKey,
     load_connector_filters,
 )
+from app.connectors.sources.microsoft.common.entra_identity import (
+    GRAPH_BASE_URL,
+    USER_EMAIL_SELECT,
+    EntraGraphClient,
+    graph_user_email,
+)
 from app.connectors.sources.sap.apps import SapApp
 from app.connectors.sources.sap.mapping import (
     ALL_FILTER_ENTITIES,
@@ -182,9 +188,6 @@ _MAX_CONCURRENT_REQUESTS = 4
 _KNOWN_RECORDS_PAGE = 1000       # keyset page size when enumerating stored records
 _RECONCILE_DELETE_BATCH = 100    # record ids per cascade-delete call
 _GUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
-
-GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0"
-GRAPH_SCOPE = "https://graph.microsoft.com/.default"
 
 _GRANT_ROLE_TO_PERMISSION = {
     GrantRole.READER: PermissionType.READ,
@@ -1303,57 +1306,19 @@ class SapConnector(BaseConnector):
         return FilterOptionsResponse(success=True, options=chunk, page=page, limit=limit, has_more=start + limit < len(options))
 
 
-class EntraGroupResolver:
+class EntraGroupResolver(EntraGraphClient):
     """Expands ``group:<display name or object id>`` into member e-mails via Microsoft Graph
     (app-only client credentials; needs ``GroupMember.Read.All`` + ``User.Read.All``).
 
-    Results are cached for the resolver's lifetime (= one connector instance / sync).
-    Unknown groups resolve to ``None`` so the caller can fall back to inline members.
+    Members are identified by their Entra primary address (``graph_user_email``) so the
+    result matches the addresses people sign in to Edrak with.  Results are cached for
+    the resolver's lifetime (= one connector instance / sync).  Unknown groups resolve to
+    ``None`` so the caller can fall back to inline members.
     """
 
     def __init__(self, tenant_id: str, client_id: str, client_secret: str, logger: Logger) -> None:
-        self._tenant_id = tenant_id
-        self._client_id = client_id
-        self._client_secret = client_secret
-        self._logger = logger
-        self._http = httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=15.0))
-        self._token: Optional[str] = None
-        self._token_expires_on: int = 0
+        super().__init__(tenant_id, client_id, client_secret, logger)
         self._cache: Dict[str, Optional[List[str]]] = {}
-
-    async def close(self) -> None:
-        with contextlib.suppress(Exception):
-            await self._http.aclose()
-
-    async def _token_header(self) -> Dict[str, str]:
-        now_s = get_epoch_timestamp_in_ms() // 1000
-        if not self._token or now_s >= self._token_expires_on - _TOKEN_REFRESH_SKEW_S:
-            response = await self._http.post(
-                f"https://login.microsoftonline.com/{self._tenant_id}/oauth2/v2.0/token",
-                data={
-                    "grant_type": "client_credentials",
-                    "client_id": self._client_id,
-                    "client_secret": self._client_secret,
-                    "scope": GRAPH_SCOPE,
-                },
-            )
-            response.raise_for_status()
-            payload = response.json()
-            self._token = str(payload["access_token"])
-            self._token_expires_on = now_s + int(payload.get("expires_in") or 3600)
-        return {"Authorization": f"Bearer {self._token}"}
-
-    async def _get(self, url: str, params: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
-        delay = 1.0
-        for attempt in range(_MAX_HTTP_RETRIES + 1):
-            response = await self._http.get(url, params=params, headers=await self._token_header())
-            if response.status_code in _RETRY_STATUS and attempt < _MAX_HTTP_RETRIES:
-                await asyncio.sleep(retry_delay(response.headers.get("Retry-After"), delay))
-                delay = min(delay * 2, 30.0)
-                continue
-            response.raise_for_status()
-            return response.json()
-        raise RuntimeError(f"Graph request to {url} exhausted retries")
 
     async def _group_id(self, name_or_id: str) -> Optional[str]:
         if _GUID_RE.match(name_or_id):
@@ -1379,15 +1344,15 @@ class EntraGroupResolver:
     async def _members(self, group_id: str) -> List[str]:
         emails: List[str] = []
         url: Optional[str] = f"{GRAPH_BASE_URL}/groups/{group_id}/transitiveMembers/microsoft.graph.user"
-        params: Optional[Dict[str, str]] = {"$select": "mail,userPrincipalName,accountEnabled", "$top": "999"}
+        params: Optional[Dict[str, str]] = {"$select": USER_EMAIL_SELECT, "$top": "999"}
         while url:
             payload = await self._get(url, params)
             for user in payload.get("value") or []:
                 if not isinstance(user, dict) or user.get("accountEnabled") is False:
                     continue
-                email = user.get("mail") or user.get("userPrincipalName")
-                if email and "@" in str(email):
-                    emails.append(str(email).strip().lower())
+                email = graph_user_email(user)
+                if email:
+                    emails.append(email)
             url = payload.get("@odata.nextLink")
             params = None
         return sorted(set(emails))

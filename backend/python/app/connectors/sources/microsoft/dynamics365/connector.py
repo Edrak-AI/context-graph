@@ -24,6 +24,13 @@ ACL edges and any attachment child go with it).  Tables without
 ``modifiedon`` incremental filter plus a periodic full reconcile that prunes
 records no longer returned by Dataverse (``reconcile_interval_hours`` filter,
 default 24h).  The decision logic lives in ``change_tracking.py`` (pure).
+
+Identity: ``systemuser`` rows are matched to platform accounts by the person's
+Entra primary address (Graph ``getByIds`` via ``EntraUserEmailResolver``, needs the
+application permission ``User.Read.All``) and only fall back to the address stored
+in Dataverse (``internalemailaddress`` / UPN) when Graph is not permitted — the
+Dataverse copy is frequently the ``@<tenant>.onmicrosoft.com`` UPN, which nobody
+signs in to Edrak with.
 """
 
 from __future__ import annotations
@@ -72,6 +79,9 @@ from app.connectors.core.registry.filters import (
     load_connector_filters,
 )
 from app.connectors.sources.microsoft.common.apps import MicrosoftDynamics365App
+from app.connectors.sources.microsoft.common.entra_identity import (
+    EntraUserEmailResolver,
+)
 from app.connectors.sources.microsoft.dynamics365.change_tracking import (
     DEFAULT_RECONCILE_INTERVAL_HOURS,
     FIELD_DELTA_LINK,
@@ -237,7 +247,10 @@ def grants_to_permissions(grants: List[PermissionGrant]) -> List[Permission]:
                 display_name="Application User configured",
                 description=(
                     "Confirm the app registration has been added as an Application User in the "
-                    "Dynamics 365 environment and assigned a security role"
+                    "Dynamics 365 environment and assigned a security role. Also grant it the "
+                    "Microsoft Graph application permission User.Read.All (admin consent) so people "
+                    "are matched by their primary e-mail address rather than the address stored in "
+                    "Dynamics; without it the Dynamics address is used."
                 ),
                 field_type="CHECKBOX",
                 required=True,
@@ -328,7 +341,11 @@ class MicrosoftDynamics365Connector(BaseConnector):
         self.records_sync_point = _sync_point(SyncDataPointType.RECORDS)
 
         self.environment_url: str = ""
+        self._tenant_id: str = ""
+        self._client_id: str = ""
+        self._client_secret: str = ""
         self.credential: Optional[ClientSecretCredential] = None
+        self._entra_users: Optional[EntraUserEmailResolver] = None
         self._http: Optional[httpx.AsyncClient] = None
         self._token: Optional[str] = None
         self._token_expires_on: int = 0
@@ -364,6 +381,7 @@ class MicrosoftDynamics365Connector(BaseConnector):
             raise ConnectorInitError(str(e)) from e
 
         await self._close_http()
+        self._tenant_id, self._client_id, self._client_secret = tenant_id, client_id, client_secret
         self.credential = ClientSecretCredential(
             tenant_id=tenant_id, client_id=client_id, client_secret=client_secret
         )
@@ -415,6 +433,9 @@ class MicrosoftDynamics365Connector(BaseConnector):
             with contextlib.suppress(Exception):
                 await self.credential.close()
             self.credential = None
+        if self._entra_users is not None:
+            await self._entra_users.close()
+            self._entra_users = None
         self._token = None
         self._token_expires_on = 0
 
@@ -612,6 +633,15 @@ class MicrosoftDynamics365Connector(BaseConnector):
     # Users, teams, business units, roles
     # ------------------------------------------------------------------
 
+    async def _official_emails(self, rows: List[Dict[str, Any]]) -> Dict[str, str]:
+        """Entra object id → primary e-mail for one page of ``systemuser`` rows; ``{}`` when Graph is not permitted."""
+        ids = [str(r["azureactivedirectoryobjectid"]) for r in rows if r.get("azureactivedirectoryobjectid")]
+        if not ids or not all((self._tenant_id, self._client_id, self._client_secret)):
+            return {}
+        if self._entra_users is None:
+            self._entra_users = EntraUserEmailResolver(self._tenant_id, self._client_id, self._client_secret, self.logger)
+        return await self._entra_users.resolve_emails(ids)
+
     async def _sync_security_model(self, specs: List[EntitySpec]) -> SecurityContext:
         ctx = SecurityContext()
         org_id = self.data_entities_processor.org_id
@@ -619,6 +649,7 @@ class MicrosoftDynamics365Connector(BaseConnector):
         # 1. systemusers → AppUser
         users_by_id: Dict[str, AppUser] = {}
         bu_members: Dict[str, List[AppUser]] = {}
+        remapped = 0
         async for page in self._iter_pages(
             "systemusers",
             params={
@@ -627,14 +658,17 @@ class MicrosoftDynamics365Connector(BaseConnector):
                            "_businessunitid_value,createdon,modifiedon",
             },
         ):
+            rows = [row for row in page if not is_application_user(row)]
+            official = await self._official_emails(rows)
             batch: List[AppUser] = []
-            for row in page:
-                if is_application_user(row):
-                    continue
-                email = systemuser_email(row)
+            for row in rows:
                 user_id = row.get("systemuserid")
+                stored = systemuser_email(row)
+                email = official.get(str(row.get("azureactivedirectoryobjectid") or "")) or stored
                 if not email or not user_id:
                     continue
+                if stored and email != stored:
+                    remapped += 1
                 app_user = AppUser(
                     app_name=self.connector_name,
                     connector_id=self.connector_id,
@@ -655,7 +689,10 @@ class MicrosoftDynamics365Connector(BaseConnector):
             if batch:
                 await self.data_entities_processor.on_new_app_users(batch)
         await self.user_sync_point.update_sync_point(USERS_SYNC_POINT_KEY, {"lastSyncTimestamp": get_epoch_timestamp_in_ms()})
-        self.logger.info("Synced %d Dynamics 365 users", len(users_by_id))
+        self.logger.info(
+            "Synced %d Dynamics 365 users (%d matched by their Entra primary address rather than the Dataverse one)",
+            len(users_by_id), remapped,
+        )
 
         # 2. businessunits → AppUserGroup (bu:<id>) of the users whose home BU it is
         bu_rows = await self._fetch_all("businessunits", {"$select": "businessunitid,name,_parentbusinessunitid_value,createdon,modifiedon"})
