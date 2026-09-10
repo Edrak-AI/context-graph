@@ -1,4 +1,4 @@
-"""``POST /api/v1/connectors/internal/{id}/notify`` — auth, lookup, coalescing, event shape."""
+"""``/internal/{id}/notify`` and ``/internal/notify-by-resource`` — auth, lookup, coalescing, event shape."""
 
 from __future__ import annotations
 
@@ -52,6 +52,12 @@ class FakeKv:
         self.keys[key] = value
         return True
 
+    async def get_key(self, key: str) -> object:
+        return self.keys.get(key)
+
+    async def delete_key(self, key: str) -> bool:
+        return self.keys.pop(key, None) is not None
+
 
 class Harness:
     def __init__(self, document: dict[str, Any] | None, *, delay_s: float = 5.0) -> None:
@@ -94,6 +100,9 @@ class Harness:
 
 
 ACTIVE_DOC = {"_key": CONNECTOR_ID, "type": "Microsoft Teams", "orgId": "org-1", "isActive": True, "isAuthenticated": True}
+GMAIL_DOC = {"_key": CONNECTOR_ID, "type": "Gmail", "orgId": "org-1", "isActive": True, "isAuthenticated": True}
+MAILBOX = "Ali@Edrak.com"
+INDEX_KEY = "cgraph:watch:gmail:ali@edrak.com"
 
 
 @pytest.fixture
@@ -171,6 +180,81 @@ class TestNotifyRoute:
             assert _post(client, _token(), body={"source": "slack", "events": []}).status_code == 400
             assert _post(client, _token(), body=b"not json").status_code == 400
         assert not h.kv.keys
+
+    def test_google_drive_source_is_accepted(self, run_route: Callable[..., Harness]) -> None:
+        h = run_route({**ACTIVE_DOC, "type": "Google Drive"})
+        with TestClient(h.app) as client:
+            response = _post(client, _token(), body={"source": "google-drive", "events": [{"resource": "changes", "changeType": "change"}]})
+            assert (response.status_code, response.json()) == (202, {"accepted": True, "scheduled": True})
+            assert _post(client, _token(), body={"source": "gmail", "events": []}).json()["scheduled"] is False
+            client.portal.call(h.scheduler.cancel_all)
+        assert list(h.kv.keys) == [f"cgraph:notify:{CONNECTOR_ID}"]
+
+
+def _post_resource(client: TestClient, token: str | None, body: object = None) -> httpx.Response:
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    payload = body if body is not None else {"source": "gmail", "resourceKey": MAILBOX, "events": [{"resource": "history", "changeType": "778899", "recordId": None}]}
+    return client.post("/api/v1/connectors/internal/notify-by-resource", headers=headers, json=payload)
+
+
+class TestNotifyByResourceRoute:
+    def test_mailbox_resolves_through_reverse_index(self, run_route: Callable[..., Harness]) -> None:
+        h = run_route(GMAIL_DOC)
+        h.kv.keys[INDEX_KEY] = [CONNECTOR_ID, "deleted-connector"]  # the second id no longer resolves
+        with TestClient(h.app) as client:
+            first = _post_resource(client, _token())
+            second = _post_resource(client, _token())
+            assert (first.status_code, first.json()) == (202, {"accepted": True, "connectors": 1, "scheduled": 1})
+            assert (second.status_code, second.json()) == (202, {"accepted": True, "connectors": 1, "scheduled": 0})
+            assert h.scheduler.is_pending(CONNECTOR_ID)
+            client.portal.call(h.scheduler.cancel_all)
+        assert f"cgraph:notify:{CONNECTOR_ID}" in h.kv.keys
+
+    def test_scheduled_event_is_incremental_gmail_resync(self, run_route: Callable[..., Harness]) -> None:
+        h = run_route(GMAIL_DOC, delay_s=0.01)
+        h.kv.keys[INDEX_KEY] = [CONNECTOR_ID]
+        with TestClient(h.app) as client:
+            assert _post_resource(client, _token()).json()["scheduled"] == 1
+
+            async def wait_published() -> None:
+                for _ in range(200):
+                    if h.published:
+                        return
+                    await asyncio.sleep(0.01)
+                raise AssertionError("event not published")
+
+            client.portal.call(wait_published)
+        topic, event = h.published[0]
+        assert topic == "sync-events"
+        assert event["eventType"] == "gmail.resync"
+        assert event["payload"]["connectorId"] == CONNECTOR_ID
+        assert event["payload"]["incremental"] is True
+        assert event["payload"]["source"] == "gmail"
+
+    def test_unknown_mailbox_is_202_with_zero_connectors(self, run_route: Callable[..., Harness]) -> None:
+        h = run_route(GMAIL_DOC)
+        with TestClient(h.app) as client:
+            response = _post_resource(client, _token())
+            assert (response.status_code, response.json()) == (202, {"accepted": True, "connectors": 0, "scheduled": 0})
+        assert h.published == [] and not h.kv.keys
+
+    def test_inactive_connector_counts_as_none(self, run_route: Callable[..., Harness]) -> None:
+        h = run_route({**GMAIL_DOC, "isActive": False})
+        h.kv.keys[INDEX_KEY] = [CONNECTOR_ID]
+        with TestClient(h.app) as client:
+            assert _post_resource(client, _token()).json() == {"accepted": True, "connectors": 0, "scheduled": 0}
+
+    def test_bad_token_is_401_and_bad_body_400(self, run_route: Callable[..., Harness]) -> None:
+        h = run_route(GMAIL_DOC)
+        h.kv.keys[INDEX_KEY] = [CONNECTOR_ID]
+        with TestClient(h.app) as client:
+            assert _post_resource(client, None).status_code == 401
+            assert _post_resource(client, _token(secret="wrong")).status_code == 401
+            assert _post_resource(client, _token(scopes=["record:content"])).status_code == 401
+            assert _post_resource(client, _token(secret="user-secret")).status_code == 401
+            assert _post_resource(client, _token(), body={"source": "graph", "resourceKey": MAILBOX}).status_code == 400
+            assert _post_resource(client, _token(), body={"source": "gmail", "resourceKey": ""}).status_code == 400
+        assert h.published == [] and list(h.kv.keys) == [INDEX_KEY]
 
 
 class TestScheduler:

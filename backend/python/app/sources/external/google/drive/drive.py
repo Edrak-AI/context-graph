@@ -276,7 +276,8 @@ class GoogleDriveDataSource:
         supportsTeamDrives: Optional[bool] = None,
         teamDriveId: Optional[str] = None,
         includePermissionsForView: Optional[str] = None,
-        includeLabels: Optional[str] = None
+        includeLabels: Optional[str] = None,
+        body: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """Google Drive API: Subscribes to changes for a user. For more information, see [Notifications for resource changes](https://developers.google.com/workspace/drive/api/guides/push).
 
@@ -330,6 +331,8 @@ class GoogleDriveDataSource:
             kwargs['includePermissionsForView'] = includePermissionsForView
         if includeLabels is not None:
             kwargs['includeLabels'] = includeLabels
+        if body is not None:
+            kwargs['body'] = body
 
         # Handle request body if needed
         if 'body' in kwargs:
@@ -339,16 +342,20 @@ class GoogleDriveDataSource:
             request = self.client.changes().watch(**kwargs) # type: ignore
         return await self._execute(request)
 
-    async def channels_stop(self) -> Dict[str, Any]:
+    async def channels_stop(self, body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Google Drive API: Stops watching resources through this channel. For more information, see [Notifications for resource changes](https://developers.google.com/workspace/drive/api/guides/push).
 
         HTTP POST channels/stop
+
+        Args:
+            body (dict, optional): Channel resource (``id`` and ``resourceId``) to stop.
 
         Returns:
             Dict[str, Any]: API response
         """
         kwargs = {}
-        # No parameters for this method
+        if body is not None:
+            kwargs['body'] = body
 
         # Handle request body if needed
         if 'body' in kwargs:

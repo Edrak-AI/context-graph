@@ -1292,10 +1292,41 @@ export function createConnectorRouter(
   );
 
   /**
+   * POST /internal/notify-by-resource
+   * Edrak Layer 2: Gmail Pub/Sub messages name a mailbox, not a connector;
+   * the Python service resolves the connectors through its reverse index.
+   * Registered before the parameterised route so ":connectorId" cannot
+   * capture "notify-by-resource". Scoped service token, forwarded verbatim.
+   */
+  router.post(
+    '/internal/notify-by-resource',
+    authMiddleware.scopedTokenValidator(TokenScopes.CONNECTOR_NOTIFY),
+    async (
+      req: AuthenticatedServiceRequest,
+      res: Response,
+      next: NextFunction,
+    ): Promise<void> => {
+      try {
+        const authorization = req.headers.authorization ?? '';
+        const response = await executeConnectorCommand(
+          `${config.connectorBackend}/api/v1/connectors/internal/notify-by-resource`,
+          HttpMethod.POST,
+          authorization === '' ? {} : { authorization },
+          req.body,
+        );
+        res.status(response.statusCode).json(response.data ?? {});
+      } catch (error) {
+        next(error);
+      }
+    },
+  );
+
+  /**
    * POST /internal/:connectorId/notify
-   * Edrak Layer 2: edrak-ai (public receiver) forwards Microsoft change
-   * notifications here; the Python connectors service coalesces them into one
-   * incremental sync. Scoped service token, no user — forwarded verbatim.
+   * Edrak Layer 2: edrak-ai (public receiver) forwards Microsoft and Google
+   * Drive change notifications here; the Python connectors service coalesces
+   * them into one incremental sync. Scoped service token, no user — forwarded
+   * verbatim.
    */
   router.post(
     '/internal/:connectorId/notify',

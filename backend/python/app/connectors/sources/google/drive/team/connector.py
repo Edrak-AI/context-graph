@@ -67,6 +67,12 @@ from app.connectors.sources.google.common.drive_file_fields import (
     DRIVE_WORKSPACE_SYNC_FILE_RESOURCE_FIELDS,
     DRIVE_WORKSPACE_SYNC_FILES_LIST_FIELDS,
 )
+from app.connectors.sources.google.common.push_notifications import (
+    DataSourceDriveTransport,
+    DriveWatchTarget,
+    remove_drive_channels,
+    sync_drive_channels,
+)
 from app.connectors.sources.google.common.impersonation import (
     get_impersonation_candidates,
     is_delegation_error,
@@ -314,6 +320,8 @@ class GoogleDriveTeamConnector(BaseConnector):
 
         # Store synced users for use in batch processing
         self.synced_users: List[AppUser] = []
+        # Users whose Drive sync succeeded this run; their push channels get (re)issued afterwards.
+        self._push_users: Dict[str, AppUser] = {}
         self.synced_user_emails: set[str] = set() # to filter out non workspace emails during shared drive file share processing
 
     async def init(self) -> bool:
@@ -435,6 +443,7 @@ class GoogleDriveTeamConnector(BaseConnector):
             self._blocked_folder_ids = set()
             self._tracked_folder_ids = set(self._folder_seed_ids)
             self._synced_drive_ids = set()
+            self._push_users = {}
             if self._folder_seed_ids:
                 self.logger.info(
                     f"📁 Folder filter active with {len(self._folder_seed_ids)} seed folder(s)"
@@ -469,6 +478,7 @@ class GoogleDriveTeamConnector(BaseConnector):
             await self._process_users_in_batches(self.synced_users)
 
             self.logger.info("Google Drive enterprise connector sync completed successfully")
+            await self._sync_change_notifications()
 
         except Exception as e:
             self.logger.error(f"❌ Error in Google Drive enterprise connector run: {e}", exc_info=True)
@@ -2158,13 +2168,16 @@ class GoogleDriveTeamConnector(BaseConnector):
 
     async def _build_user_drive_data_source(self, user: AppUser) -> GoogleDriveDataSource:
         """Build a Drive data source that impersonates the given workspace user."""
+        return await self._build_drive_data_source_for_email(user.email)
+
+    async def _build_drive_data_source_for_email(self, user_email: str) -> GoogleDriveDataSource:
         user_drive_client = await GoogleClient.build_from_services(
             service_name="drive",
             logger=self.logger,
             config_service=self.config_service,
             is_individual=False,  # Enterprise connector
             version="v3",
-            user_email=user.email,  # Impersonate this user
+            user_email=user_email,  # Impersonate this user
             connector_instance_id=self.connector_id
         )
 
@@ -2282,6 +2295,8 @@ class GoogleDriveTeamConnector(BaseConnector):
             )
 
             self.logger.info(f"Completed Google Drive sync for user {user.email}")
+            if user.email:
+                self._push_users[user.email.lower()] = user
 
         except Exception as ex:
             self.logger.error(f"❌ Error in Google Drive sync for user {user.email}: {ex}", exc_info=True)
@@ -3657,8 +3672,40 @@ class GoogleDriveTeamConnector(BaseConnector):
             )
 
     async def run_incremental_sync(self) -> None:
-        """Run incremental sync for Google Drive enterprise."""
-        raise NotImplementedError("run_incremental_sync is not yet implemented for Google Drive enterprise")
+        """Same entry point: run_sync already walks changes.list per user once a page token exists."""
+        self.logger.info("Starting incremental sync for Google Drive enterprise")
+        await self.run_sync()
+
+    def _drive_push_transport(self) -> DataSourceDriveTransport:
+        return DataSourceDriveTransport(self._build_drive_data_source_for_email)
+
+    async def _sync_change_notifications(self) -> None:
+        """One Drive push channel per user this run synced, on that user's changes feed (never raises)."""
+        users = list(self._push_users.values())
+        self._push_users = {}
+        targets: List[DriveWatchTarget] = []
+        for user in users:
+            sync_point_key = generate_record_sync_point_key(RecordType.DRIVE.value, "users", user.source_user_id)
+            sync_point = await self.drive_delta_sync_point.read_sync_point(sync_point_key)
+            page_token = sync_point.get("pageToken") if sync_point else None
+            if page_token and user.email:
+                targets.append(DriveWatchTarget(user.email, page_token))
+        await sync_drive_channels(
+            config_service=self.config_service,
+            connector_id=self.connector_id,
+            sync_point=self.drive_delta_sync_point,
+            transport=self._drive_push_transport(),
+            targets=targets,
+            logger=self.logger,
+        )
+
+    async def remove_change_notifications(self) -> None:
+        await remove_drive_channels(
+            connector_id=self.connector_id,
+            sync_point=self.drive_delta_sync_point,
+            transport=self._drive_push_transport(),
+            logger=self.logger,
+        )
 
     def handle_webhook_notification(self, notification: Dict) -> None:
         """Handle webhook notifications from Google Drive."""

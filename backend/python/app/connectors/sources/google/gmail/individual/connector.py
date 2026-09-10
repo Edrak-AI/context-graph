@@ -64,6 +64,11 @@ from app.connectors.sources.google.common.connector_google_exceptions import (
 from app.connectors.sources.google.common.datasource_refresh import (
     refresh_google_datasource_credentials,
 )
+from app.connectors.sources.google.common.push_notifications import (
+    DataSourceGmailTransport,
+    remove_gmail_watches,
+    sync_gmail_watches,
+)
 from app.connectors.sources.google.common.gmail_received_date_query import (
     build_gmail_received_date_threads_query,
 )
@@ -2414,9 +2419,39 @@ class GoogleGmailIndividualConnector(BaseConnector):
             await self._sync_user_mailbox()
 
             self.logger.info("Sync completed for Google Gmail Individual")
+            await self._sync_change_notifications(user_email)
         except Exception as e:
             self.logger.error(f"❌ Error during sync: {e}", exc_info=True)
             raise
+
+    def _gmail_push_transport(self) -> DataSourceGmailTransport:
+        async def datasource_for(_user_email: str) -> GoogleGmailDataSource:
+            await self._get_fresh_datasource()
+            if self.gmail_data_source is None:
+                raise RuntimeError("Google Gmail connector not initialised")
+            return self.gmail_data_source
+
+        return DataSourceGmailTransport(datasource_for)
+
+    async def _sync_change_notifications(self, user_email: str) -> None:
+        """users.watch on the mailbox, publishing to GOOGLE_PUBSUB_TOPIC (never raises)."""
+        await sync_gmail_watches(
+            config_service=self.config_service,
+            connector_id=self.connector_id,
+            sync_point=self.gmail_delta_sync_point,
+            transport=self._gmail_push_transport(),
+            emails=[user_email],
+            logger=self.logger,
+        )
+
+    async def remove_change_notifications(self) -> None:
+        await remove_gmail_watches(
+            config_service=self.config_service,
+            connector_id=self.connector_id,
+            sync_point=self.gmail_delta_sync_point,
+            transport=self._gmail_push_transport(),
+            logger=self.logger,
+        )
 
     async def run_incremental_sync(self) -> None:
         """Run incremental sync for Google Gmail."""

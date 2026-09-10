@@ -62,6 +62,12 @@ from app.connectors.sources.google.common.connector_google_exceptions import (
 from app.connectors.sources.google.common.datasource_refresh import (
     refresh_google_datasource_credentials,
 )
+from app.connectors.sources.google.common.push_notifications import (
+    DataSourceDriveTransport,
+    DriveWatchTarget,
+    remove_drive_channels,
+    sync_drive_channels,
+)
 from app.connectors.sources.google.common.drive_file_fields import (
     DRIVE_PERSONAL_SYNC_FILE_RESOURCE_FIELDS,
     DRIVE_PERSONAL_SYNC_FILES_LIST_FIELDS,
@@ -92,6 +98,8 @@ from app.sources.client.google.google import GoogleClient
 from app.sources.external.google.drive.drive import GoogleDriveDataSource
 from app.utils.streaming import create_stream_record_response
 from app.utils.time_conversion import get_epoch_timestamp_in_ms, parse_timestamp
+
+PERSONAL_DRIVE_SYNC_POINT_KEY = "personal_drive"
 
 if TYPE_CHECKING:
     from app.connectors.core.thread_pool import ThreadPoolLease
@@ -1049,7 +1057,7 @@ class GoogleDriveIndividualConnector(BaseConnector):
             self.logger.error("Failed to get user information")
             return
 
-        sync_point_key = "personal_drive"
+        sync_point_key = PERSONAL_DRIVE_SYNC_POINT_KEY
         org_id = self.data_entities_processor.org_id
 
         # Resolve the folder scope on every sync (full and incremental) so new and
@@ -1864,10 +1872,46 @@ class GoogleDriveIndividualConnector(BaseConnector):
         await self._sync_user_personal_drive(drive_id=drive_id)
 
         self.logger.info("Sync completed for Google Drive Individual")
+        await self._sync_change_notifications(user_about.get('user', {}).get('emailAddress'))
 
     async def run_incremental_sync(self) -> None:
-        """Run incremental sync for Google Drive."""
-        self.logger.info("run_incremental_sync not implemented for Google Drive")
+        """Same entry point: run_sync already walks changes.list once a page token exists."""
+        self.logger.info("Starting incremental sync for Google Drive Individual")
+        await self.run_sync()
+
+    def _drive_push_transport(self) -> DataSourceDriveTransport:
+        async def datasource_for(_user_email: str) -> GoogleDriveDataSource:
+            await self._get_fresh_datasource()
+            if self.drive_data_source is None:
+                raise RuntimeError("Google Drive connector not initialised")
+            return self.drive_data_source
+
+        return DataSourceDriveTransport(datasource_for)
+
+    async def _sync_change_notifications(self, user_email: Optional[str]) -> None:
+        """One Drive push channel on the user's changes feed (never raises)."""
+        if not user_email:
+            return
+        sync_point = await self.drive_delta_sync_point.read_sync_point(PERSONAL_DRIVE_SYNC_POINT_KEY)
+        page_token = sync_point.get("pageToken") if sync_point else None
+        if not page_token:
+            return
+        await sync_drive_channels(
+            config_service=self.config_service,
+            connector_id=self.connector_id,
+            sync_point=self.drive_delta_sync_point,
+            transport=self._drive_push_transport(),
+            targets=[DriveWatchTarget(user_email, page_token)],
+            logger=self.logger,
+        )
+
+    async def remove_change_notifications(self) -> None:
+        await remove_drive_channels(
+            connector_id=self.connector_id,
+            sync_point=self.drive_delta_sync_point,
+            transport=self._drive_push_transport(),
+            logger=self.logger,
+        )
 
     def handle_webhook_notification(self, notification: Dict) -> None:
         """Handle webhook notifications from Google Drive."""

@@ -67,6 +67,11 @@ from app.connectors.sources.google.common.apps import GmailTeamApp
 from app.connectors.sources.google.common.gmail_received_date_query import (
     build_gmail_received_date_threads_query,
 )
+from app.connectors.sources.google.common.push_notifications import (
+    DataSourceGmailTransport,
+    remove_gmail_watches,
+    sync_gmail_watches,
+)
 from app.connectors.sources.google.common.impersonation import (
     get_impersonation_candidates,
     is_delegation_error,
@@ -258,6 +263,8 @@ class GoogleGmailTeamConnector(BaseConnector):
         # Store synced users for use in batch processing
         self.synced_users: List[AppUser] = []
         self.synced_user_emails: set[str] = set()  # confirmed workspace members, used to prioritize impersonation candidates
+        # Mailboxes whose sync succeeded this run; their Gmail watches get (re)issued afterwards.
+        self._push_mailboxes: set[str] = set()
 
     async def init(self) -> bool:
         """Initialize the Google Gmail workspace connector with service account credentials and services."""
@@ -949,6 +956,7 @@ class GoogleGmailTeamConnector(BaseConnector):
             else:
                 self.logger.info(f"No history ID found for user {user_email}, performing full sync")
                 await self._run_full_sync(user_email, user_gmail_datasource, sync_point_key)
+            self._push_mailboxes.add(user_email)
 
         except Exception as ex:
             self.logger.error(f"❌ Error in sync for user {user_email}: {ex}")
@@ -1908,6 +1916,7 @@ class GoogleGmailTeamConnector(BaseConnector):
             self.sync_filters, self.indexing_filters = await load_connector_filters(
                 self.config_service, "gmail", self.connector_id, self.logger
             )
+            self._push_mailboxes = set()
 
             # Step 1: Sync users
             self.logger.info("Syncing users...")
@@ -1927,6 +1936,7 @@ class GoogleGmailTeamConnector(BaseConnector):
             await self._process_users_in_batches(self.synced_users)
 
             self.logger.info("Google Gmail workspace connector sync completed successfully")
+            await self._sync_change_notifications()
 
         except Exception as e:
             self.logger.error(f"❌ Error in Google Gmail workspace connector run: {e}", exc_info=True)
@@ -2961,6 +2971,31 @@ class GoogleGmailTeamConnector(BaseConnector):
         """Run incremental sync for Google Gmail workspace."""
         self.logger.info("Running incremental sync for Google Gmail workspace")
         await self.run_sync()
+
+    def _gmail_push_transport(self) -> DataSourceGmailTransport:
+        return DataSourceGmailTransport(self._create_user_gmail_client)
+
+    async def _sync_change_notifications(self) -> None:
+        """users.watch per mailbox this run synced, publishing to GOOGLE_PUBSUB_TOPIC (never raises)."""
+        mailboxes = sorted(self._push_mailboxes)
+        self._push_mailboxes = set()
+        await sync_gmail_watches(
+            config_service=self.config_service,
+            connector_id=self.connector_id,
+            sync_point=self.gmail_delta_sync_point,
+            transport=self._gmail_push_transport(),
+            emails=mailboxes,
+            logger=self.logger,
+        )
+
+    async def remove_change_notifications(self) -> None:
+        await remove_gmail_watches(
+            config_service=self.config_service,
+            connector_id=self.connector_id,
+            sync_point=self.gmail_delta_sync_point,
+            transport=self._gmail_push_transport(),
+            logger=self.logger,
+        )
 
 
     def handle_webhook_notification(self, notification: Dict) -> None:

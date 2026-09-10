@@ -31,11 +31,14 @@ from urllib.parse import quote
 import httpx
 
 from app.config.constants.service import config_node_constants
+from app.connectors.core.base.webhooks.subscription_store import (
+    SubscriptionStore as _SubscriptionStore,
+)
+from app.connectors.core.base.webhooks.subscription_store import SyncPointLike
 
 if TYPE_CHECKING:
     from logging import Logger
 
-WEBHOOKS_SYNC_POINT_KEY = "webhooks"
 CLIENT_STATE_PREFIX = "ms-webhook:"
 CLIENT_STATE_LENGTH = 40
 GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0"
@@ -177,35 +180,19 @@ class Registration:
         )
 
 
-class SyncPointLike(Protocol):
-    async def read_sync_point(self, sync_point_key: str) -> dict[str, Any]: ...
-
-    async def update_sync_point(self, sync_point_key: str, sync_point_data: dict[str, Any]) -> object: ...
-
-
 class ConfigServiceLike(Protocol):
     async def get_config(self, key: str) -> object: ...
 
 
-class SubscriptionStore:
+class SubscriptionStore(_SubscriptionStore):
     """Registrations of one connector, persisted in its sync point under ``webhooks``."""
 
-    def __init__(self, sync_point: SyncPointLike, key: str = WEBHOOKS_SYNC_POINT_KEY) -> None:
-        self._sync_point = sync_point
-        self._key = key
-
     async def load(self) -> list[Registration]:
-        point = await self._sync_point.read_sync_point(self._key)
-        rows = point.get(WEBHOOKS_SYNC_POINT_KEY) if isinstance(point, dict) else None
-        if not isinstance(rows, list):
-            return []
-        loaded = [Registration.from_dict(row) for row in rows]
+        loaded = [Registration.from_dict(row) for row in await self.load_rows()]
         return [reg for reg in loaded if reg is not None]
 
     async def save(self, registrations: list[Registration]) -> None:
-        await self._sync_point.update_sync_point(
-            self._key, {WEBHOOKS_SYNC_POINT_KEY: [reg.to_dict() for reg in registrations]}
-        )
+        await self.save_rows([reg.to_dict() for reg in registrations])
 
 
 @dataclass(frozen=True)

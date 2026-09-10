@@ -37191,11 +37191,11 @@ paths:
     post:
       tags:
         - Connectors
-      summary: Forward a Microsoft change notification to a connector (internal)
+      summary: Forward a change notification to a connector (internal)
       description: |
         <b>Internal service-to-service endpoint (Edrak).</b> The public receiver in
-        edrak-ai posts Microsoft Graph / Dataverse / Business Central change
-        notifications here. Notifications for one connector are coalesced (Redis key
+        edrak-ai posts Microsoft Graph / Dataverse / Business Central and Google
+        Drive change notifications here. Notifications for one connector are coalesced (Redis key
         <code>cgraph:notify:{connectorId}</code>, ~25 s window) into a single
         incremental sync scheduled about 10 s later; <code>scheduled</code> is
         <code>false</code> when the call joined an already-pending run.<br><br>
@@ -37223,7 +37223,7 @@ paths:
               properties:
                 source:
                   type: string
-                  enum: [graph, dataverse, bc]
+                  enum: [graph, dataverse, bc, google-drive, gmail]
                 events:
                   type: array
                   items:
@@ -37267,6 +37267,79 @@ paths:
           description: Missing, invalid or wrongly scoped token
         '404':
           description: Connector does not exist or is inactive
+  /connectors/internal/notify-by-resource:
+    post:
+      tags:
+        - Connectors
+      summary: Forward a resource-keyed change notification (internal)
+      description: |
+        <b>Internal service-to-service endpoint (Edrak).</b> Gmail push notifications
+        arrive through Cloud Pub/Sub and carry only <code>{ emailAddress, historyId }</code>,
+        so edrak-ai posts them here keyed by mailbox. The connectors service resolves the
+        connector instances watching that mailbox through its reverse index
+        (<code>cgraph:watch:gmail:&lt;email&gt;</code>) and schedules each one exactly like
+        <code>/connectors/internal/{connectorId}/notify</code> (same coalescing).<br><br>
+
+        Always <code>202</code> for a well-formed, authenticated request — an unknown mailbox
+        answers <code>connectors: 0</code> — because Pub/Sub retries any non-2xx.<br><br>
+
+        <b>Auth:</b> HS256 JWT signed with the scoped JWT secret, claims
+        <code>{ "scopes": ["connector:notify"], "issuer": "edrak-ai", "iat", "exp" }</code>.
+        Not intended for end-user clients.
+      operationId: notifyResourceChange
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - source
+                - resourceKey
+              properties:
+                source:
+                  type: string
+                  enum: [gmail]
+                resourceKey:
+                  type: string
+                  description: The mailbox address from the Pub/Sub message (case-insensitive)
+                events:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      resource:
+                        type: string
+                        nullable: true
+                      changeType:
+                        type: string
+                        nullable: true
+                      recordId:
+                        type: string
+                        nullable: true
+      responses:
+        '202':
+          description: Notification accepted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  accepted:
+                    type: boolean
+                    example: true
+                  connectors:
+                    type: integer
+                    description: Active connector instances watching this mailbox
+                  scheduled:
+                    type: integer
+                    description: How many of them got a new run scheduled (others were coalesced)
+        '400':
+          description: Malformed body
+        '401':
+          description: Missing, invalid or wrongly scoped token
   /connectors/internal/all-scheduled:
     get:
       tags:
