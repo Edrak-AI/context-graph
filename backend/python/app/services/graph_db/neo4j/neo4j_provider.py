@@ -77,7 +77,11 @@ from app.models.entities import (
 from app.models.permission import EntityType
 from app.schema.node_schema_registry import NODE_SCHEMA_REGISTRY, get_required_fields
 from app.schema.node_validator import NodeSchemaValidator
-from app.services.graph_db.common.utils import build_connector_stats_response, dedupe_agents_by_id
+from app.services.graph_db.common.utils import (
+    alternate_email_matches,
+    build_connector_stats_response,
+    dedupe_agents_by_id,
+)
 from app.services.graph_db.interface.graph_db_provider import (
     IGraphDBProvider,
     _distinct_connector_types,
@@ -93,6 +97,14 @@ from app.utils.time_conversion import get_epoch_timestamp_in_ms
 MAX_REINDEX_DEPTH = 100  # Maximum depth for reindexing records (unlimited depth is capped at this value)
 EDGE_DELETE_BATCH_SIZE = 2000  # Batch size for edge deletion to avoid huge single-query transactions
 
+
+
+def _user_email_match(alias: str) -> str:
+    """Cypher predicate: `$email` is the node's primary e-mail or one of its alternate e-mails."""
+    return (
+        f"(toLower({alias}.email) = toLower($email) "
+        f"OR toLower($email) IN [x IN coalesce({alias}.alternateEmails, []) | toLower(x)])"
+    )
 
 class Neo4jProvider(IGraphDBProvider):
     """
@@ -3093,22 +3105,32 @@ class Neo4jProvider(IGraphDBProvider):
     async def get_user_by_email(
         self,
         email: str,
-        transaction: str | None = None
+        transaction: str | None = None,
+        org_id: str | None = None,
     ) -> User | None:
-        """Get user by email"""
+        """Get user by email, optionally restricted to one org"""
         try:
-            query = """
+            org_filter = " AND u.orgId = $org_id" if org_id else ""
+            query = f"""
             MATCH (u:User)
-            WHERE toLower(u.email) = toLower($email)
+            WHERE {_user_email_match("u")}{org_filter}
             RETURN u
-            LIMIT 1
+            ORDER BY CASE WHEN toLower(u.email) = toLower($email) THEN 0 ELSE 1 END
+            LIMIT 2
             """
+            parameters: dict[str, str] = {"email": email}
+            if org_id:
+                parameters["org_id"] = org_id
 
             results = await self.client.execute_query(
                 query,
-                parameters={"email": email},
+                parameters=parameters,
                 txn_id=transaction
             )
+
+            if results and len(results) > 1:
+                # Node enforces alternate-e-mail uniqueness per org; more than one hit means stale graph data.
+                self.logger.warning(f"⚠️ {len(results)} users match e-mail {email}; using the primary-address match")
 
             if results:
                 user_dict = dict(results[0]["u"])
@@ -3254,12 +3276,13 @@ class Neo4jProvider(IGraphDBProvider):
     ) -> AppUser | None:
         """Get app user by email"""
         try:
-            query = """
-            MATCH (app:App {id: $connector_id})
+            query = f"""
+            MATCH (app:App {{id: $connector_id}})
             MATCH (u:User)
-            WHERE toLower(u.email) = toLower($email)
+            WHERE {_user_email_match("u")}
             MATCH (u)-[r:USER_APP_RELATION]->(app)
             RETURN u, r.sourceUserId AS sourceUserId
+            ORDER BY CASE WHEN toLower(u.email) = toLower($email) THEN 0 ELSE 1 END
             LIMIT 1
             """
 
@@ -5968,11 +5991,14 @@ class Neo4jProvider(IGraphDBProvider):
             if not users:
                 return
 
-            # Get org_id
-            orgs = await self.get_all_orgs(transaction=transaction)
-            if not orgs:
-                raise Exception("No organizations found in the database")
-            org_id = orgs[0].get("id") or orgs[0].get("_key")
+            # Connectors that predate AppUser.org_id leave it empty; only a single-org install may fill it in.
+            default_org_id: str | None = None
+            if any(not user.org_id for user in users):
+                orgs = await self.get_all_orgs(transaction=transaction)
+                if not orgs:
+                    raise Exception("No organizations found in the database")
+                if len(orgs) == 1:
+                    default_org_id = orgs[0].get("id") or orgs[0].get("_key")
             connector_id = users[0].connector_id
 
             # Get or create app
@@ -5991,8 +6017,15 @@ class Neo4jProvider(IGraphDBProvider):
                 )
 
             for user in users:
-                # Check if user exists
-                user_record = await self.get_user_by_email(user.email, transaction)
+                org_id = user.org_id or default_org_id
+                if not org_id:
+                    self.logger.warning(
+                        f"Skipping app user {user.email} ({connector_id}): no org_id and multiple orgs exist"
+                    )
+                    continue
+
+                # Check if user exists in this org
+                user_record = await self.get_user_by_email(user.email, transaction, org_id=org_id)
 
                 if not user_record:
                     # Create new user
@@ -6007,7 +6040,7 @@ class Neo4jProvider(IGraphDBProvider):
                         transaction=transaction
                     )
 
-                    user_record = await self.get_user_by_email(user.email, transaction)
+                    user_record = await self.get_user_by_email(user.email, transaction, org_id=org_id)
 
                     # Create org relation
                     user_org_edge = {
@@ -6442,11 +6475,12 @@ class Neo4jProvider(IGraphDBProvider):
     ) -> str | None:
         """Get entity ID (user or group) by email"""
         try:
-            query = """
+            query = f"""
             MATCH (n)
             WHERE (n:User OR n:Group OR n:Person)
-            AND toLower(n.email) = toLower($email)
+            AND {_user_email_match("n")}
             RETURN n.id AS id
+            ORDER BY CASE WHEN toLower(n.email) = toLower($email) THEN 0 ELSE 1 END
             LIMIT 1
             """
 
@@ -6477,8 +6511,9 @@ class Neo4jProvider(IGraphDBProvider):
             query = """
             MATCH (n)
             WHERE (n:User OR n:Group OR n:Person)
-            AND toLower(n.email) IN [e IN $emails | toLower(e)]
-            RETURN n.email AS email, n.id AS id, labels(n) AS labels
+            AND (toLower(n.email) IN [e IN $emails | toLower(e)]
+                 OR any(x IN coalesce(n.alternateEmails, []) WHERE toLower(x) IN [e IN $emails | toLower(e)]))
+            RETURN n.email AS email, n.alternateEmails AS alternateEmails, n.id AS id, labels(n) AS labels
             """
 
             results = await self.client.execute_query(
@@ -6488,6 +6523,7 @@ class Neo4jProvider(IGraphDBProvider):
             )
 
             result_map = {}
+            alternate_hits: list[tuple[str, tuple[str, str, str]]] = []
             for r in results:
                 email = r["email"]
                 entity_id = r["id"]
@@ -6506,8 +6542,18 @@ class Neo4jProvider(IGraphDBProvider):
                     collection_name = CollectionNames.PEOPLE.value
                     permission_type = "USER"
 
-                if collection_name:
-                    result_map[email] = (entity_id, collection_name, permission_type)
+                if not collection_name:
+                    continue
+                entry = (entity_id, collection_name, permission_type)
+                result_map[email] = entry
+                alternate_hits.extend(
+                    (requested, entry)
+                    for requested in alternate_email_matches(unique_emails, r.get("alternateEmails"))
+                )
+
+            # A primary-address match always wins over an alternate-address match.
+            for requested, entry in alternate_hits:
+                result_map.setdefault(requested, entry)
 
             return result_map
 

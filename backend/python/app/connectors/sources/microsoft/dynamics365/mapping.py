@@ -11,26 +11,40 @@ Permission model (how Dataverse security becomes CGraph permission edges)
 
 Dataverse decides whether a user can read a row from five sources.  The
 connector approximates each with an edge that ``DataSourceEntitiesProcessor``
-already understands (``USER`` by email, ``GROUP`` / ``ROLE`` by external id):
+already understands (``USER`` by email, ``GROUP`` / ``ROLE`` by external id).
+Security roles exist once per business unit (copies of a root role) and
+Dataverse evaluates the privileges of the *copy* a user holds, so every
+privilege-derived membership below is computed per copy and only counts users
+whose own copy carries the depth.  Disabled users (``isdisabled``) are upserted
+as inactive ``AppUser`` rows but never appear in a membership or as an owner.
 
 +--------------------------------------+----------------------------------------------+---------+
 | Dataverse source                     | CGraph principal                             | Role    |
 +======================================+==============================================+=========+
 | ``_owninguser_value`` (owner = user) | USER (systemuser -> email)                   | OWNER   |
 | ``_owningteam_value`` (owner = team) | GROUP ``team:<teamid>``                      | OWNER   |
-| ``_owningbusinessunit_value``        | GROUP ``bu:<businessunitid>`` (users in BU)  | READER  |
-| security role whose                  | ROLE ``role:<parentrootroleid>`` (all users  | READER  |
-| ``prvRead<Entity>`` depth == Global  | holding any BU copy of that role, directly   |         |
-|                                      | or through a team)                           |         |
-| ``System Administrator`` role        | ROLE (always granted, on every record)       | READER  |
+| ``_owningbusinessunit_value``        | GROUP ``bu:<businessunitid>:<entity>`` =     | READER  |
+|                                      | users whose home BU it is **and** who hold   |         |
+|                                      | (directly or through a team) a role copy     |         |
+|                                      | whose ``prvRead<Entity>`` depth is Local,    |         |
+|                                      | Deep or Global                               |         |
+| role copy whose ``prvRead<Entity>``  | GROUP ``globalread:<entity>`` = holders of   | READER  |
+| depth == Global                      | any such copy (directly or through a team)   |         |
+| ``System Administrator`` role        | ROLE ``role:<parentrootroleid>`` (always     | READER  |
+| (``roletemplateid`` 627090ff-…)      | granted, on every record)                    |         |
 | ``principalobjectaccess`` share      | USER / GROUP ``team:<id>`` per principal     | READER  |
 |                                      | (WRITER when the mask has the Write bit)     | /WRITER |
 +--------------------------------------+----------------------------------------------+---------+
 
+``role:<parentrootroleid>`` AppRoles (members = holders of any copy) and plain
+``bu:<businessunitid>`` / ``team:<teamid>`` groups are still synced so the
+directory mirrors Dataverse, but only the System Administrator role and the
+team groups carry permissions.
+
 Known approximations (documented gaps):
 
-* Business-unit *Deep* / *Local* read depth is collapsed to "members of the
-  owning BU can read" — child-BU depth (Deep) is not walked.
+* Business-unit *Deep* / *Local* read depth is collapsed to "read-privileged
+  members of the owning BU can read" — child-BU depth (Deep) is not walked.
 * *Basic* (user-level) depth is covered by the owner edge only.
 * Hierarchy security (manager / position) and field-level security are ignored.
 * Access teams are only honoured when they show up as ``principalobjectaccess``
@@ -76,6 +90,15 @@ ACCESS_SHARE = 262144
 ACCESS_ASSIGN = 524288
 
 PRIVILEGE_DEPTH_GLOBAL = "Global"
+PRIVILEGE_DEPTH_DEEP = "Deep"
+PRIVILEGE_DEPTH_LOCAL = "Local"
+PRIVILEGE_DEPTH_BASIC = "Basic"
+_PRIVILEGE_DEPTH_RANK = {PRIVILEGE_DEPTH_BASIC: 1, PRIVILEGE_DEPTH_LOCAL: 2, PRIVILEGE_DEPTH_DEEP: 3, PRIVILEGE_DEPTH_GLOBAL: 4}
+# Depths at which a role lets its holder read rows owned by (at least) their own business unit.
+BU_READ_DEPTHS = frozenset({PRIVILEGE_DEPTH_LOCAL, PRIVILEGE_DEPTH_DEEP, PRIVILEGE_DEPTH_GLOBAL})
+# Fixed template id of the built-in System Administrator role; the display name is localisable
+# and a custom role may reuse it, so the name is only a fallback for payloads without the field.
+SYSTEM_ADMINISTRATOR_ROLE_TEMPLATE_ID = "627090ff-40a3-4053-8790-584edc5be201"
 SYSTEM_ADMINISTRATOR_ROLE_NAME = "System Administrator"
 
 # statecode values shared by opportunity / incident / lead
@@ -88,6 +111,7 @@ ENTITIES_FILTER_KEY = "entities"
 # Prefixes keep GROUP / ROLE external ids unambiguous and greppable in the graph.
 TEAM_GROUP_PREFIX = "team:"
 BU_GROUP_PREFIX = "bu:"
+GLOBAL_READ_GROUP_PREFIX = "globalread:"
 ROLE_PREFIX = "role:"
 ATTACHMENT_ID_PREFIX = "annotation-file"
 
@@ -318,16 +342,74 @@ def read_privilege_name(spec: EntitySpec) -> str:
     return f"prvRead{spec.privilege_entity}"
 
 
-def role_has_global_read(role_privileges: Iterable[Mapping[str, Any]], spec: EntitySpec) -> bool:
-    """True when a ``RetrieveRolePrivilegesRole`` payload grants org-wide read on ``spec``.
+def role_read_depth(role_privileges: Iterable[Mapping[str, Any]], spec: EntitySpec) -> Optional[str]:
+    """Depth of ``prvRead<Entity>`` in a ``RetrieveRolePrivilegesRole`` payload, ``None`` when absent.
 
     Each item looks like ``{"PrivilegeName": "prvReadOpportunity", "Depth": "Global", ...}``.
     """
     wanted = read_privilege_name(spec)
+    best: Optional[str] = None
     for priv in role_privileges:
-        if str(priv.get("PrivilegeName") or "") == wanted and str(priv.get("Depth") or "") == PRIVILEGE_DEPTH_GLOBAL:
-            return True
-    return False
+        if str(priv.get("PrivilegeName") or "") != wanted:
+            continue
+        depth = str(priv.get("Depth") or "")
+        if _PRIVILEGE_DEPTH_RANK.get(depth, 0) > _PRIVILEGE_DEPTH_RANK.get(best or "", 0):
+            best = depth
+    return best
+
+
+def role_has_global_read(role_privileges: Iterable[Mapping[str, Any]], spec: EntitySpec) -> bool:
+    """True when the payload grants org-wide read on ``spec``."""
+    return role_read_depth(role_privileges, spec) == PRIVILEGE_DEPTH_GLOBAL
+
+
+def role_has_bu_read(role_privileges: Iterable[Mapping[str, Any]], spec: EntitySpec) -> bool:
+    """True when the payload lets the holder read rows owned by their business unit."""
+    return role_read_depth(role_privileges, spec) in BU_READ_DEPTHS
+
+
+def system_administrator_match(role_row: Mapping[str, Any]) -> Optional[str]:
+    """``"roletemplateid"`` / ``"name"`` when the role row is the System Administrator role, else ``None``.
+
+    The name is trusted only when the payload carries no ``roletemplateid`` field at all;
+    a present-but-null template id means a custom role, whatever it is called.
+    """
+    if "roletemplateid" in role_row:
+        template_id = str(role_row.get("roletemplateid") or "").lower()
+        return "roletemplateid" if template_id == SYSTEM_ADMINISTRATOR_ROLE_TEMPLATE_ID else None
+    return "name" if role_row.get("name") == SYSTEM_ADMINISTRATOR_ROLE_NAME else None
+
+
+@dataclass(frozen=True)
+class RoleCopy:
+    """One business-unit copy of a security role with the active users holding it
+    (directly or through a team) and its own ``RetrieveRolePrivilegesRole`` payload."""
+
+    role_id: str
+    holder_ids: frozenset[str]
+    privileges: tuple[Mapping[str, Any], ...] = ()
+
+
+@dataclass(frozen=True)
+class EntityReaders:
+    """Users whose role copies let them read one table (system user ids)."""
+
+    bu_read: frozenset[str]      # depth Local / Deep / Global -> readers of rows owned by their BU
+    global_read: frozenset[str]  # depth Global -> readers of every row
+
+
+def entity_readers(copies: Iterable[RoleCopy], spec: EntitySpec) -> EntityReaders:
+    """Evaluate ``prvRead<Entity>`` per role copy: only the holders of a copy that itself
+    carries the depth count, so a Global child copy never widens the root copy's holders."""
+    bu_read: set[str] = set()
+    global_read: set[str] = set()
+    for copy in copies:
+        depth = role_read_depth(copy.privileges, spec)
+        if depth in BU_READ_DEPTHS:
+            bu_read.update(copy.holder_ids)
+        if depth == PRIVILEGE_DEPTH_GLOBAL:
+            global_read.update(copy.holder_ids)
+    return EntityReaders(frozenset(bu_read), frozenset(global_read))
 
 
 # ---------------------------------------------------------------------------
@@ -341,6 +423,15 @@ def team_group_external_id(team_id: str) -> str:
 
 def bu_group_external_id(business_unit_id: str) -> str:
     return f"{BU_GROUP_PREFIX}{business_unit_id}"
+
+
+def bu_entity_group_external_id(business_unit_id: str, spec: EntitySpec) -> str:
+    """Read-privileged members of one business unit for one table."""
+    return f"{BU_GROUP_PREFIX}{business_unit_id}:{spec.logical_name}"
+
+
+def global_read_group_external_id(spec: EntitySpec) -> str:
+    return f"{GLOBAL_READ_GROUP_PREFIX}{spec.logical_name}"
 
 
 def role_external_id(role_row: Mapping[str, Any]) -> str:
@@ -608,28 +699,24 @@ class ShareEntry:
 class SecurityContext:
     """Everything derived from the security tables at the start of a sync."""
 
+    # active users only: a disabled owner or share target must not produce an edge
     user_email_by_id: dict[str, str] = field(default_factory=dict)
     known_team_ids: set[str] = field(default_factory=set)
     known_business_unit_ids: set[str] = field(default_factory=set)
-    # entity logical name -> role external ids (``role:<root>``) with Global read
-    global_read_roles_by_entity: dict[str, set[str]] = field(default_factory=dict)
     system_admin_role_id: Optional[str] = None
     # entity logical name -> object id -> shares
     shares_by_entity: dict[str, dict[str, list[ShareEntry]]] = field(default_factory=dict)
 
-    def entity_role_grants(self, spec: EntitySpec) -> list[PermissionGrant]:
-        """ROLE grants that apply to every row of ``spec`` (used for records
-        and for the entity's record group)."""
+    def entity_wide_grants(self, spec: EntitySpec) -> list[PermissionGrant]:
+        """Grants that apply to every row of ``spec`` (records and the entity's record
+        group): the System Administrator role and the per-table Global-read group."""
         grants: list[PermissionGrant] = []
-        seen: set[str] = set()
         if self.system_admin_role_id:
-            seen.add(self.system_admin_role_id)
             grants.append(PermissionGrant(GrantEntity.ROLE, GrantRole.READER, external_id=self.system_admin_role_id, reason="System Administrator"))
-        for role_id in sorted(self.global_read_roles_by_entity.get(spec.logical_name, ())):
-            if role_id in seen:
-                continue
-            seen.add(role_id)
-            grants.append(PermissionGrant(GrantEntity.ROLE, GrantRole.READER, external_id=role_id, reason=f"{read_privilege_name(spec)} Global"))
+        grants.append(PermissionGrant(
+            GrantEntity.GROUP, GrantRole.READER,
+            external_id=global_read_group_external_id(spec), reason=f"{read_privilege_name(spec)} Global",
+        ))
         return grants
 
 
@@ -670,13 +757,13 @@ def derive_grants(spec: EntitySpec, row: Mapping[str, Any], ctx: SecurityContext
         if email:
             grants.append(PermissionGrant(GrantEntity.USER, GrantRole.OWNER, email=email, reason="ownerid (user)"))
 
-    # 2. Owning business unit -> BU group readers
+    # 2. Owning business unit -> its read-privileged members for this table
     bu_id = row.get("_owningbusinessunit_value")
     if bu_id:
-        grants.append(PermissionGrant(GrantEntity.GROUP, GrantRole.READER, external_id=bu_group_external_id(str(bu_id)), reason="owningbusinessunit"))
+        grants.append(PermissionGrant(GrantEntity.GROUP, GrantRole.READER, external_id=bu_entity_group_external_id(str(bu_id), spec), reason="owningbusinessunit"))
 
-    # 3. Roles with Global read on this entity + System Administrator
-    grants.extend(ctx.entity_role_grants(spec))
+    # 3. Global read on this entity + System Administrator
+    grants.extend(ctx.entity_wide_grants(spec))
 
     # 4. Explicit shares
     row_id = str(row.get(spec.primary_id) or "")

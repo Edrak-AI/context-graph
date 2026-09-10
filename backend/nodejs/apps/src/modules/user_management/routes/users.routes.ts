@@ -111,6 +111,11 @@ const provisionUserValidationSchema = z.object({
     firstName: z.string().optional(),
     lastName: z.string().optional(),
     role: z.enum(['admin', 'member']).optional(),
+    // Omit → unchanged; [] → clear. Replaces the whole set.
+    alternateEmails: z
+      .array(z.string().email('Invalid alternate email'))
+      .max(10, 'At most 10 alternate emails')
+      .optional(),
     // Omit → the single active org (OSS single-org deployments).
     orgId: z
       .string()

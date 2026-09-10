@@ -2333,6 +2333,16 @@ components:
           type: string
           format: email
           description: Email address (unique, lowercase)
+        alternateEmails:
+          type: array
+          description: |
+            Additional verified addresses that resolve to this user (lower-cased). Set through
+            `POST /users/internal/provision`; connector permissions granted to any of them are
+            attributed to this user.
+          items:
+            type: string
+            format: email
+          default: []
         mobile:
           type: string
           description: Mobile number (10-15 digits with optional +)
@@ -2379,6 +2389,36 @@ components:
         - _id
         - orgId
 
+    ProvisionedUserResponse:
+      type: object
+      additionalProperties: false
+      description: Result of `POST /users/internal/provision`
+      required:
+        - userId
+        - orgId
+        - role
+        - created
+        - alternateEmails
+      properties:
+        userId:
+          type: string
+          format: ObjectId
+        orgId:
+          type: string
+          format: ObjectId
+        role:
+          type: string
+          enum: [admin, member]
+        created:
+          type: boolean
+          description: True when the user was created by this call
+        alternateEmails:
+          type: array
+          description: The stored set after this call
+          items:
+            type: string
+            format: email
+
     UpdateUserResponse:
       type: object
       additionalProperties: false
@@ -2416,6 +2456,16 @@ components:
           type: string
           format: email
           description: Email address (unique, lowercase)
+        alternateEmails:
+          type: array
+          description: |
+            Additional verified addresses that resolve to this user (lower-cased). Set through
+            `POST /users/internal/provision`; connector permissions granted to any of them are
+            attributed to this user.
+          items:
+            type: string
+            format: email
+          default: []
         mobile:
           type: string
           description: Mobile number (10-15 digits with optional +)
@@ -19012,6 +19062,109 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+
+  /users/internal/provision:
+    post:
+      tags:
+        - Users
+      summary: Provision a user from a trusted external identity provider
+      description: |
+        Internal service-to-service endpoint (scoped token with the `user:provision` scope).
+        Creates the user if the e-mail is unknown, otherwise updates it in place; a soft-deleted
+        user is restored. Idempotent by `email`.
+
+        `alternateEmails` **replaces** the stored set: omit it to leave the set unchanged, send `[]`
+        to clear it. Each entry is lower-cased and trimmed; an entry may not equal the primary
+        `email`, nor another user's primary or alternate e-mail within the same organization
+        (`409`). A new user's `email` may not be another user's alternate e-mail either (`409`).
+
+        `orgId` may be omitted only when exactly one organization exists.
+      operationId: provisionExternalUser
+      security:
+        - scopedToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required:
+                - email
+                - fullName
+              properties:
+                email:
+                  type: string
+                  format: email
+                fullName:
+                  type: string
+                  minLength: 1
+                firstName:
+                  type: string
+                lastName:
+                  type: string
+                role:
+                  type: string
+                  enum: [admin, member]
+                  default: member
+                alternateEmails:
+                  type: array
+                  maxItems: 10
+                  items:
+                    type: string
+                    format: email
+                orgId:
+                  type: string
+                  pattern: '^[a-fA-F0-9]{24}$'
+      responses:
+        '200':
+          description: Existing user updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProvisionedUserResponse'
+        '201':
+          description: User created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProvisionedUserResponse'
+        '400':
+          description: Validation error, user belongs to another organization, alternate equals the primary e-mail, or `orgId` omitted with several organizations
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Missing or invalid scoped token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Organization not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: An alternate e-mail is already another user's primary or alternate e-mail, or a new user's primary e-mail is another user's alternate
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required:
+                  - error
+                  - email
+                properties:
+                  error:
+                    type: string
+                    enum: ["alternate email in use"]
+                  email:
+                    type: string
+                    format: email
+                    description: The conflicting e-mail
 
   # ==================== TEAMS ENDPOINTS ====================
   /teams:

@@ -164,8 +164,9 @@ class TestUserIdentity:
             "u-2": "nour@edrak.com",        # unknown to Graph → Dataverse address
             "u-3": "stub@edrak.com",        # no Entra id → Dataverse address
         }
-        assert ctx.user_email_by_id == {"u-1": "sujit@edrak.com", "u-2": "nour@edrak.com", "u-3": "stub@edrak.com"}
+        # the disabled user is still upserted (inactive) but resolves no owner / share edge
         assert {u.source_user_id: u.is_active for u in processor.users}["u-3"] is False
+        assert ctx.user_email_by_id == {"u-1": "sujit@edrak.com", "u-2": "nour@edrak.com"}
 
         resolver = FakeResolver.instances[0]
         assert resolver.args == ("tenant-1", "client", "secret")

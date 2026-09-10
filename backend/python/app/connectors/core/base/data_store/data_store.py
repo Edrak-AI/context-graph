@@ -169,7 +169,7 @@ class BaseDataStore(ABC):
         pass
 
     @abstractmethod
-    async def get_user_by_email(self, email: str) -> Optional[User]:
+    async def get_user_by_email(self, email: str, org_id: str | None = None) -> Optional[User]:
         pass
 
     @abstractmethod

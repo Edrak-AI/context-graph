@@ -2,6 +2,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from app.config.constants.arangodb import CollectionNames
 from app.services.graph_db.neo4j.neo4j_provider import Neo4jProvider
 
 
@@ -4246,3 +4247,84 @@ class TestDeleteSingleRecord:
         mock_begin.assert_not_awaited()
         mock_commit.assert_not_awaited()
 
+
+class TestBatchUpsertAppUsers:
+    @staticmethod
+    def _app_user(email: str, org_id: str | None) -> MagicMock:
+        user = MagicMock()
+        user.email = email
+        user.connector_id = "app1"
+        user.org_id = org_id
+        user.id = "u2"
+        user.source_user_id = "ext_u2"
+        user.to_arango_base_user.return_value = {"_key": "u2", "email": email}
+        user.created_at = 1000
+        user.updated_at = 2000
+        return user
+
+    @pytest.mark.asyncio
+    async def test_explicit_org_id_skips_org_lookup_and_scopes_user(self, neo4j_provider: Neo4jProvider) -> None:
+        user = self._app_user("new@test.com", "org2")
+        user_record = MagicMock()
+        user_record.id = "u2"
+        neo4j_provider.get_all_orgs = AsyncMock(return_value=[{"id": "org1"}, {"id": "org2"}])
+        neo4j_provider.get_document = AsyncMock(return_value={"id": "app1"})
+        neo4j_provider.get_user_by_email = AsyncMock(side_effect=[None, user_record])
+        neo4j_provider.batch_upsert_nodes = AsyncMock()
+        neo4j_provider.batch_create_edges = AsyncMock()
+
+        await neo4j_provider.batch_upsert_app_users([user], transaction="txn1")
+
+        neo4j_provider.get_all_orgs.assert_not_awaited()
+        for call in neo4j_provider.get_user_by_email.await_args_list:
+            assert call.args == ("new@test.com", "txn1")
+            assert call.kwargs == {"org_id": "org2"}
+        created = neo4j_provider.batch_upsert_nodes.await_args.args[0][0]
+        assert created["orgId"] == "org2"
+        assert created["isActive"] is False
+        belongs_to = neo4j_provider.batch_create_edges.await_args_list[0]
+        assert belongs_to.kwargs["collection"] == CollectionNames.BELONGS_TO.value
+        assert belongs_to.args[0][0]["to_id"] == "org2"
+        assert belongs_to.args[0][0]["to_collection"] == CollectionNames.ORGS.value
+
+    @pytest.mark.asyncio
+    async def test_single_org_fills_missing_org_id(self, neo4j_provider: Neo4jProvider) -> None:
+        user = self._app_user("new@test.com", None)
+        user_record = MagicMock()
+        user_record.id = "u2"
+        neo4j_provider.get_all_orgs = AsyncMock(return_value=[{"id": "org1"}])
+        neo4j_provider.get_document = AsyncMock(return_value={"id": "app1"})
+        neo4j_provider.get_user_by_email = AsyncMock(side_effect=[None, user_record])
+        neo4j_provider.batch_upsert_nodes = AsyncMock()
+        neo4j_provider.batch_create_edges = AsyncMock()
+
+        await neo4j_provider.batch_upsert_app_users([user])
+
+        neo4j_provider.get_all_orgs.assert_awaited_once()
+        assert neo4j_provider.get_user_by_email.await_args.kwargs == {"org_id": "org1"}
+        assert neo4j_provider.batch_upsert_nodes.await_args.args[0][0]["orgId"] == "org1"
+
+    @pytest.mark.asyncio
+    async def test_no_orgs_raises(self, neo4j_provider: Neo4jProvider) -> None:
+        user = self._app_user("new@test.com", None)
+        neo4j_provider.get_all_orgs = AsyncMock(return_value=[])
+        with pytest.raises(Exception, match="No organizations"):
+            await neo4j_provider.batch_upsert_app_users([user])
+
+    @pytest.mark.asyncio
+    async def test_multi_org_user_without_org_id_is_skipped(self, neo4j_provider: Neo4jProvider) -> None:
+        user = self._app_user("orphan@test.com", None)
+        neo4j_provider.get_all_orgs = AsyncMock(return_value=[{"id": "org1"}, {"id": "org2"}])
+        neo4j_provider.get_document = AsyncMock(return_value={"id": "app1"})
+        neo4j_provider.get_user_by_email = AsyncMock()
+        neo4j_provider.batch_upsert_nodes = AsyncMock()
+        neo4j_provider.batch_create_edges = AsyncMock()
+
+        await neo4j_provider.batch_upsert_app_users([user])
+
+        neo4j_provider.get_all_orgs.assert_awaited_once()
+        neo4j_provider.get_user_by_email.assert_not_awaited()
+        neo4j_provider.batch_upsert_nodes.assert_not_awaited()
+        neo4j_provider.batch_create_edges.assert_not_awaited()
+        neo4j_provider.logger.warning.assert_called_once()
+        assert "orphan@test.com" in neo4j_provider.logger.warning.call_args.args[0]

@@ -379,18 +379,30 @@ class TestCompanyScoping:
         mapping = parse_company_access_mapping(
             "CRONUS SA = BC Finance Readers, 3f2b0c9e-0000-0000-0000-000000000001\n"
             "شركة المثال = قرّاء الحسابات; * = All Staff\n"
-            "broken line\n"
-            "Empty Co =\n"
         )
         assert mapping.groups_by_company[normalize_name("CRONUS SA")] == ("BC Finance Readers", "3f2b0c9e-0000-0000-0000-000000000001")
         assert mapping.groups_by_company[normalize_name("شركة المثال")] == ("قرّاء الحسابات",)
+        assert mapping.entry_labels == {normalize_name("CRONUS SA"): "CRONUS SA", normalize_name("شركة المثال"): "شركة المثال"}
         assert mapping.default_groups == ("All Staff",)
         assert mapping.referenced_groups() == ["All Staff", "BC Finance Readers", "3f2b0c9e-0000-0000-0000-000000000001", "قرّاء الحسابات"]
-        assert len(mapping.warnings) == 2
-        assert "broken line" in mapping.warnings[0] and "Empty Co" in mapping.warnings[1]
         assert mapping.groups_for(CRONUS) == ("BC Finance Readers", "3f2b0c9e-0000-0000-0000-000000000001")
         assert mapping.groups_for(ARABIC) == ("قرّاء الحسابات",)
         assert mapping.groups_for(Company(id="z", name="Zeta", display_name="Zeta")) == ("All Staff",)
+
+    @pytest.mark.parametrize(
+        ("value", "fragment"),
+        [
+            ("CRONUS SA = Readers\nbroken line", "broken line"),
+            ("Empty Co =", "Empty Co"),
+            ("{not json", "not valid JSON"),
+            ('["CRONUS SA"]', "Company = group"),  # not an object → read as text → not a 'Company = ...' line
+            ({"CRONUS SA": []}, "lists no group"),
+        ],
+    )
+    def test_parse_company_access_mapping_rejects_malformed_input(self, value: object, fragment: str) -> None:
+        # fail-closed: a mapping that is silently dropped would leave companies readable by the wrong people
+        with pytest.raises(ValueError, match=fragment):
+            parse_company_access_mapping(value)
 
     def test_parse_company_access_mapping_json_and_empty(self) -> None:
         mapping = parse_company_access_mapping('{"CRONUS SA": ["Readers"], "*": "Everyone Finance"}')
@@ -398,27 +410,44 @@ class TestCompanyScoping:
         assert mapping.default_groups == ("Everyone Finance",)
         assert parse_company_access_mapping(None).is_empty()
         assert parse_company_access_mapping("   ").is_empty()
-        bad = parse_company_access_mapping("{not json")
-        assert bad.is_empty() and bad.warnings
         assert parse_company_access_mapping({"CRONUS SA": "A, B"}).groups_by_company == {"cronus sa": ("A", "B")}
 
-    def test_company_grants(self) -> None:
+    def test_unmatched_entries_are_surfaced_as_written(self) -> None:
+        mapping = parse_company_access_mapping("Cronus  SA = Readers\nNope Ltd = Readers\n* = Staff")
+        assert mapping.unmatched_entries([CRONUS, ARABIC]) == ["Nope Ltd"]
+        assert parse_company_access_mapping({ARABIC.id.upper(): "Readers"}).unmatched_entries([ARABIC]) == []
+
+    def test_company_without_entry_grants_nobody(self) -> None:
         accesses = resolve_company_access([CRONUS, ARABIC], parse_company_access_mapping("CRONUS SA = Readers"))
-        gated, open_ = accesses
-        assert gated.group_refs == ("Readers",) and not gated.org_wide
-        assert open_.group_refs == () and open_.org_wide
-        gated_grants = company_grants(gated)
-        assert [(g.entity_type, g.role, g.external_id) for g in gated_grants] == [
+        gated, unmapped = accesses
+        assert gated.group_refs == ("Readers",) and gated.entra_refs == ("Readers",) and not gated.org_wide
+        assert [(g.entity_type, g.role, g.external_id) for g in company_grants(gated)] == [
             (GrantEntity.GROUP, GrantRole.READER, company_group_external_id(CRONUS.id)),
         ]
-        open_grants = company_grants(open_)
-        assert [(g.entity_type, g.role, g.external_id) for g in open_grants] == [
+        # no entry and no '*' key: only the (empty) company group, never the org
+        assert unmapped.group_refs == () and not unmapped.org_wide
+        assert [(g.entity_type, g.role, g.external_id) for g in company_grants(unmapped)] == [
             (GrantEntity.GROUP, GrantRole.READER, company_group_external_id(ARABIC.id)),
+        ]
+        assert not CompanyAccess(company=CRONUS).org_wide
+        assert CompanyAccessMapping().groups_for(CRONUS) == ()
+        assert company_group_name(ARABIC) == "Business Central · شركة المثال للتجارة"
+
+    def test_star_value_is_the_explicit_org_wide_opt_in(self) -> None:
+        mapping = parse_company_access_mapping("CRONUS SA = *\nشركة المثال = Readers, *")
+        assert mapping.referenced_groups() == ["Readers"]  # '*' is not an Entra group
+        cronus, arabic = resolve_company_access([CRONUS, ARABIC], mapping)
+        assert cronus.org_wide and cronus.entra_refs == ()
+        assert [(g.entity_type, g.role, g.external_id) for g in company_grants(cronus)] == [
+            (GrantEntity.GROUP, GrantRole.READER, company_group_external_id(CRONUS.id)),
             (GrantEntity.ORG, GrantRole.READER, None),
         ]
-        assert company_group_name(ARABIC) == "Business Central · شركة المثال للتجارة"
-        assert CompanyAccess(company=CRONUS).org_wide
-        assert CompanyAccessMapping().groups_for(CRONUS) == ()
+        # '*' mixed with groups: org-wide wins, the groups are still resolved for the company group
+        assert arabic.org_wide and arabic.entra_refs == ("Readers",)
+        assert any(g.entity_type == GrantEntity.ORG for g in company_grants(arabic))
+        # '* = *' as the default makes every company without its own entry org-wide
+        by_default = resolve_company_access([CRONUS, ARABIC], parse_company_access_mapping("CRONUS SA = Readers; * = *"))
+        assert not by_default[0].org_wide and by_default[1].org_wide
 
 
 # ---------------------------------------------------------------------------

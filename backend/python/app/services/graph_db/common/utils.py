@@ -91,3 +91,13 @@ def build_connector_stats_response(
         },
         "byRecordType": list(record_type_counts.values()),
     }
+
+
+def alternate_email_matches(
+    requested_emails: list[str], alternate_emails: list[Any] | None
+) -> list[str]:
+    """Requested e-mails that equal one of a user's alternate e-mails (case-insensitive)."""
+    if not alternate_emails:
+        return []
+    lowered = {str(a).lower() for a in alternate_emails if a}
+    return [e for e in requested_emails if isinstance(e, str) and e.lower() in lowered]

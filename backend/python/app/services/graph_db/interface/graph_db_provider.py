@@ -1617,14 +1617,17 @@ class IGraphDBProvider(ABC):
     async def get_user_by_email(
         self,
         email: str,
-        transaction: str | None = None
+        transaction: str | None = None,
+        org_id: str | None = None,
     ) -> Optional['User']:
         """
-        Get a user by email address.
+        Get a user by email address (the primary e-mail or one of the user's `alternateEmails`).
 
         Args:
             email (str): User email
             transaction (Optional[Any]): Optional transaction context
+            org_id (Optional[str]): When given, only match a user of this org.
+                Multi-tenant deployments must pass it: the same e-mail can exist in several orgs.
 
         Returns:
             Optional[Dict]: User data if found, None otherwise

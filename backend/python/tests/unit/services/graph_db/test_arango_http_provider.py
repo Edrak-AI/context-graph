@@ -28,6 +28,7 @@ from unittest.mock import AsyncMock, MagicMock, patch, PropertyMock
 
 import pytest
 
+from app.config.constants.arangodb import CollectionNames
 from app.services.graph_db.arango.arango_http_provider import (
     ARANGO_ID_PARTS_COUNT,
     ArangoHTTPProvider,
@@ -5428,6 +5429,7 @@ class TestBatchUpsertAppUsers:
     async def test_no_orgs(self, connected_provider):
         mock_user = MagicMock()
         mock_user.connector_id = "c1"
+        mock_user.org_id = None
         with patch.object(
             connected_provider, "get_all_orgs",
             new_callable=AsyncMock, return_value=[]
@@ -5439,6 +5441,7 @@ class TestBatchUpsertAppUsers:
     async def test_app_not_found(self, connected_provider):
         mock_user = MagicMock()
         mock_user.connector_id = "c1"
+        mock_user.org_id = None
         with patch.object(
             connected_provider, "get_all_orgs",
             new_callable=AsyncMock,
@@ -16430,6 +16433,7 @@ class TestBatchUpsertAppUsers:
         mock_user = MagicMock()
         mock_user.email = "user@test.com"
         mock_user.connector_id = "app1"
+        mock_user.org_id = None
         mock_user.id = "u1"
         mock_user.source_user_id = "ext_u1"
         mock_user.to_arango_base_user.return_value = {"_key": "u1", "email": "user@test.com"}
@@ -16455,6 +16459,7 @@ class TestBatchUpsertAppUsers:
         mock_user = MagicMock()
         mock_user.email = "new@test.com"
         mock_user.connector_id = "app1"
+        mock_user.org_id = None
         mock_user.id = "u2"
         mock_user.source_user_id = "ext_u2"
         mock_user.to_arango_base_user.return_value = {"_key": "u2", "email": "new@test.com"}
@@ -16480,10 +16485,65 @@ class TestBatchUpsertAppUsers:
     async def test_no_app_raises(self, connected_provider):
         mock_user = MagicMock()
         mock_user.connector_id = "app1"
+        mock_user.org_id = None
         connected_provider.get_all_orgs = AsyncMock(return_value=[{"_key": "org1"}])
         connected_provider.get_document = AsyncMock(return_value=None)
         with pytest.raises(Exception, match="Failed to get/create app"):
             await connected_provider.batch_upsert_app_users([mock_user])
+
+    @pytest.mark.asyncio
+    async def test_explicit_org_id_skips_org_lookup_and_scopes_user(self, connected_provider) -> None:
+        mock_user = MagicMock()
+        mock_user.email = "new@test.com"
+        mock_user.connector_id = "app1"
+        mock_user.org_id = "org2"
+        mock_user.id = "u2"
+        mock_user.source_user_id = "ext_u2"
+        mock_user.to_arango_base_user.return_value = {"_key": "u2", "email": "new@test.com"}
+        mock_user.created_at = 1000
+        mock_user.updated_at = 2000
+
+        connected_provider.get_all_orgs = AsyncMock(return_value=[{"_key": "org1"}, {"_key": "org2"}])
+        connected_provider.get_document = AsyncMock(return_value={"_id": "apps/app1", "_key": "app1"})
+        mock_user_record = MagicMock()
+        mock_user_record.id = "u2"
+        connected_provider.get_user_by_email = AsyncMock(side_effect=[None, mock_user_record])
+        connected_provider.batch_upsert_nodes = AsyncMock()
+        connected_provider.batch_create_edges = AsyncMock()
+
+        await connected_provider.batch_upsert_app_users([mock_user])
+
+        connected_provider.get_all_orgs.assert_not_awaited()
+        for call in connected_provider.get_user_by_email.await_args_list:
+            assert call.args[0] == "new@test.com"
+            assert call.kwargs == {"org_id": "org2"}
+        created = connected_provider.batch_upsert_nodes.await_args.args[0][0]
+        assert created["orgId"] == "org2"
+        belongs_to = connected_provider.batch_create_edges.await_args_list[0]
+        assert belongs_to.kwargs["collection"] == CollectionNames.BELONGS_TO.value
+        assert belongs_to.args[0][0]["_to"] == f"{CollectionNames.ORGS.value}/org2"
+
+    @pytest.mark.asyncio
+    async def test_multi_org_user_without_org_id_is_skipped(self, connected_provider) -> None:
+        mock_user = MagicMock()
+        mock_user.email = "orphan@test.com"
+        mock_user.connector_id = "app1"
+        mock_user.org_id = None
+
+        connected_provider.get_all_orgs = AsyncMock(return_value=[{"_key": "org1"}, {"_key": "org2"}])
+        connected_provider.get_document = AsyncMock(return_value={"_id": "apps/app1", "_key": "app1"})
+        connected_provider.get_user_by_email = AsyncMock()
+        connected_provider.batch_upsert_nodes = AsyncMock()
+        connected_provider.batch_create_edges = AsyncMock()
+
+        await connected_provider.batch_upsert_app_users([mock_user])
+
+        connected_provider.get_all_orgs.assert_awaited_once()
+        connected_provider.get_user_by_email.assert_not_awaited()
+        connected_provider.batch_upsert_nodes.assert_not_awaited()
+        connected_provider.batch_create_edges.assert_not_awaited()
+        connected_provider.logger.warning.assert_called_once()
+        assert "orphan@test.com" in connected_provider.logger.warning.call_args.args[0]
 
 
 # ---------------------------------------------------------------------------

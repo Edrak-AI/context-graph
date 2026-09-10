@@ -519,7 +519,7 @@ class DataSourceEntitiesProcessor:
 
         try:
             # Only get existing user by email - do not create if not found
-            user = await tx_store.get_user_by_email(user_email)
+            user = await tx_store.get_user_by_email(user_email, org_id=self.org_id)
 
             if not user:
                 return None
@@ -641,7 +641,7 @@ class DataSourceEntitiesProcessor:
 
         try:
             # Only get existing user by email - do not create if not found
-            user = await tx_store.get_user_by_email(project.lead_email)
+            user = await tx_store.get_user_by_email(project.lead_email, org_id=self.org_id)
 
             if not user:
                 return
@@ -781,7 +781,8 @@ class DataSourceEntitiesProcessor:
                 if permission.entity_type == EntityType.USER.value:
                     user = None
                     if permission.email:
-                        user = await tx_store.get_user_by_email(permission.email)
+                        # Records may carry a caller-supplied org (KB / cross-org); scope to it, not the processor default.
+                        user = await tx_store.get_user_by_email(permission.email, org_id=record.org_id or self.org_id)
 
                         # If user doesn't exist (external user), use PEOPLE collection
                         if not user and permission.email:
@@ -1807,7 +1808,7 @@ class DataSourceEntitiesProcessor:
                         if permission.entity_type == EntityType.USER:
                             user = None
                             if permission.email:
-                                user = await tx_store.get_user_by_email(permission.email)
+                                user = await tx_store.get_user_by_email(permission.email, org_id=self.org_id)
 
                             if user:
                                 from_id = user.id
@@ -1904,12 +1905,30 @@ class DataSourceEntitiesProcessor:
                 self.logger.warning("on_new_app_users received an empty list; skipping processing.")
                 return
 
+            scoped_users: list[AppUser] = []
+            for user in users:
+                if not user.org_id:
+                    user.org_id = self.org_id
+                elif self.org_id and user.org_id != self.org_id:
+                    self.logger.warning(
+                        f"Skipping app user {user.email}: org {user.org_id} does not match connector org {self.org_id}"
+                    )
+                    continue
+                scoped_users.append(user)
+            if not scoped_users:
+                return
+
             async with self.data_store_provider.transaction() as tx_store:
-                await tx_store.batch_upsert_app_users(users)
+                await tx_store.batch_upsert_app_users(scoped_users)
 
         except Exception as e:
             self.logger.error(f"Transaction on_new_users failed: {str(e)}")
             raise e
+
+    @staticmethod
+    def _is_deactivated(member: AppUser) -> bool:
+        # AppUser.is_active defaults to False; only a value the connector set explicitly means "deactivated".
+        return "is_active" in member.model_fields_set and not member.is_active
 
     @retry_on_deadlock()
     async def on_new_user_groups(self, user_groups: list[tuple[AppUserGroup, list[AppUser]]]) -> None:
@@ -1962,10 +1981,13 @@ class DataSourceEntitiesProcessor:
                     to_collection = CollectionNames.GROUPS.value
 
                     for member in members:
+                        if self._is_deactivated(member):
+                            self.logger.debug(f"Skipping inactive member {member.email} for UserGroup {user_group.id}")
+                            continue
                         user = None
                         if member.email:
                             # Find the user's internal DB ID
-                            user = await tx_store.get_user_by_email(member.email)
+                            user = await tx_store.get_user_by_email(member.email, org_id=self.org_id)
 
                         if not user:
                             self.logger.warning(f"Could not find user with email {member.email} for UserGroup permission.")
@@ -2045,10 +2067,13 @@ class DataSourceEntitiesProcessor:
                     to_collection = CollectionNames.ROLES.value
 
                     for member in members:
+                        if self._is_deactivated(member):
+                            self.logger.debug(f"Skipping inactive member {member.email} for AppRole {role.id}")
+                            continue
                         user = None
                         if member.email:
                             # Find the user's internal DB ID
-                            user = await tx_store.get_user_by_email(member.email)
+                            user = await tx_store.get_user_by_email(member.email, org_id=self.org_id)
 
                         if not user:
                             self.logger.warning(f"Could not find user with email {member.email} for AppRole permission.")
@@ -2111,7 +2136,7 @@ class DataSourceEntitiesProcessor:
 
     async def get_user_by_email(self, email: str) -> User | None:
         async with self.data_store_provider.transaction() as tx_store:
-            return await tx_store.get_user_by_email(email)
+            return await tx_store.get_user_by_email(email, org_id=self.org_id)
 
     async def get_user_group_by_external_id(
         self, connector_id: str, external_id: str
@@ -2273,7 +2298,7 @@ class DataSourceEntitiesProcessor:
         try:
             async with self.data_store_provider.transaction() as tx_store:
                 # 1. Look up the user by email
-                user = await tx_store.get_user_by_email(user_email)
+                user = await tx_store.get_user_by_email(user_email, org_id=self.org_id)
                 if not user:
                     self.logger.warning(
                         f"Cannot remove member from group {external_group_id}: "
@@ -2333,7 +2358,7 @@ class DataSourceEntitiesProcessor:
         try:
             async with self.data_store_provider.transaction() as tx_store:
                 # 1. Look up the user by email
-                user = await tx_store.get_user_by_email(user_email)
+                user = await tx_store.get_user_by_email(user_email, org_id=self.org_id)
                 if not user:
                     self.logger.warning(
                         f"Cannot add member to group {external_group_id}: "
@@ -2556,7 +2581,7 @@ class DataSourceEntitiesProcessor:
                 )
 
         # Get the user object
-        user = await tx_store.get_user_by_email(user_email)
+        user = await tx_store.get_user_by_email(user_email, org_id=self.org_id)
         if not user:
             self.logger.warning(
                 f"User {user_email} not found in users collection, "
@@ -2882,7 +2907,7 @@ class DataSourceEntitiesProcessor:
         """Delete permissions from a record."""
 
         async with self.data_store_provider.transaction() as tx_store:
-            user = await tx_store.get_user_by_email(user_email)
+            user = await tx_store.get_user_by_email(user_email, org_id=self.org_id)
             if not user:
                 self.logger.warning(f"User with email {user_email} not found in database")
                 return

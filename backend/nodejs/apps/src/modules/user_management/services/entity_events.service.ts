@@ -57,6 +57,7 @@ export interface UserAddedEvent {
   middleName?: string;
   lastName?: string;
   email: string;
+  alternateEmails?: string[];
   designation?: string;
   syncAction: SyncAction;
 }
@@ -76,6 +77,7 @@ export interface UserUpdatedEvent {
   fullName?: string;
   designation?: string;
   email: string;
+  alternateEmails?: string[];
 }
 
 @injectable()

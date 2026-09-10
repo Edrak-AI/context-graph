@@ -191,7 +191,8 @@ def _connector(
     c.sync_filters = FilterCollection()
     c.indexing_filters = FilterCollection()
     c._companies = list(companies or [CRONUS, ARABIC])
-    c._access_by_company = {}
+    # what ``_sync_access_model`` leaves behind for an empty mapping: every company resolved, readable by nobody
+    c._access_by_company = {co.id: CompanyAccess(company=co) for co in c._companies}
     c._known_records_cache = None
     return c, http, processor
 
@@ -309,6 +310,10 @@ class TestInit:
         with pytest.raises(ConnectorInitError):
             asyncio.run(c.init())
 
+    def test_init_rejects_malformed_access_mapping(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        with pytest.raises(ConnectorInitError, match="companyAccessGroups.*'broken line'"):
+            self._init(monkeypatch, {"clientId": "c", "clientSecret": "s", "tenantId": TENANT, "companyAccessGroups": "broken line"})
+
     def test_init_fails_when_no_configured_company_matches(self, monkeypatch: pytest.MonkeyPatch) -> None:
         with pytest.raises(ConnectorInitError, match="None of the configured companies"):
             self._init(monkeypatch, {"clientId": "c", "clientSecret": "s", "tenantId": TENANT, "companies": "Nope Ltd"})
@@ -340,11 +345,14 @@ class FakeEntra:
 
 
 class TestAccessModel:
-    def test_company_groups_from_entra_and_org_wide_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_company_groups_from_entra_and_unmapped_company_grants_nobody(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
         FakeEntra.instances = []
         monkeypatch.setattr(bc_connector, "EntraGroupResolver", FakeEntra)
         c, _, processor = _connector(lambda *_: _response(200, {}), access_mapping="CRONUS SA = BC Readers, Missing Group")
-        asyncio.run(c._sync_access_model())
+        with caplog.at_level(logging.WARNING, logger="test-bc"):
+            asyncio.run(c._sync_access_model())
         asyncio.run(c._sync_record_groups())
 
         assert FakeEntra.instances[0].args == (TENANT, "client", "secret")
@@ -362,22 +370,72 @@ class TestAccessModel:
         assert [(p.entity_type, p.type, p.external_id) for p in cronus_perms] == [
             (EntityType.GROUP, PermissionType.READ, company_group_external_id(CRONUS.id)),
         ]
+        # no entry and no '*' default: the (empty) company group only, never an ORG grant
         arabic_rg, arabic_perms = record_groups[company_group_external_id(ARABIC.id)]
-        assert [(p.entity_type, p.external_id) for p in arabic_perms] == [
-            (EntityType.GROUP, company_group_external_id(ARABIC.id)), (EntityType.ORG, None),
-        ]
+        assert [(p.entity_type, p.external_id) for p in arabic_perms] == [(EntityType.GROUP, company_group_external_id(ARABIC.id))]
+        assert not c._access_by_company[ARABIC.id].org_wide
         assert arabic_rg.group_type.value == "ERP_ENTITY"
         assert arabic_rg.web_url.endswith("?company=%D8%B4%D8%B1%D9%83%D8%A9%20%D8%A7%D9%84%D9%85%D8%AB%D8%A7%D9%84")
         assert c.user_sync_point.points["users"][FIELD_LAST_SYNC] > 0
 
-    def test_no_mapping_means_no_graph_call(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert any("شركة المثال" in m and "no companyAccessGroups entry" in m and "nobody can read it" in m for m in warnings)
+        assert any("'Missing Group'" in m and "CRONUS SA" in m and "grants nobody" in m for m in warnings)
+        assert not any(r.levelno >= logging.ERROR for r in caplog.records)
+
+    def test_star_value_grants_org_wide_read(self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+        FakeEntra.instances = []
+        monkeypatch.setattr(bc_connector, "EntraGroupResolver", FakeEntra)
+        c, _, processor = _connector(lambda *_: _response(200, {}), access_mapping="CRONUS SA = *\nشركة المثال = BC Readers")
+        with caplog.at_level(logging.INFO, logger="test-bc"):
+            asyncio.run(c._sync_access_model())
+        asyncio.run(c._sync_record_groups())
+
+        assert FakeEntra.instances[0].requested == ["BC Readers"]  # '*' is never looked up in Entra
+        record_groups = {rg.external_group_id: perms for rg, perms in processor.record_groups}
+        assert [(p.entity_type, p.type, p.external_id) for p in record_groups[company_group_external_id(CRONUS.id)]] == [
+            (EntityType.GROUP, PermissionType.READ, company_group_external_id(CRONUS.id)),
+            (EntityType.ORG, PermissionType.READ, None),
+        ]
+        assert [(p.entity_type, p.external_id) for p in record_groups[company_group_external_id(ARABIC.id)]] == [
+            (EntityType.GROUP, company_group_external_id(ARABIC.id)),
+        ]
+        groups = {g.source_user_group_id: members for g, members in processor.groups}
+        assert groups[company_group_external_id(CRONUS.id)] == []
+        assert sorted(u.email for u in groups[company_group_external_id(ARABIC.id)]) == ["a@edrak.com", "b@edrak.com"]
+        assert any("CRONUS SA" in r.getMessage() and "org-wide" in r.getMessage() for r in caplog.records if r.levelno == logging.INFO)
+        assert not any(r.levelno >= logging.WARNING for r in caplog.records)
+
+    def test_no_mapping_means_no_graph_call_and_nobody_reads(self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
         FakeEntra.instances = []
         monkeypatch.setattr(bc_connector, "EntraGroupResolver", FakeEntra)
         c, _, processor = _connector(lambda *_: _response(200, {}))
-        asyncio.run(c._sync_access_model())
+        c._access_by_company = {}
+        with caplog.at_level(logging.WARNING, logger="test-bc"):
+            asyncio.run(c._sync_access_model())
         assert FakeEntra.instances == []
         assert processor.users == [] and len(processor.groups) == 2
-        assert all(access.org_wide for access in c._access_by_company.values())
+        assert set(c._access_by_company) == {CRONUS.id, ARABIC.id}
+        assert not any(access.org_wide or access.group_refs for access in c._access_by_company.values())
+        named = {co.label for co in (CRONUS, ARABIC) if any(co.label in r.getMessage() and "nobody can read it" in r.getMessage() for r in caplog.records)}
+        assert named == {CRONUS.label, ARABIC.label}
+
+    def test_entry_matching_no_synced_company_is_an_error(self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+        monkeypatch.setattr(bc_connector, "EntraGroupResolver", FakeEntra)
+        c, _, _ = _connector(lambda *_: _response(200, {}), access_mapping="Nope Ltd = BC Readers")
+        with caplog.at_level(logging.ERROR, logger="test-bc"):
+            asyncio.run(c._sync_access_model())
+        errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+        assert len(errors) == 1 and "['Nope Ltd']" in errors[0] and "grant nobody" in errors[0]
+        assert not any(access.org_wide or access.group_refs for access in c._access_by_company.values())
+
+    def test_permissions_fail_closed_before_the_access_sync(self) -> None:
+        c, _, _ = _connector(lambda *_: _response(200, {}))
+        c._access_by_company = {}
+        with pytest.raises(RuntimeError, match="CRONUS SA has no resolved access model"):
+            c._company_permissions(CRONUS)
+        with pytest.raises(RuntimeError):
+            asyncio.run(c._sync_entity(CRONUS, SPECS["salesOrders"], incremental=False))
 
     def test_grants_to_permissions(self) -> None:
         perms = grants_to_permissions([

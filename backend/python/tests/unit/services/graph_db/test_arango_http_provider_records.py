@@ -1827,6 +1827,7 @@ class TestBatchUpsertAppUsers:
     async def test_no_orgs_raises(self, connected_provider):
         user = MagicMock()
         user.connector_id = "conn1"
+        user.org_id = None
         connected_provider.http_client.execute_aql.return_value = []  # no orgs
         with pytest.raises(Exception, match="No organizations"):
             await connected_provider.batch_upsert_app_users([user])
@@ -1834,6 +1835,7 @@ class TestBatchUpsertAppUsers:
     async def test_exception_raises(self, connected_provider):
         user = MagicMock()
         user.connector_id = "conn1"
+        user.org_id = None
         connected_provider.http_client.execute_aql.side_effect = Exception("err")
         with pytest.raises(Exception):
             await connected_provider.batch_upsert_app_users([user])

@@ -2761,6 +2761,7 @@ class AnyOneWithLink(BaseModel):
 class User(BaseModel):
     id: str = Field(description="Unique identifier for the user", default_factory=lambda: str(uuid4()))
     email: str
+    alternate_emails: list[str] = Field(default_factory=list, description="Other addresses that resolve to this user")
     source_user_id: str | None = None
     org_id: str | None = None
     user_id: str | None = None
@@ -2790,6 +2791,7 @@ class User(BaseModel):
         return User(
             id=data.get("id", data.get("_key")),
             email=data.get("email", ""),
+            alternate_emails=list(data.get("alternateEmails") or []),
             org_id=data.get("orgId", ""),
             user_id=data.get("userId"),
             is_active=data.get("isActive", False),

@@ -204,8 +204,8 @@ class GraphTransactionStore(TransactionStore):
         """
         return await self.graph_provider.create_record_groups_relation(child_id, parent_id, transaction=self.txn)
 
-    async def get_user_by_email(self, email: str) -> Optional[User]:
-        return await self.graph_provider.get_user_by_email(email, transaction=self.txn)
+    async def get_user_by_email(self, email: str, org_id: str | None = None) -> Optional[User]:
+        return await self.graph_provider.get_user_by_email(email, transaction=self.txn, org_id=org_id)
 
     async def get_user_by_source_id(self, source_user_id: str, connector_id: str) -> Optional[User]:
         return await self.graph_provider.get_user_by_source_id(source_user_id, connector_id, transaction=self.txn)

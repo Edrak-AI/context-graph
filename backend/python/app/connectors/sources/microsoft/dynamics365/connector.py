@@ -118,14 +118,15 @@ from app.connectors.sources.microsoft.dynamics365.mapping import (
     PRIMARY_ID_FILTER_BATCH_SIZE,
     STATE_LOST_OR_CANCELLED,
     STATE_WON_OR_RESOLVED,
-    SYSTEM_ADMINISTRATOR_ROLE_NAME,
     EntitySpec,
     GrantEntity,
     GrantRole,
     PermissionGrant,
+    RoleCopy,
     SecurityContext,
     api_base_url,
     attachment_external_id,
+    bu_entity_group_external_id,
     bu_group_external_id,
     build_modified_filter,
     build_primary_id_filter,
@@ -133,20 +134,23 @@ from app.connectors.sources.microsoft.dynamics365.mapping import (
     derive_grants,
     display_value,
     entity_list_web_url,
+    entity_readers,
+    global_read_group_external_id,
     index_shares,
     is_application_user,
     normalize_environment_url,
     owner_reference,
     parse_dataverse_timestamp,
+    read_privilege_name,
     record_external_id,
     record_title,
     record_web_url,
     render_record_markdown,
     resolve_selected_entities,
     role_external_id,
-    role_has_global_read,
     share_digests,
     split_external_id,
+    system_administrator_match,
     systemuser_email,
     team_group_external_id,
     token_scope,
@@ -730,14 +734,24 @@ class MicrosoftDynamics365Connector(BaseConnector):
             self._entra_users = EntraUserEmailResolver(self._tenant_id, self._client_id, self._client_secret, self.logger)
         return await self._entra_users.resolve_emails(ids)
 
+    async def _role_privileges(self, role_id: str) -> List[Dict[str, Any]]:
+        """``RetrieveRolePrivilegesRole`` of one role copy; unreadable copies grant nothing."""
+        try:
+            payload = await self._get_json(f"roles({role_id})/Microsoft.Dynamics.CRM.RetrieveRolePrivilegesRole()")
+        except httpx.HTTPStatusError as e:
+            self.logger.warning("Could not read privileges of role copy %s: %s", role_id, e.response.status_code)
+            return []
+        return list(payload.get("RolePrivileges") or [])
+
     async def _sync_security_model(self, specs: List[EntitySpec]) -> SecurityContext:
         ctx = SecurityContext()
         org_id = self.data_entities_processor.org_id
 
-        # 1. systemusers → AppUser
-        users_by_id: Dict[str, AppUser] = {}
+        # 1. systemusers → AppUser. Disabled users are upserted (inactive) but join no
+        #    membership and resolve no owner, so nothing they held leaks to them.
+        active_users: Dict[str, AppUser] = {}
         bu_members: Dict[str, List[AppUser]] = {}
-        remapped = 0
+        synced = disabled = remapped = 0
         async for page in self._iter_pages(
             "systemusers",
             params={
@@ -768,34 +782,40 @@ class MicrosoftDynamics365Connector(BaseConnector):
                     source_created_at=parse_dataverse_timestamp(row.get("createdon")),
                     source_updated_at=parse_dataverse_timestamp(row.get("modifiedon")),
                 )
-                users_by_id[str(user_id)] = app_user
+                batch.append(app_user)
+                synced += 1
+                if not app_user.is_active:
+                    disabled += 1
+                    continue
+                active_users[str(user_id)] = app_user
                 ctx.user_email_by_id[str(user_id)] = email
                 bu_id = row.get("_businessunitid_value")
                 if bu_id:
                     bu_members.setdefault(str(bu_id), []).append(app_user)
-                batch.append(app_user)
             if batch:
                 await self.data_entities_processor.on_new_app_users(batch)
         await self.user_sync_point.update_sync_point(USERS_SYNC_POINT_KEY, {"lastSyncTimestamp": get_epoch_timestamp_in_ms()})
         self.logger.info(
-            "Synced %d Dynamics 365 users (%d matched by their Entra primary address rather than the Dataverse one)",
-            len(users_by_id), remapped,
+            "Synced %d Dynamics 365 users (%d disabled and excluded from permissions, %d matched by their "
+            "Entra primary address rather than the Dataverse one)", synced, disabled, remapped,
         )
 
-        # 2. businessunits → AppUserGroup (bu:<id>) of the users whose home BU it is
+        # 2. businessunits → AppUserGroup (bu:<id>) of the active users whose home BU it is
         bu_rows = await self._fetch_all("businessunits", {"$select": "businessunitid,name,_parentbusinessunitid_value,createdon,modifiedon"})
+        bu_names: Dict[str, str] = {}
         bu_groups: List[Tuple[AppUserGroup, List[AppUser]]] = []
         for row in bu_rows:
             bu_id = row.get("businessunitid")
             if not bu_id:
                 continue
             ctx.known_business_unit_ids.add(str(bu_id))
+            bu_names[str(bu_id)] = str(row.get("name") or bu_id)
             bu_groups.append((
                 AppUserGroup(
                     app_name=self.connector_name,
                     connector_id=self.connector_id,
                     source_user_group_id=bu_group_external_id(str(bu_id)),
-                    name=f"Business unit · {row.get('name') or bu_id}",
+                    name=f"Business unit · {bu_names[str(bu_id)]}",
                     org_id=org_id,
                     description="Dynamics 365 business unit members",
                     source_created_at=parse_dataverse_timestamp(row.get("createdon")),
@@ -813,7 +833,7 @@ class MicrosoftDynamics365Connector(BaseConnector):
         async def _load_team_members(team_id: str) -> None:
             member_rows = await self._fetch_all(f"teams({team_id})/teammembership_association", {"$select": "systemuserid"})
             team_members[team_id] = [
-                users_by_id[str(m["systemuserid"])] for m in member_rows if str(m.get("systemuserid")) in users_by_id
+                active_users[str(m["systemuserid"])] for m in member_rows if str(m.get("systemuserid")) in active_users
             ]
 
         await asyncio.gather(*(_load_team_members(str(r["teamid"])) for r in team_rows if r.get("teamid")))
@@ -840,8 +860,12 @@ class MicrosoftDynamics365Connector(BaseConnector):
             await self.data_entities_processor.on_new_user_groups(team_groups)
         self.logger.info("Synced %d business units and %d teams", len(bu_groups), len(team_groups))
 
-        # 4. roles → AppRole (role:<root>) — members = direct holders ∪ members of teams holding it
-        role_rows = await self._fetch_all("roles", {"$select": "roleid,name,_businessunitid_value,_parentrootroleid_value,createdon,modifiedon"})
+        # 4. roles: holders and privileges are loaded per business-unit copy (Dataverse
+        #    evaluates the copy a user holds); the AppRole (role:<root>) unions the copies.
+        role_rows = await self._fetch_all(
+            "roles",
+            {"$select": "roleid,name,roletemplateid,_businessunitid_value,_parentrootroleid_value,createdon,modifiedon"},
+        )
         roles_by_ext: Dict[str, Dict[str, Any]] = {}
         copies_by_ext: Dict[str, List[str]] = {}
         for row in role_rows:
@@ -853,54 +877,93 @@ class MicrosoftDynamics365Connector(BaseConnector):
             if ext not in roles_by_ext or not row.get("_parentrootroleid_value"):
                 roles_by_ext[ext] = row
 
-        role_members: Dict[str, Dict[str, AppUser]] = {ext: {} for ext in roles_by_ext}
-        role_privileges: Dict[str, List[Dict[str, Any]]] = {}
+        holders_by_role_id: Dict[str, Dict[str, AppUser]] = {}
+        privileges_by_role_id: Dict[str, List[Dict[str, Any]]] = {}
 
-        async def _load_role(ext: str) -> None:
-            for role_id in copies_by_ext[ext]:
-                user_rows = await self._fetch_all(f"roles({role_id})/systemuserroles_association", {"$select": "systemuserid"})
-                for m in user_rows:
-                    uid = str(m.get("systemuserid"))
-                    if uid in users_by_id:
-                        role_members[ext][uid] = users_by_id[uid]
-                team_role_rows = await self._fetch_all(f"roles({role_id})/teamroles_association", {"$select": "teamid"})
-                for t in team_role_rows:
-                    for member in team_members.get(str(t.get("teamid")), []):
-                        role_members[ext][member.source_user_id] = member
-            root_id = split_external_id(ext)[1]
-            try:
-                payload = await self._get_json(f"roles({root_id})/Microsoft.Dynamics.CRM.RetrieveRolePrivilegesRole()")
-                role_privileges[ext] = list(payload.get("RolePrivileges") or [])
-            except httpx.HTTPStatusError as e:
-                self.logger.warning("Could not read privileges of role %s: %s", ext, e.response.status_code)
-                role_privileges[ext] = []
+        async def _load_role_copy(role_id: str) -> None:
+            holders: Dict[str, AppUser] = {}
+            user_rows = await self._fetch_all(f"roles({role_id})/systemuserroles_association", {"$select": "systemuserid"})
+            for m in user_rows:
+                uid = str(m.get("systemuserid"))
+                if uid in active_users:
+                    holders[uid] = active_users[uid]
+            team_role_rows = await self._fetch_all(f"roles({role_id})/teamroles_association", {"$select": "teamid"})
+            for t in team_role_rows:
+                for member in team_members.get(str(t.get("teamid")), []):
+                    holders[member.source_user_id] = member
+            holders_by_role_id[role_id] = holders
+            privileges_by_role_id[role_id] = await self._role_privileges(role_id)
 
-        await asyncio.gather(*(_load_role(ext) for ext in roles_by_ext))
+        await asyncio.gather(*(_load_role_copy(role_id) for copies in copies_by_ext.values() for role_id in copies))
 
         app_roles: List[Tuple[AppRole, List[AppUser]]] = []
         for ext, row in roles_by_ext.items():
-            name = row.get("name") or ext
+            members: Dict[str, AppUser] = {}
+            for role_id in copies_by_ext[ext]:
+                members.update(holders_by_role_id[role_id])
             app_roles.append((
                 AppRole(
                     app_name=self.connector_name,
                     connector_id=self.connector_id,
                     source_role_id=ext,
-                    name=name,
+                    name=row.get("name") or ext,
                     org_id=org_id,
                     source_created_at=parse_dataverse_timestamp(row.get("createdon")),
                     source_updated_at=parse_dataverse_timestamp(row.get("modifiedon")),
                 ),
-                list(role_members[ext].values()),
+                list(members.values()),
             ))
-            if name == SYSTEM_ADMINISTRATOR_ROLE_NAME:
+            matched_by = system_administrator_match(row)
+            if matched_by:
+                if ctx.system_admin_role_id:
+                    self.logger.warning("Several roles look like System Administrator (%s, %s); keeping the first", ctx.system_admin_role_id, ext)
+                    continue
                 ctx.system_admin_role_id = ext
-            for spec in specs:
-                if role_has_global_read(role_privileges.get(ext, []), spec):
-                    ctx.global_read_roles_by_entity.setdefault(spec.logical_name, set()).add(ext)
+                self.logger.info("Dynamics 365 System Administrator role is %s (matched by %s)", ext, matched_by)
         if app_roles:
             await self.data_entities_processor.on_new_app_roles(app_roles)
+        if ctx.system_admin_role_id is None:
+            self.logger.warning("Dynamics 365 System Administrator role not found among %d roles; administrators get no blanket read", len(app_roles))
+
+        # 5. per-table groups the record grants point at: globalread:<entity> and
+        #    bu:<id>:<entity> (BU members ∩ users with a read-privileged role copy)
+        copies = [
+            RoleCopy(role_id, frozenset(holders_by_role_id[role_id]), tuple(privileges_by_role_id[role_id]))
+            for role_id in privileges_by_role_id
+        ]
+        entity_groups: List[Tuple[AppUserGroup, List[AppUser]]] = []
+        for spec in specs:
+            readers = entity_readers(copies, spec)
+            entity_groups.append((
+                AppUserGroup(
+                    app_name=self.connector_name,
+                    connector_id=self.connector_id,
+                    source_user_group_id=global_read_group_external_id(spec),
+                    name=f"Global read · {spec.display_name}",
+                    org_id=org_id,
+                    description=f"Dynamics 365 users whose security role reads every {spec.singular.lower()} ({read_privilege_name(spec)} Global)",
+                ),
+                [active_users[uid] for uid in sorted(readers.global_read)],
+            ))
+            for bu_id, bu_name in bu_names.items():
+                entity_groups.append((
+                    AppUserGroup(
+                        app_name=self.connector_name,
+                        connector_id=self.connector_id,
+                        source_user_group_id=bu_entity_group_external_id(bu_id, spec),
+                        name=f"Business unit · {bu_name} · {spec.display_name}",
+                        org_id=org_id,
+                        description=f"Dynamics 365 business unit members whose security role reads {spec.display_name.lower()}",
+                    ),
+                    [u for u in bu_members.get(bu_id, []) if u.source_user_id in readers.bu_read],
+                ))
+        if entity_groups:
+            await self.data_entities_processor.on_new_user_groups(entity_groups)
         await self.records_sync_point.update_sync_point(SECURITY_SYNC_POINT_KEY, {"lastSyncTimestamp": get_epoch_timestamp_in_ms()})
-        self.logger.info("Synced %d Dynamics 365 security roles", len(app_roles))
+        self.logger.info(
+            "Synced %d Dynamics 365 security roles (%d business-unit copies) and %d per-table access groups",
+            len(app_roles), len(copies), len(entity_groups),
+        )
         return ctx
 
     async def _load_shares(self, spec: EntitySpec, ctx: SecurityContext) -> bool:
@@ -951,7 +1014,7 @@ class MicrosoftDynamics365Connector(BaseConnector):
                     web_url=entity_list_web_url(self.environment_url, spec),
                     org_id=self.data_entities_processor.org_id,
                 ),
-                grants_to_permissions(self._security.entity_role_grants(spec)),
+                grants_to_permissions(self._security.entity_wide_grants(spec)),
             ))
         if groups:
             await self.data_entities_processor.on_new_record_groups(groups)

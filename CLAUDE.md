@@ -32,6 +32,12 @@ Edrak additions (keep them working when merging upstream):
   (sparse index); `routes/org.routes.ts` + `controller/org.controller.ts` `POST /api/v1/org/internal/provision`
   (scoped token), `provisionExternalOrg()`: idempotent by `externalId`, creates org + admin user + default
   groups + auth config, no credentials/mail — one CGraph org per Edrak org. Public single-org signup guard unchanged.
+- `alternateEmails` ("linked sign-ins"): `schema/users.schema.ts` field (lower-cased, `(orgId, alternateEmails)` index) +
+  `POST /api/v1/users/internal/provision` payload (replaces the set; omit = unchanged, `[]` = clear; `409 alternate email in use`
+  when an entry — or a new user's primary — is another user's primary/alternate in the org) + `alternateEmails` on
+  `UserAddedEvent`/`UserUpdatedEvent`. Python: `User.alternate_emails`, `get_user_by_email(..., org_id=)` /
+  `get_app_user_by_email` / `get_entity_id_by_email` / `bulk_get_entity_ids_by_email` match aliases (primary wins) in both
+  Neo4j and Arango; the Kafka entity handler adopts a connector-created node found by alias.
 - `Dockerfile` runtime stage tail — non-root patch: uid 10001 owns `/app` and `/root` (caches stay at their
   upstream paths, `HOME=/root`), `USER 10001`. Pairs with platform-infra `cgraph_run_as_non_root` (image ≥ edrak6).
 - OCR provider `edrakOCR` (`config/constants/ai_models.py` `OCRProvider.EDRAK_OCR`, `MARKDOWN_OCR_PROVIDERS`;

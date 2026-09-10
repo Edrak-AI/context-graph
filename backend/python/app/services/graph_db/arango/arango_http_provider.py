@@ -125,7 +125,11 @@ from app.schema.arango.edges import (
 )
 from app.schema.arango.graph import EDGE_DEFINITIONS
 from app.services.graph_db.arango.arango_http_client import ArangoHTTPClient
-from app.services.graph_db.common.utils import build_connector_stats_response, dedupe_agents_by_id
+from app.services.graph_db.common.utils import (
+    alternate_email_matches,
+    build_connector_stats_response,
+    dedupe_agents_by_id,
+)
 from app.services.graph_db.interface.graph_db_provider import (
     IGraphDBProvider,
     _distinct_connector_types,
@@ -226,6 +230,14 @@ EDGE_COLLECTIONS = [
     (CollectionNames.MEMBER_OF.value, member_of_schema),
 ]
 
+
+
+def _user_email_match(alias: str) -> str:
+    """AQL predicate: `@email` is the document's primary e-mail or one of its alternate e-mails."""
+    return (
+        f"(LOWER({alias}.email) == LOWER(@email) "
+        f"OR LOWER(@email) IN (FOR x IN ({alias}.alternateEmails || []) RETURN LOWER(x)))"
+    )
 
 class ArangoHTTPProvider(IGraphDBProvider):
     """
@@ -4680,24 +4692,34 @@ class ArangoHTTPProvider(IGraphDBProvider):
     async def get_user_by_email(
         self,
         email: str,
-        transaction: str | None = None
+        transaction: str | None = None,
+        org_id: str | None = None,
     ) -> User | None:
         """
-        Get user by email.
+        Get user by email, optionally restricted to one org.
         """
+        org_filter = " AND user.orgId == @org_id" if org_id else ""
         query = f"""
         FOR user IN {CollectionNames.USERS.value}
-            FILTER LOWER(user.email) == LOWER(@email)
-            LIMIT 1
+            FILTER {_user_email_match("user")}{org_filter}
+            SORT LOWER(user.email) == LOWER(@email) ? 0 : 1
+            LIMIT 2
             RETURN user
         """
+        bind_vars: dict[str, str] = {"email": email}
+        if org_id:
+            bind_vars["org_id"] = org_id
 
         try:
             results = await self.http_client.execute_aql(
                 query,
-                bind_vars={"email": email},
+                bind_vars=bind_vars,
                 txn_id=transaction
             )
+
+            if results and len(results) > 1:
+                # Node enforces alternate-e-mail uniqueness per org; more than one hit means stale graph data.
+                self.logger.warning(f"⚠️ {len(results)} users match e-mail {email}; using the primary-address match")
 
             if results:
                 # Convert to User entity
@@ -4956,10 +4978,11 @@ class ArangoHTTPProvider(IGraphDBProvider):
                         RETURN a
                 )
 
-                // Then find the user by email
+                // Then find the user by email (primary first, then alternate)
                 LET user = FIRST(
                     FOR u IN {CollectionNames.USERS.value}
-                        FILTER LOWER(u.email) == LOWER(@email)
+                        FILTER {_user_email_match("u")}
+                        SORT LOWER(u.email) == LOWER(@email) ? 0 : 1
                         RETURN u
                 )
 
@@ -6602,11 +6625,14 @@ class ArangoHTTPProvider(IGraphDBProvider):
             if not users:
                 return
 
-            # Get org_id
-            orgs = await self.get_all_orgs()
-            if not orgs:
-                raise Exception("No organizations found in the database")
-            org_id = orgs[0]["_key"]
+            # Connectors that predate AppUser.org_id leave it empty; only a single-org install may fill it in.
+            default_org_id: str | None = None
+            if any(not user.org_id for user in users):
+                orgs = await self.get_all_orgs()
+                if not orgs:
+                    raise Exception("No organizations found in the database")
+                if len(orgs) == 1:
+                    default_org_id = orgs[0]["_key"]
             connector_id = users[0].connector_id
 
             app = await self.get_document(connector_id, CollectionNames.APPS.value)
@@ -6616,8 +6642,15 @@ class ArangoHTTPProvider(IGraphDBProvider):
             app_id = app["_id"]
 
             for user in users:
-                # Check if user exists
-                user_record = await self.get_user_by_email(user.email, transaction)
+                org_id = user.org_id or default_org_id
+                if not org_id:
+                    self.logger.warning(
+                        f"Skipping app user {user.email} ({connector_id}): no org_id and multiple orgs exist"
+                    )
+                    continue
+
+                # Check if user exists in this org
+                user_record = await self.get_user_by_email(user.email, transaction, org_id=org_id)
 
                 if not user_record:
                     # Create new user
@@ -6627,7 +6660,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
                         transaction=transaction
                     )
 
-                    user_record = await self.get_user_by_email(user.email, transaction)
+                    user_record = await self.get_user_by_email(user.email, transaction, org_id=org_id)
 
                     # Create org relation
                     user_org_relation = {
@@ -7069,7 +7102,8 @@ class ArangoHTTPProvider(IGraphDBProvider):
         # First check users
         query = f"""
         FOR doc IN {CollectionNames.USERS.value}
-            FILTER doc.email == @email
+            FILTER {_user_email_match("doc")}
+            SORT LOWER(doc.email) == LOWER(@email) ? 0 : 1
             LIMIT 1
             RETURN doc._key
         """
@@ -7152,24 +7186,38 @@ class ArangoHTTPProvider(IGraphDBProvider):
             # Deduplicate emails to avoid redundant queries
             unique_emails = list(set(emails))
 
-            # QUERY 1: Check users collection
+            # QUERY 1: Check users collection (primary or alternate e-mail)
             user_query = f"""
             FOR doc IN {CollectionNames.USERS.value}
                 FILTER doc.email IN @emails
-                RETURN {{email: doc.email, id: doc._key}}
+                    OR LENGTH(INTERSECTION(
+                        (FOR x IN (doc.alternateEmails || []) RETURN LOWER(x)), @emails_lower)) > 0
+                RETURN {{email: doc.email, alternateEmails: doc.alternateEmails, id: doc._key}}
             """
             try:
                 users = await self.http_client.execute_aql(
                     user_query,
-                    bind_vars={"emails": unique_emails},
+                    bind_vars={
+                        "emails": unique_emails,
+                        "emails_lower": [e.lower() for e in unique_emails if isinstance(e, str)],
+                    },
                     txn_id=transaction
                 )
+                alternate_hits: list[tuple[str, str]] = []
                 for user in users:
-                    result_map[user["email"]] = (
-                        user["id"],
-                        CollectionNames.USERS.value,
-                        "USER"
+                    if user["email"] in unique_emails:
+                        result_map[user["email"]] = (
+                            user["id"],
+                            CollectionNames.USERS.value,
+                            "USER"
+                        )
+                    alternate_hits.extend(
+                        (requested, user["id"])
+                        for requested in alternate_email_matches(unique_emails, user.get("alternateEmails"))
                     )
+                # A primary-address match always wins over an alternate-address match.
+                for requested, user_id in alternate_hits:
+                    result_map.setdefault(requested, (user_id, CollectionNames.USERS.value, "USER"))
                 self.logger.debug(f"✅ Found {len(users)} users")
             except Exception as e:
                 self.logger.error(f"❌ Error querying users: {str(e)}")

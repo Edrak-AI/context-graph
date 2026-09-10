@@ -5346,4 +5346,171 @@ describe('UserController', () => {
       expect(next.firstCall.args[0].message).to.equal('Invalid emails are found');
     });
   });
+
+  describe('provisionExternalUser (alternateEmails)', () => {
+    const orgId = '507f1f77bcf86cd799439012';
+    const existingId = new mongoose.Types.ObjectId('507f1f77bcf86cd799439011');
+
+    function existingUser(overrides: Record<string, unknown> = {}) {
+      return {
+        _id: existingId,
+        orgId: new mongoose.Types.ObjectId(orgId),
+        email: 'sujit@edrak.com',
+        fullName: 'Sujit',
+        role: 'member',
+        isDeleted: false,
+        alternateEmails: [],
+        ...overrides,
+      };
+    }
+
+    /** Users.findOne: 1st call = lookup by primary e-mail, 2nd = conflict query chain. */
+    function stubUsers(existing: unknown, conflict: unknown = null) {
+      const findOne = sinon.stub(Users, 'findOne');
+      findOne.onFirstCall().resolves(existing as any);
+      findOne.onSecondCall().returns({
+        select: sinon.stub().returnsThis(),
+        lean: sinon.stub().returnsThis(),
+        exec: sinon.stub().resolves(conflict),
+      } as any);
+      const updateOne = sinon.stub(Users, 'updateOne').resolves({} as any);
+      sinon.stub(UserGroups, 'updateOne').resolves({} as any);
+      return { findOne, updateOne };
+    }
+
+    beforeEach(() => {
+      req.body = { email: 'Sujit@edrak.com', fullName: 'Sujit', orgId };
+      sinon
+        .stub(Org, 'findOne')
+        .resolves({ _id: new mongoose.Types.ObjectId(orgId) } as any);
+    });
+
+    it('replaces the stored set, publishes userUpdated and echoes the set', async () => {
+      const { updateOne } = stubUsers(existingUser({ alternateEmails: ['old@demo.edrak.com'] }));
+      req.body.alternateEmails = [' Sujit@Demo.edrak.com ', 'sujit@demo.edrak.com'];
+
+      await controller.provisionExternalUser(req, res, next);
+
+      expect(next.called).to.be.false;
+      expect(updateOne.calledOnce).to.be.true;
+      expect(updateOne.firstCall.args[1].$set.alternateEmails).to.deep.equal([
+        'sujit@demo.edrak.com',
+      ]);
+      expect(mockEventService.publishEvent.calledOnce).to.be.true;
+      const event = mockEventService.publishEvent.firstCall.args[0];
+      expect(event.eventType).to.equal('userUpdated');
+      expect(event.payload.alternateEmails).to.deep.equal(['sujit@demo.edrak.com']);
+      expect(event.payload.userId).to.equal(String(existingId));
+      expect(res.status.calledWith(200)).to.be.true;
+      expect(res.json.firstCall.args[0]).to.deep.equal({
+        userId: String(existingId),
+        orgId,
+        role: 'member',
+        created: false,
+        alternateEmails: ['sujit@demo.edrak.com'],
+      });
+    });
+
+    it('leaves the set unchanged when the field is omitted', async () => {
+      const { findOne, updateOne } = stubUsers(existingUser({ alternateEmails: ['keep@demo.edrak.com'] }));
+
+      await controller.provisionExternalUser(req, res, next);
+
+      expect(next.called).to.be.false;
+      expect(findOne.calledOnce).to.be.true;
+      expect(updateOne.called).to.be.false;
+      expect(mockEventService.publishEvent.called).to.be.false;
+      expect(res.json.firstCall.args[0].alternateEmails).to.deep.equal(['keep@demo.edrak.com']);
+    });
+
+    it('clears the set with an empty array', async () => {
+      const { updateOne } = stubUsers(existingUser({ alternateEmails: ['old@demo.edrak.com'] }));
+      req.body.alternateEmails = [];
+
+      await controller.provisionExternalUser(req, res, next);
+
+      expect(updateOne.firstCall.args[1].$set.alternateEmails).to.deep.equal([]);
+      expect(res.json.firstCall.args[0].alternateEmails).to.deep.equal([]);
+    });
+
+    it('rejects an alternate equal to the primary e-mail', async () => {
+      const findOne = sinon.stub(Users, 'findOne');
+      req.body.alternateEmails = ['SUJIT@edrak.com'];
+
+      await controller.provisionExternalUser(req, res, next);
+
+      expect(findOne.called).to.be.false;
+      expect(next.calledOnce).to.be.true;
+      expect(next.firstCall.args[0].message).to.equal(
+        'alternateEmails must not contain the primary email',
+      );
+    });
+
+    it('replies 409 when an alternate belongs to another user in the org', async () => {
+      const { findOne, updateOne } = stubUsers(existingUser(), {
+        email: 'other@edrak.com',
+        alternateEmails: ['taken@demo.edrak.com'],
+      });
+      req.body.alternateEmails = ['free@demo.edrak.com', 'taken@demo.edrak.com'];
+
+      await controller.provisionExternalUser(req, res, next);
+
+      const conflictFilter = findOne.secondCall.args[0];
+      expect(conflictFilter._id).to.deep.equal({ $ne: String(existingId) });
+      expect(conflictFilter.$or).to.deep.equal([
+        { orgId, email: { $in: ['free@demo.edrak.com', 'taken@demo.edrak.com'] } },
+        { orgId, alternateEmails: { $in: ['free@demo.edrak.com', 'taken@demo.edrak.com'] } },
+      ]);
+      expect(updateOne.called).to.be.false;
+      expect(res.status.calledWith(409)).to.be.true;
+      expect(res.json.firstCall.args[0]).to.deep.equal({
+        error: 'alternate email in use',
+        email: 'taken@demo.edrak.com',
+      });
+    });
+
+    it("replies 409 when the primary e-mail is another user's alternate", async () => {
+      const { findOne } = stubUsers(null, {
+        email: 'other@edrak.com',
+        alternateEmails: ['sujit@edrak.com'],
+      });
+      const jit = sinon.stub(controller, 'provisionJitUser');
+
+      await controller.provisionExternalUser(req, res, next);
+
+      expect(findOne.secondCall.args[0].$or).to.deep.equal([
+        { orgId, email: { $in: ['sujit@edrak.com'] } },
+        { orgId, alternateEmails: { $in: ['sujit@edrak.com'] } },
+      ]);
+      expect(jit.called).to.be.false;
+      expect(res.status.calledWith(409)).to.be.true;
+      expect(res.json.firstCall.args[0]).to.deep.equal({
+        error: 'alternate email in use',
+        email: 'sujit@edrak.com',
+      });
+    });
+
+    it('passes the set to JIT creation for a new user and returns it', async () => {
+      stubUsers(null);
+      const jit = sinon.stub(controller, 'provisionJitUser').resolves({
+        _id: existingId,
+        alternateEmails: ['sujit@demo.edrak.com'],
+      } as any);
+      req.body.alternateEmails = ['sujit@demo.edrak.com'];
+
+      await controller.provisionExternalUser(req, res, next);
+
+      expect(next.called).to.be.false;
+      expect(jit.calledOnce).to.be.true;
+      expect(jit.firstCall.args[1].alternateEmails).to.deep.equal(['sujit@demo.edrak.com']);
+      expect(res.status.calledWith(201)).to.be.true;
+      expect(res.json.firstCall.args[0]).to.deep.equal({
+        userId: String(existingId),
+        orgId,
+        role: 'member',
+        created: true,
+        alternateEmails: ['sujit@demo.edrak.com'],
+      });
+    });
+  });
 });

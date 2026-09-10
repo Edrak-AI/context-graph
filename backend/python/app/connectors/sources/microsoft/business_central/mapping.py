@@ -42,10 +42,17 @@ could read).  The connector therefore mirrors *company access* only:
 | ``companyAccessGroups`` auth field    | members of that group = transitive members of | (same) |
 | (``Company = entra-group[, ...]``)    | the listed Entra groups (Microsoft Graph,     |        |
 |                                       | resolved by name or object id)                |        |
-| company **without** an access-group   | ORG (every member of the Edrak organisation)  | READER |
-| entry                                 | — the admin acknowledges this org-wide grant  |        |
-|                                       | in the edrak-ai policy dialog                 |        |
+| company whose entry (or the ``*``     | ORG (every member of the Edrak organisation)  | READER |
+| default) is the literal ``*``         | — the admin opts in explicitly and            |        |
+|                                       | acknowledges it in the edrak-ai policy dialog |        |
+| company **without** an entry and no   | nobody (the company group has no members; a   | —      |
+| ``*`` default                         | warning names the company)                    |        |
 +---------------------------------------+-----------------------------------------------+--------+
+
+Access is fail-closed: a ``companyAccessGroups`` value that does not parse fails the
+sync, an entry naming no synced company is logged as an error, and a company the
+mapping does not cover is readable by nobody until the admin adds it (or a ``*``
+default).  Org-wide access is never implied.
 
 Deliberately *not* mapped: ``salespersonCode`` / ``salesperson`` / ``purchaser`` are
 BC codes (``JR``, ``PS``), not e-mail addresses, so no OWNER edge is derived; BC
@@ -102,7 +109,8 @@ MS_PER_HOUR = 3_600_000
 
 RECORD_ID_PREFIX = "bc"
 COMPANY_GROUP_PREFIX = "bc:company:"
-ACCESS_MAPPING_WILDCARD = "*"
+ACCESS_MAPPING_WILDCARD = "*"   # key: applies to every company without its own entry
+ORG_WIDE_GROUP_REF = "*"        # value: explicit opt-in to org-wide (everyone in the Edrak org)
 
 # Sync-point document fields (camelCase like the other connectors' sync points).
 FIELD_LAST_SYNC = "lastSyncTimestamp"
@@ -467,13 +475,14 @@ class CompanyAccessMapping:
     * text, one entry per line or ``;``: ``CRONUS SA = BC Readers, 3f2b...guid``
     * JSON object: ``{"CRONUS SA": ["BC Readers"], "*": "All Finance"}``
 
-    ``*`` applies to every company without its own entry.  Companies with no entry (and
-    no wildcard) are readable org-wide.
+    ``*`` as a *key* applies to every company without its own entry.  ``*`` as a
+    *value* (``CRONUS SA = *`` or ``* = *``) is the explicit opt-in to org-wide read.
+    A company with no entry and no ``*`` key is readable by nobody.
     """
 
     groups_by_company: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    entry_labels: dict[str, str] = field(default_factory=dict)  # normalised key -> as written
     default_groups: tuple[str, ...] = ()
-    warnings: list[str] = field(default_factory=list)
 
     def groups_for(self, company: Company) -> tuple[str, ...]:
         for key in (normalize_name(company.name), normalize_name(company.display_name), company.id.lower()):
@@ -481,11 +490,19 @@ class CompanyAccessMapping:
                 return self.groups_by_company[key]
         return self.default_groups
 
+    def unmatched_entries(self, companies: Sequence[Company]) -> list[str]:
+        """Entries (as written) that name none of ``companies`` — typos grant nobody, so they are surfaced."""
+        matched: set[str] = set()
+        for company in companies:
+            matched.update((normalize_name(company.name), normalize_name(company.display_name), company.id.lower()))
+        return [self.entry_labels.get(key, key) for key in self.groups_by_company if key not in matched]
+
     def referenced_groups(self) -> list[str]:
+        """Entra group references to resolve (the org-wide token is not a group)."""
         refs: list[str] = list(self.default_groups)
         for groups in self.groups_by_company.values():
             refs.extend(groups)
-        return list(dict.fromkeys(refs))
+        return [r for r in dict.fromkeys(refs) if r != ORG_WIDE_GROUP_REF]
 
     def is_empty(self) -> bool:
         return not self.groups_by_company and not self.default_groups
@@ -502,7 +519,11 @@ def _split_group_refs(value: object) -> tuple[str, ...]:
 
 
 def parse_company_access_mapping(value: object) -> CompanyAccessMapping:
-    """Parse the ``companyAccessGroups`` auth field; never raises (problems land in ``warnings``)."""
+    """Parse the ``companyAccessGroups`` auth field.
+
+    Raises ``ValueError`` on anything malformed: a mapping that is silently ignored
+    would leave companies readable by the wrong people, so the sync must fail instead.
+    """
     mapping = CompanyAccessMapping()
     if value is None:
         return mapping
@@ -517,11 +538,9 @@ def parse_company_access_mapping(value: object) -> CompanyAccessMapping:
             try:
                 parsed = json.loads(text)
             except ValueError as e:
-                mapping.warnings.append(f"companyAccessGroups is not valid JSON ({e}); ignoring it")
-                return mapping
+                raise ValueError(f"companyAccessGroups is not valid JSON: {e}") from e
             if not isinstance(parsed, Mapping):
-                mapping.warnings.append("companyAccessGroups JSON must be an object of company -> groups")
-                return mapping
+                raise ValueError("companyAccessGroups JSON must be an object of company -> groups")
             entries = [(str(k), v) for k, v in parsed.items()]
         else:
             for raw_line in re.split(r"[\n;]", text):
@@ -530,18 +549,18 @@ def parse_company_access_mapping(value: object) -> CompanyAccessMapping:
                     continue
                 company, sep, groups = line.partition("=")
                 if not sep or not company.strip():
-                    mapping.warnings.append(f"companyAccessGroups entry {line!r} is not 'Company = group[, group]'")
-                    continue
+                    raise ValueError(f"companyAccessGroups entry {line!r} is not 'Company = group[, group]'")
                 entries.append((company.strip(), groups))
     for company, groups in entries:
         refs = _split_group_refs(groups)
         if not refs:
-            mapping.warnings.append(f"companyAccessGroups entry for {company!r} lists no group; company stays org-wide")
-            continue
+            raise ValueError(f"companyAccessGroups entry for {company!r} lists no group (use '*' for org-wide access)")
         if company.strip() == ACCESS_MAPPING_WILDCARD:
             mapping.default_groups = refs
         else:
-            mapping.groups_by_company[normalize_name(company)] = refs
+            key = normalize_name(company)
+            mapping.groups_by_company[key] = refs
+            mapping.entry_labels[key] = company.strip()
     return mapping
 
 
@@ -954,14 +973,18 @@ class PermissionGrant:
 
 @dataclass(frozen=True)
 class CompanyAccess:
-    """Resolved access of one company: the Entra groups that gate it (empty = org-wide)."""
+    """Resolved access of one company: the group references that gate it (empty = nobody)."""
 
     company: Company
     group_refs: tuple[str, ...] = ()
 
     @property
     def org_wide(self) -> bool:
-        return not self.group_refs
+        return ORG_WIDE_GROUP_REF in self.group_refs
+
+    @property
+    def entra_refs(self) -> tuple[str, ...]:
+        return tuple(r for r in self.group_refs if r != ORG_WIDE_GROUP_REF)
 
 
 def resolve_company_access(companies: Sequence[Company], mapping: CompanyAccessMapping) -> list[CompanyAccess]:
@@ -977,7 +1000,7 @@ def company_grants(access: CompanyAccess) -> list[PermissionGrant]:
         )
     ]
     if access.org_wide:
-        grants.append(PermissionGrant(GrantEntity.ORG, GrantRole.READER, reason="no companyAccessGroups entry"))
+        grants.append(PermissionGrant(GrantEntity.ORG, GrantRole.READER, reason="companyAccessGroups '*' opt-in"))
     return grants
 
 

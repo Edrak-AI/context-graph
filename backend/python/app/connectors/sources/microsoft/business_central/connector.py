@@ -251,9 +251,11 @@ def grants_to_permissions(grants: list[PermissionGrant]) -> list[Permission]:
                 description=(
                     "One line per company: 'Company = Entra group[, group...]' (display name or object id). "
                     "Members of the listed groups can find that company's records. '* = group' applies to "
-                    "the remaining companies. Companies without an entry are searchable by everyone in the "
-                    "organisation. Resolving groups needs GroupMember.Read.All and User.Read.All "
-                    "application permissions on this app."
+                    "the remaining companies; a company with no entry and no '*' line is readable by nobody. "
+                    "Use the value '*' (e.g. 'CRONUS SA = *') to make a company readable by everyone in the "
+                    "organisation. Group members are resolved through Microsoft Graph (GroupMember.Read.All "
+                    "and User.Read.All application permissions); B2B guest accounts are excluded, and a "
+                    "display name shared by several groups resolves to nobody — use the object id instead."
                 ),
                 field_type="TEXTAREA",
                 required=False,
@@ -399,9 +401,10 @@ class MicrosoftBusinessCentralConnector(BaseConnector):
         self._client_id = str(client_id)
         self._client_secret = str(client_secret)
         self._company_filter = parse_company_names(auth.get("companies"))
-        self._access_mapping = parse_company_access_mapping(auth.get("companyAccessGroups"))
-        for warning in self._access_mapping.warnings:
-            self.logger.warning("Business Central companyAccessGroups: %s", warning)
+        try:
+            self._access_mapping = parse_company_access_mapping(auth.get("companyAccessGroups"))
+        except ValueError as e:
+            raise ConnectorInitError(f"Business Central companyAccessGroups: {e}") from e
 
         await self._close_http()
         self._http = httpx.AsyncClient(
@@ -727,6 +730,13 @@ class MicrosoftBusinessCentralConnector(BaseConnector):
     async def _sync_access_model(self) -> None:
         accesses = resolve_company_access(self._companies, self._access_mapping)
         self._access_by_company = {a.company.id: a for a in accesses}
+        unmatched = self._access_mapping.unmatched_entries(self._companies)
+        if unmatched:
+            self.logger.error(
+                "Business Central companyAccessGroups: entries %s match none of the synced companies %s; "
+                "they grant nobody until corrected",
+                unmatched, [c.label for c in self._companies],
+            )
 
         resolved: dict[str, list[str] | None] = {}
         refs = self._access_mapping.referenced_groups()
@@ -739,7 +749,7 @@ class MicrosoftBusinessCentralConnector(BaseConnector):
         all_emails: set[str] = set()
         for access in accesses:
             members: set[str] = set()
-            for ref in access.group_refs:
+            for ref in access.entra_refs:
                 emails = resolved.get(ref)
                 if emails is None:
                     self.logger.warning(
@@ -749,7 +759,12 @@ class MicrosoftBusinessCentralConnector(BaseConnector):
                     continue
                 members.update(emails)
             if access.org_wide:
-                self.logger.info("Business Central company %s has no access groups; readable org-wide", access.company.label)
+                self.logger.info("Business Central company %s is configured org-wide ('*'); readable by the whole organisation", access.company.label)
+            elif not access.group_refs:
+                self.logger.warning(
+                    "Business Central company %s has no companyAccessGroups entry and no '*' default; nobody can read it",
+                    access.company.label,
+                )
             elif not members:
                 self.logger.warning(
                     "Business Central company %s: the configured access groups resolved to no members; nobody can read it",
@@ -777,7 +792,11 @@ class MicrosoftBusinessCentralConnector(BaseConnector):
         self.logger.info("Business Central access model: %d company groups, %d users", len(groups), len(all_emails))
 
     def _company_permissions(self, company: Company) -> list[Permission]:
-        access = self._access_by_company.get(company.id) or CompanyAccess(company=company)
+        access = self._access_by_company.get(company.id)
+        if access is None:
+            # only reachable when records are processed before ``_sync_access_model`` ran (``_run`` always
+            # orders them); permissions from an unresolved model would be wrong either way, so fail loudly
+            raise RuntimeError(f"Business Central company {company.label} has no resolved access model; run the access sync first")
         return grants_to_permissions(company_grants(access))
 
     # ------------------------------------------------------------------

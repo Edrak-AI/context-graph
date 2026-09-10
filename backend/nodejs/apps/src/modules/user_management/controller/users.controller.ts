@@ -75,6 +75,9 @@ import { resolveOAuthTokenService } from '../../../libs/services/oauth-token-ser
 
 export const MAX_BULK_INVITE = 1000;
 
+const sameStringSet = (a: string[], b: string[]): boolean =>
+  a.length === b.length && a.every((x) => b.includes(x));
+
 // Linear-time email check: each segment excludes its following separator
 // (`@`/`.`), so there is no ambiguous backtracking (avoids ReDoS).
 const EMAIL_REGEX = /^[^\s@]+@[^\s@.]+(?:\.[^\s@.]+)+$/;
@@ -622,7 +625,12 @@ export class UserController {
    */
   async provisionJitUser(
     email: string,
-    userDetails: { firstName?: string; lastName?: string; fullName: string },
+    userDetails: {
+      firstName?: string;
+      lastName?: string;
+      fullName: string;
+      alternateEmails?: string[];
+    },
     orgId: string,
     provider: 'google' | 'microsoft' | 'azureAd' | 'oauth',
     logger: Logger,
@@ -665,6 +673,7 @@ export class UserController {
           userId: newUser._id,
           fullName: newUser.fullName,
           email: newUser.email,
+          alternateEmails: newUser.alternateEmails ?? [],
           syncAction: SyncAction.Immediate,
         } as UserAddedEvent,
       });
@@ -685,6 +694,57 @@ export class UserController {
     return newUser.toObject();
   }
 
+  private async singleActiveOrg() {
+    const orgs = await Org.find({ isDeleted: false }).limit(2);
+    if (orgs.length !== 1) {
+      throw new BadRequestError(
+        'orgId is required when more than one organization exists',
+      );
+    }
+    return orgs[0];
+  }
+
+  /** First of `emails` already used as another user's primary or alternate in the org, if any. */
+  private async findAlternateEmailConflict(
+    orgId: string,
+    emails: string[],
+    excludeUserId?: string,
+  ): Promise<string | undefined> {
+    // orgId inside each branch so both can be answered by an index (unique email, orgId+alternateEmails).
+    const filter: Record<string, unknown> = {
+      $or: [
+        { orgId, email: { $in: emails } },
+        { orgId, alternateEmails: { $in: emails } },
+      ],
+    };
+    if (excludeUserId !== undefined) filter._id = { $ne: excludeUserId };
+    const other = await Users.findOne(filter)
+      .select('email alternateEmails')
+      .lean<Pick<User, 'email' | 'alternateEmails'>>()
+      .exec();
+    if (!other) return undefined;
+    const taken = new Set([other.email, ...(other.alternateEmails ?? [])]);
+    return emails.find((e) => taken.has(e));
+  }
+
+  private async publishUserUpdated(payload: UserUpdatedEvent): Promise<void> {
+    try {
+      await this.eventService.start();
+      await this.eventService.publishEvent({
+        eventType: EventType.UpdateUserEvent,
+        timestamp: Date.now(),
+        payload,
+      });
+    } catch (eventError) {
+      this.logger.error('Failed to publish user update event', {
+        error: eventError,
+        userId: payload.userId,
+      });
+    } finally {
+      await this.eventService.stop();
+    }
+  }
+
   /**
    * Edrak identity bridge: create-or-update a user on behalf of a trusted external
    * identity provider (scoped `user:provision` token). Idempotent by email; the
@@ -703,6 +763,7 @@ export class UserController {
         firstName,
         lastName,
         role,
+        alternateEmails: requestedAlternateEmails,
         orgId: requestedOrgId,
       } = req.body as {
         email: string;
@@ -710,24 +771,60 @@ export class UserController {
         firstName?: string;
         lastName?: string;
         role?: string;
+        alternateEmails?: string[];
         orgId?: string;
       };
       const normalizedEmail = email.trim().toLowerCase();
       const desiredRole = normalizeUserRole(role) ?? 'member';
+      // undefined → leave the stored set untouched; [] → clear it.
+      const alternateEmails = requestedAlternateEmails
+        ? Array.from(
+            new Set(
+              requestedAlternateEmails.map((e) => e.trim().toLowerCase()),
+            ),
+          )
+        : undefined;
+      if (alternateEmails?.includes(normalizedEmail)) {
+        throw new BadRequestError(
+          'alternateEmails must not contain the primary email',
+        );
+      }
 
+      // Without an explicit orgId the only safe answer is the deployment's single org; with
+      // several orgs, guessing (e.g. the oldest) would silently place the user in another tenant.
       const org = requestedOrgId
         ? await findActiveOrgById(requestedOrgId)
-        : await Org.findOne({ isDeleted: false }).sort({ createdAt: 1 });
+        : await this.singleActiveOrg();
       if (!org) {
         throw new NotFoundError('Organization not found');
       }
       const orgId = String(org._id);
 
       const existing = await Users.findOne({ email: normalizedEmail });
-      if (existing) {
-        if (existing.orgId.toString() !== orgId) {
-          throw new BadRequestError('User belongs to a different organization');
+      if (existing && existing.orgId.toString() !== orgId) {
+        throw new BadRequestError('User belongs to a different organization');
+      }
+
+      // A new primary must not be someone's alternate either: the graph consumer resolves by
+      // either address and would otherwise adopt the alias owner's node.
+      const conflictCandidates = existing
+        ? alternateEmails ?? []
+        : [normalizedEmail, ...(alternateEmails ?? [])];
+      if (conflictCandidates.length > 0) {
+        const conflictEmail = await this.findAlternateEmailConflict(
+          orgId,
+          conflictCandidates,
+          existing ? String(existing._id) : undefined,
+        );
+        if (conflictEmail) {
+          res
+            .status(409)
+            .json({ error: 'alternate email in use', email: conflictEmail });
+          return;
         }
+      }
+
+      if (existing) {
         const set: Record<string, unknown> = {};
         if (existing.isDeleted) {
           set.isDeleted = false;
@@ -741,6 +838,11 @@ export class UserController {
           set.lastName = lastName;
         }
         if (existing.role !== desiredRole) set.role = desiredRole;
+        const storedAlternates = existing.alternateEmails ?? [];
+        const alternatesChanged =
+          alternateEmails !== undefined &&
+          !sameStringSet(alternateEmails, storedAlternates);
+        if (alternatesChanged) set.alternateEmails = alternateEmails;
         if (Object.keys(set).length > 0) {
           await Users.updateOne({ _id: existing._id }, { $set: set });
         }
@@ -750,18 +852,32 @@ export class UserController {
             { $addToSet: { users: existing._id } },
           );
         }
+        const finalAlternates = alternateEmails ?? storedAlternates;
+        if (Object.keys(set).length > 0) {
+          // The graph mirror (Python entity consumer) only learns about profile changes through this event.
+          await this.publishUserUpdated({
+            orgId,
+            userId: String(existing._id),
+            fullName,
+            firstName: firstName ?? existing.firstName,
+            lastName: lastName ?? existing.lastName,
+            email: normalizedEmail,
+            alternateEmails: finalAlternates,
+          });
+        }
         res.status(200).json({
           userId: String(existing._id),
           orgId,
           role: desiredRole,
           created: false,
+          alternateEmails: finalAlternates,
         });
         return;
       }
 
       const created = await this.provisionJitUser(
         normalizedEmail,
-        { firstName, lastName, fullName },
+        { firstName, lastName, fullName, alternateEmails },
         orgId,
         'oauth',
         this.logger,
@@ -777,6 +893,7 @@ export class UserController {
         orgId,
         role: desiredRole,
         created: true,
+        alternateEmails: created.alternateEmails ?? [],
       });
     } catch (error) {
       next(error);

@@ -16,6 +16,8 @@ export interface User extends Document, Address {
   lastName?: string;
   middleName?: string;
   email: string;
+  /** Extra verified addresses that resolve to this user (lower-cased); see users `/internal/provision`. */
+  alternateEmails?: string[];
   mobile?: string;
   hasLoggedIn?: boolean;
   designation?: string;
@@ -40,6 +42,14 @@ const userSchema = new Schema<User>(
       lowercase: true,
       unique: true,
     },
+    alternateEmails: {
+      type: [String],
+      default: [],
+      set: (emails: unknown) =>
+        Array.isArray(emails)
+          ? emails.map((e) => String(e).trim().toLowerCase())
+          : [],
+    },
     mobile: { type: String },
     hasLoggedIn: { type: Boolean, default: false },
     designation: { type: String, trim: true },
@@ -62,6 +72,8 @@ const userSchema = new Schema<User>(
   },
   { timestamps: true },
 );
+
+userSchema.index({ orgId: 1, alternateEmails: 1 }, { sparse: true });
 
 userSchema.pre<User>('save', async function (next) {
   try {

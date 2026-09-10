@@ -965,6 +965,51 @@ describe('User Routes', () => {
       expect(mockUserController.listUsers.calledOnce).to.be.true;
     });
 
+    describe('POST /internal/provision alternateEmails validation', () => {
+      // Route stack: scopedTokenValidator, validation, handler
+      const provisionValidation = (router: any) =>
+        findRouteLayer(router, '/internal/provision', 'post').route.stack[1].handle;
+
+      it('rejects a non-email alternate', async () => {
+        const router = createUserRouter(container);
+        const { mockReq, mockRes, mockNext } = createMockReqRes();
+        mockReq.body = {
+          email: 'a@x.com',
+          fullName: 'A',
+          alternateEmails: ['not-an-email'],
+        };
+        await provisionValidation(router)(mockReq, mockRes, mockNext);
+        expect(mockNext.calledOnce).to.be.true;
+        expect(mockNext.firstCall.args[0]).to.exist;
+      });
+
+      it('rejects more than 10 alternates', async () => {
+        const router = createUserRouter(container);
+        const { mockReq, mockRes, mockNext } = createMockReqRes();
+        mockReq.body = {
+          email: 'a@x.com',
+          fullName: 'A',
+          alternateEmails: Array.from({ length: 11 }, (_, i) => `u${i}@x.com`),
+        };
+        await provisionValidation(router)(mockReq, mockRes, mockNext);
+        expect(mockNext.calledOnce).to.be.true;
+        expect(mockNext.firstCall.args[0]).to.exist;
+      });
+
+      it('accepts an omitted field and an empty array', async () => {
+        const router = createUserRouter(container);
+        for (const body of [
+          { email: 'a@x.com', fullName: 'A' },
+          { email: 'a@x.com', fullName: 'A', alternateEmails: [] },
+        ]) {
+          const { mockReq, mockRes, mockNext } = createMockReqRes();
+          mockReq.body = body;
+          await provisionValidation(router)(mockReq, mockRes, mockNext);
+          expect(mockNext.calledOnce).to.be.true;
+          expect(mockNext.firstCall.args[0]).to.be.undefined;
+        }
+      });
+    });
   });
 });
 

@@ -188,6 +188,7 @@ _MAX_CONCURRENT_REQUESTS = 4
 _KNOWN_RECORDS_PAGE = 1000       # keyset page size when enumerating stored records
 _RECONCILE_DELETE_BATCH = 100    # record ids per cascade-delete call
 _GUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+GUEST_USER_TYPE = "guest"  # Graph ``user.userType`` of B2B guests (compared lower-cased)
 
 _GRANT_ROLE_TO_PERMISSION = {
     GrantRole.READER: PermissionType.READ,
@@ -373,7 +374,9 @@ def _shared_auth_fields() -> List[AuthField]:
                 '"salesorg:1010": ["group:<entra-object-id>"], "plant:1010": [...], '
                 '"entity:product": ["group:Everyone"], "groups": {"Name": ["a@x.com"]}, '
                 '"users": {"CB9980000042": "jane@edrak.com"}}. group: entries are Entra groups '
-                "(display name or object id) when the Entra fields are set, else inline 'groups'."
+                "(display name or object id) when the Entra fields are set, else inline 'groups'. "
+                "Entra expansion skips disabled accounts and B2B guests; a display name shared by several "
+                "groups resolves to nobody — use the object id."
             ),
         ))
         .add_sync_custom_field(CustomField(
@@ -1311,13 +1314,25 @@ class EntraGroupResolver(EntraGraphClient):
     (app-only client credentials; needs ``GroupMember.Read.All`` + ``User.Read.All``).
 
     Members are identified by their Entra primary address (``graph_user_email``) so the
-    result matches the addresses people sign in to Edrak with.  Results are cached for
-    the resolver's lifetime (= one connector instance / sync).  Unknown groups resolve to
-    ``None`` so the caller can fall back to inline members.
+    result matches the addresses people sign in to Edrak with.  Disabled accounts and,
+    unless ``include_guests`` is set, B2B guests (``userType == Guest``) are skipped.
+    Results are cached for the resolver's lifetime (= one connector instance / sync).
+    Unknown groups — and display names shared by several groups, which cannot be told
+    apart safely — resolve to ``None`` so the caller can fall back to inline members.
     """
 
-    def __init__(self, tenant_id: str, client_id: str, client_secret: str, logger: Logger) -> None:
-        super().__init__(tenant_id, client_id, client_secret, logger)
+    def __init__(
+        self,
+        tenant_id: str,
+        client_id: str,
+        client_secret: str,
+        logger: Logger,
+        http: Optional[httpx.AsyncClient] = None,
+        *,
+        include_guests: bool = False,
+    ) -> None:
+        super().__init__(tenant_id, client_id, client_secret, logger, http)
+        self._include_guests = include_guests
         self._cache: Dict[str, Optional[List[str]]] = {}
 
     async def _group_id(self, name_or_id: str) -> Optional[str]:
@@ -1338,17 +1353,24 @@ class EntraGroupResolver(EntraGraphClient):
         if not matches:
             return None
         if len(matches) > 1:
-            self._logger.warning("Entra: %d groups named %r; using %s", len(matches), name_or_id, matches[0]["id"])
+            self._logger.error(
+                "Entra: %d groups are named %r (%s); the name is ambiguous and grants nobody — "
+                "reference the intended group by its object id instead",
+                len(matches), name_or_id, ", ".join(str(g["id"]) for g in matches),
+            )
+            return None
         return str(matches[0]["id"])
 
     async def _members(self, group_id: str) -> List[str]:
         emails: List[str] = []
         url: Optional[str] = f"{GRAPH_BASE_URL}/groups/{group_id}/transitiveMembers/microsoft.graph.user"
-        params: Optional[Dict[str, str]] = {"$select": USER_EMAIL_SELECT, "$top": "999"}
+        params: Optional[Dict[str, str]] = {"$select": f"{USER_EMAIL_SELECT},userType", "$top": "999"}
         while url:
             payload = await self._get(url, params)
             for user in payload.get("value") or []:
                 if not isinstance(user, dict) or user.get("accountEnabled") is False:
+                    continue
+                if not self._include_guests and str(user.get("userType") or "").lower() == GUEST_USER_TYPE:
                     continue
                 email = graph_user_email(user)
                 if email:

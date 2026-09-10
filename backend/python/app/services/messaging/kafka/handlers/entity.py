@@ -20,6 +20,14 @@ from app.services.graph_db.interface.graph_db_provider import IGraphDBProvider
 from app.utils.time_conversion import get_epoch_timestamp_in_ms
 
 
+def _normalize_alternate_emails(payload: dict) -> list[str] | None:
+    """Lower-cased alternate e-mails from a user event; None when the event does not carry the field."""
+    if "alternateEmails" not in payload:
+        return None
+    raw = payload.get("alternateEmails") or []
+    return [str(e).strip().lower() for e in raw if e and str(e).strip()]
+
+
 class EntityEventService(BaseEventService):
     def __init__(
         self,
@@ -210,6 +218,15 @@ class EntityEventService(BaseEventService):
             existing_user = await self.graph_provider.get_user_by_email(
                 payload["email"]
             )
+            alternate_emails = _normalize_alternate_emails(payload)
+            # A connector may already have created an inactive node under one of the alternates; adopt it
+            # so its permissions and app relations end up on the platform user.
+            for alternate in alternate_emails or []:
+                if existing_user:
+                    break
+                existing_user = await self.graph_provider.get_user_by_email(
+                    alternate, org_id=payload["orgId"]
+                )
 
             current_timestamp = get_epoch_timestamp_in_ms()
 
@@ -220,9 +237,12 @@ class EntityEventService(BaseEventService):
                     "id": user_key,
                     "userId": payload["userId"],
                     "orgId": payload["orgId"],
+                    "email": payload["email"],
                     "isActive": True,
                     "updatedAtTimestamp": current_timestamp,
                 }
+                if alternate_emails is not None:
+                    user_data["alternateEmails"] = alternate_emails
             else:
                 user_key = str(uuid4())
                 user_data = {
@@ -236,6 +256,7 @@ class EntityEventService(BaseEventService):
                     "lastName": payload.get("lastName", ""),
                     "designation": payload.get("designation", ""),
                     "businessPhones": payload.get("businessPhones", []),
+                    "alternateEmails": alternate_emails or [],
                     "isActive": True,
                     "createdAtTimestamp": current_timestamp,
                     "updatedAtTimestamp": current_timestamp,
@@ -330,6 +351,9 @@ class EntityEventService(BaseEventService):
                     if payload.get(key) is not None
                 }
             )
+            alternate_emails = _normalize_alternate_emails(payload)
+            if alternate_emails is not None:
+                user_data["alternateEmails"] = alternate_emails
 
             # Batch upsert user
             await self.graph_provider.batch_upsert_nodes(

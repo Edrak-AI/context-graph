@@ -14,12 +14,15 @@ from app.connectors.sources.microsoft.dynamics365.mapping import (
     ENTITY_SPECS,
     PRINCIPAL_TYPE_SYSTEMUSER,
     PRINCIPAL_TYPE_TEAM,
+    SYSTEM_ADMINISTRATOR_ROLE_TEMPLATE_ID,
     GrantEntity,
     GrantRole,
     PermissionGrant,
+    RoleCopy,
     SecurityContext,
     ShareEntry,
     attachment_external_id,
+    bu_entity_group_external_id,
     bu_group_external_id,
     build_metadata,
     build_modified_filter,
@@ -27,7 +30,9 @@ from app.connectors.sources.microsoft.dynamics365.mapping import (
     changed_share_record_ids,
     derive_grants,
     display_value,
+    entity_readers,
     epoch_ms_to_odata,
+    global_read_group_external_id,
     index_shares,
     is_application_user,
     normalize_environment_url,
@@ -39,11 +44,14 @@ from app.connectors.sources.microsoft.dynamics365.mapping import (
     render_record_markdown,
     resolve_selected_entities,
     role_external_id,
+    role_has_bu_read,
     role_has_global_read,
+    role_read_depth,
     share_digest,
     share_digests,
     share_role,
     split_external_id,
+    system_administrator_match,
     systemuser_email,
     team_group_external_id,
     token_scope,
@@ -60,7 +68,7 @@ TEAM_X = "33333333-3333-3333-3333-333333333333"
 BU_ROOT = "44444444-4444-4444-4444-444444444444"
 OPP_ID = "55555555-5555-5555-5555-555555555555"
 ROLE_ADMIN = "role:aaaaaaaa-0000-0000-0000-000000000001"
-ROLE_SALES = "role:aaaaaaaa-0000-0000-0000-000000000002"
+GLOBAL_OPP = global_read_group_external_id(OPP)
 
 
 def _ctx(**overrides) -> SecurityContext:
@@ -68,7 +76,6 @@ def _ctx(**overrides) -> SecurityContext:
         user_email_by_id={USER_A: "alice@contoso.com", USER_B: "bob@contoso.com"},
         known_team_ids={TEAM_X},
         known_business_unit_ids={BU_ROOT},
-        global_read_roles_by_entity={"opportunity": {ROLE_SALES}},
         system_admin_role_id=ROLE_ADMIN,
     )
     for key, value in overrides.items():
@@ -141,14 +148,42 @@ class TestEntityRegistry:
         assert read_privilege_name(INC) == "prvReadIncident"
         assert read_privilege_name(NOTE) == "prvReadNote"
 
-    def test_role_has_global_read(self):
+    def test_role_read_depth_and_predicates(self) -> None:
         privs = [
             {"PrivilegeName": "prvReadOpportunity", "Depth": "Deep"},
             {"PrivilegeName": "prvReadIncident", "Depth": "Global"},
+            {"PrivilegeName": "prvReadNote", "Depth": "Basic"},
         ]
+        assert role_read_depth(privs, OPP) == "Deep" and role_read_depth([], OPP) is None
         assert role_has_global_read(privs, INC) is True
         assert role_has_global_read(privs, OPP) is False  # Deep is not Global
         assert role_has_global_read([], OPP) is False
+        assert role_has_bu_read(privs, OPP) is True and role_has_bu_read(privs, INC) is True
+        assert role_has_bu_read(privs, NOTE) is False  # Basic = own rows only, no BU read
+        # duplicated privilege rows: the widest depth wins
+        dup = [{"PrivilegeName": "prvReadNote", "Depth": "Basic"}, {"PrivilegeName": "prvReadNote", "Depth": "Local"}]
+        assert role_read_depth(dup, NOTE) == "Local"
+
+    def test_system_administrator_match_prefers_template_id(self) -> None:
+        template = SYSTEM_ADMINISTRATOR_ROLE_TEMPLATE_ID
+        assert system_administrator_match({"name": "مسؤول النظام", "roletemplateid": template.upper()}) == "roletemplateid"
+        # a custom role that reuses the display name is not the built-in one
+        assert system_administrator_match({"name": "System Administrator", "roletemplateid": None}) is None
+        assert system_administrator_match({"name": "Salesperson", "roletemplateid": "11111111-1111-1111-1111-111111111111"}) is None
+        # the name is only trusted when the payload has no roletemplateid field at all
+        assert system_administrator_match({"name": "System Administrator"}) == "name"
+        assert system_administrator_match({"name": "Salesperson"}) is None
+
+    def test_entity_readers_are_evaluated_per_role_copy(self) -> None:
+        root_copy = RoleCopy("r-root", frozenset({USER_A}), ({"PrivilegeName": "prvReadOpportunity", "Depth": "Deep"},))
+        child_copy = RoleCopy("r-child", frozenset({USER_B}), ({"PrivilegeName": "prvReadOpportunity", "Depth": "Global"},))
+        basic_copy = RoleCopy("r-basic", frozenset({"u-basic"}), ({"PrivilegeName": "prvReadOpportunity", "Depth": "Basic"},))
+        unreadable = RoleCopy("r-none", frozenset({"u-none"}), ())
+        readers = entity_readers([root_copy, child_copy, basic_copy, unreadable], OPP)
+        assert readers.bu_read == {USER_A, USER_B}         # Deep and Global read their BU's rows
+        assert readers.global_read == {USER_B}             # only the copy that itself is Global
+        none = entity_readers([root_copy, child_copy], INC)
+        assert none.bu_read == frozenset() and none.global_read == frozenset()
 
     def test_external_ids_round_trip(self):
         ext = record_external_id(OPP, OPP_ID)
@@ -157,6 +192,8 @@ class TestEntityRegistry:
         assert split_external_id(attachment_external_id("abc")) == ("annotation-file", "abc")
         assert team_group_external_id(TEAM_X) == f"team:{TEAM_X}"
         assert bu_group_external_id(BU_ROOT) == f"bu:{BU_ROOT}"
+        assert bu_entity_group_external_id(BU_ROOT, OPP) == f"bu:{BU_ROOT}:opportunity"
+        assert global_read_group_external_id(INC) == "globalread:incident"
         with pytest.raises(ValueError):
             split_external_id("no-separator")
 
@@ -285,10 +322,12 @@ class TestPermissionMapping:
         grants = derive_grants(OPP, _opp_row(), _ctx())
         assert _grant_keys(grants) == {
             (GrantEntity.USER, GrantRole.OWNER, None, "alice@contoso.com"),
-            (GrantEntity.GROUP, GrantRole.READER, f"bu:{BU_ROOT}", None),
+            # the BU grant is per table: only read-privileged BU members are in this group
+            (GrantEntity.GROUP, GrantRole.READER, f"bu:{BU_ROOT}:opportunity", None),
             (GrantEntity.ROLE, GrantRole.READER, ROLE_ADMIN, None),
-            (GrantEntity.ROLE, GrantRole.READER, ROLE_SALES, None),
+            (GrantEntity.GROUP, GrantRole.READER, GLOBAL_OPP, None),
         }
+        assert not any(g.external_id == f"bu:{BU_ROOT}" for g in grants)
 
     def test_team_owner_becomes_group_owner(self):
         row = _opp_row(_owninguser_value=None, _owningteam_value=TEAM_X, _ownerid_value=TEAM_X)
@@ -309,21 +348,19 @@ class TestPermissionMapping:
         grants = derive_grants(OPP, row, _ctx())
         assert not any(g.entity_type == GrantEntity.USER for g in grants)
 
-    def test_global_read_roles_are_per_entity(self):
-        ctx = _ctx()
+    def test_global_read_group_is_per_entity(self) -> None:
         inc_row = {"incidentid": "i1", "_owninguser_value": USER_B, "_owningbusinessunit_value": BU_ROOT}
-        grants = derive_grants(INC, inc_row, ctx)
-        role_ids = {g.external_id for g in grants if g.entity_type == GrantEntity.ROLE}
-        assert role_ids == {ROLE_ADMIN}  # sales role only has Global read on opportunities
+        grants = derive_grants(INC, inc_row, _ctx())
+        assert {g.external_id for g in grants if g.entity_type == GrantEntity.ROLE} == {ROLE_ADMIN}
+        group_ids = {g.external_id for g in grants if g.entity_type == GrantEntity.GROUP}
+        assert group_ids == {f"bu:{BU_ROOT}:incident", "globalread:incident"}
 
     def test_system_admin_always_granted_even_without_privilege_data(self):
-        ctx = _ctx(global_read_roles_by_entity={})
-        grants = derive_grants(OPP, _opp_row(), ctx)
+        grants = derive_grants(OPP, _opp_row(), _ctx())
         assert (GrantEntity.ROLE, GrantRole.READER, ROLE_ADMIN, None) in _grant_keys(grants)
 
     def test_no_admin_role_when_not_resolved(self):
-        ctx = _ctx(system_admin_role_id=None, global_read_roles_by_entity={})
-        grants = derive_grants(OPP, _opp_row(), ctx)
+        grants = derive_grants(OPP, _opp_row(), _ctx(system_admin_role_id=None))
         assert not any(g.entity_type == GrantEntity.ROLE for g in grants)
 
     def test_shares_map_to_reader_or_writer(self):
@@ -410,13 +447,11 @@ class TestPermissionMapping:
         assert changed_share_record_ids({}, current) == set(current)
         assert changed_share_record_ids(previous, {}) == set(previous)
 
-    def test_entity_role_grants_for_record_groups(self):
-        grants = _ctx().entity_role_grants(OPP)
-        assert [g.external_id for g in grants] == [ROLE_ADMIN, ROLE_SALES]
-        assert all(g.role == GrantRole.READER and g.entity_type == GrantEntity.ROLE for g in grants)
-        # admin id is not duplicated when it also has Global read
-        ctx = _ctx(global_read_roles_by_entity={"opportunity": {ROLE_ADMIN, ROLE_SALES}})
-        assert [g.external_id for g in ctx.entity_role_grants(OPP)] == [ROLE_ADMIN, ROLE_SALES]
+    def test_entity_wide_grants_for_record_groups(self) -> None:
+        grants = _ctx().entity_wide_grants(OPP)
+        assert [(g.entity_type, g.external_id) for g in grants] == [(GrantEntity.ROLE, ROLE_ADMIN), (GrantEntity.GROUP, GLOBAL_OPP)]
+        assert all(g.role == GrantRole.READER for g in grants)
+        assert [g.external_id for g in _ctx(system_admin_role_id=None).entity_wide_grants(INC)] == ["globalread:incident"]
 
     def test_permission_grant_reason_is_not_part_of_identity(self):
         a = PermissionGrant(GrantEntity.USER, GrantRole.OWNER, email="x@y.z", reason="one")

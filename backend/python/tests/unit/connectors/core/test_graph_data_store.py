@@ -193,7 +193,7 @@ class TestGraphTransactionStore:
     async def test_get_user_by_email(self, tx_store, mock_graph_provider) -> None:
         result = await tx_store.get_user_by_email("test@example.com")
         assert result is None
-        mock_graph_provider.get_user_by_email.assert_awaited_once_with("test@example.com", transaction="txn-123")
+        mock_graph_provider.get_user_by_email.assert_awaited_once_with("test@example.com", transaction="txn-123", org_id=None)
 
     @pytest.mark.asyncio
     async def test_get_user_by_source_id(self, tx_store, mock_graph_provider) -> None:
