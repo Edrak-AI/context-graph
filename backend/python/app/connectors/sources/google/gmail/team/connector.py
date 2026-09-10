@@ -64,6 +64,9 @@ from app.connectors.core.registry.filters import (
     load_connector_filters,
 )
 from app.connectors.sources.google.common.apps import GmailTeamApp
+from app.connectors.sources.google.common.directory_identity import (
+    directory_alternate_emails,
+)
 from app.connectors.sources.google.common.gmail_received_date_query import (
     build_gmail_received_date_threads_query,
 )
@@ -2010,6 +2013,7 @@ class GoogleGmailTeamConnector(BaseConnector):
                                 connector_id=self.connector_id,
                                 source_user_id=user.get("id", ""),
                                 email=email,
+                                alternate_emails=directory_alternate_emails(user),
                                 full_name=full_name,
                                 is_active=is_active,
                                 title=title,

@@ -334,6 +334,7 @@ class FakeEntra:
     def __init__(self, tenant_id: str, client_id: str, client_secret: str, logger: logging.Logger) -> None:
         self.args = (tenant_id, client_id, client_secret)
         self.requested: list[str] = []
+        self.alternates_by_email = {"a@edrak.com": ["a@favapps.co"]}
         FakeEntra.instances.append(self)
 
     async def resolve_many(self, names: list[str]) -> dict[str, list[str] | None]:
@@ -364,6 +365,8 @@ class TestAccessModel:
         arabic_group, arabic_members = groups[company_group_external_id(ARABIC.id)]
         assert arabic_group.name == "Business Central · شركة المثال" and arabic_members == []
         assert sorted(u.email for u in processor.users) == ["a@edrak.com", "b@edrak.com"]
+        # Entra directory aliases ride along on the AppUser so the graph can link alias sign-ins
+        assert {u.email: u.alternate_emails for u in processor.users} == {"a@edrak.com": ["a@favapps.co"], "b@edrak.com": []}
 
         record_groups = {rg.external_group_id: (rg, perms) for rg, perms in processor.record_groups}
         _, cronus_perms = record_groups[company_group_external_id(CRONUS.id)]

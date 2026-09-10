@@ -3,12 +3,13 @@ import os
 import json
 from datetime import datetime, timezone
 from enum import Enum
+from collections.abc import Iterable
 from typing import Any, Optional,Dict, List, Literal, TypeVar
 from uuid import uuid4
 from app.modules.qna.prompt_templates import (
     agent_block_group_prompt,
 )
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from app.models.blocks import BlockType, GroupType
 from app.config.constants.arangodb import (
     CollectionNames,
@@ -2762,6 +2763,7 @@ class User(BaseModel):
     id: str = Field(description="Unique identifier for the user", default_factory=lambda: str(uuid4()))
     email: str
     alternate_emails: list[str] = Field(default_factory=list, description="Other addresses that resolve to this user")
+    source_emails: list[str] = Field(default_factory=list, description="Addresses connectors reported for this user")
     source_user_id: str | None = None
     org_id: str | None = None
     user_id: str | None = None
@@ -2792,6 +2794,7 @@ class User(BaseModel):
             id=data.get("id", data.get("_key")),
             email=data.get("email", ""),
             alternate_emails=list(data.get("alternateEmails") or []),
+            source_emails=list(data.get("sourceEmails") or []),
             org_id=data.get("orgId", ""),
             user_id=data.get("userId"),
             is_active=data.get("isActive", False),
@@ -2868,6 +2871,17 @@ class Person(BaseModel):
         )
 
 
+def normalize_alternate_emails(primary: object, candidates: Iterable[object] | None) -> list[str]:
+    """Lower-cased, deduped addresses that differ from ``primary``; non-addresses are dropped."""
+    own = str(primary or "").strip().lower()
+    result: list[str] = []
+    for candidate in candidates or ():
+        text = str(candidate or "").strip().lower()
+        if "@" in text and text != own and text not in result:
+            result.append(text)
+    return result
+
+
 class AppUser(BaseModel):
     app_name: Connectors = Field(description="Name of the app")
     connector_id: str = Field(description="Unique identifier for the connector")
@@ -2875,6 +2889,10 @@ class AppUser(BaseModel):
     source_user_id: str = Field(description="Unique identifier for the user in the source system")
     org_id: str = Field(default="", description="Unique identifier for the organization")
     email: str = Field(description="Email of the user")
+    alternate_emails: list[str] = Field(
+        default_factory=list,
+        description="Other addresses the source directory lists for the user (aliases, UPN); lower-cased, without the primary",
+    )
     full_name: str = Field(description="Name of the user")
     created_at: int = Field(default=get_epoch_timestamp_in_ms(), description="Epoch timestamp in milliseconds of the user creation")
     updated_at: int = Field(default=get_epoch_timestamp_in_ms(), description="Epoch timestamp in milliseconds of the user update")
@@ -2883,11 +2901,17 @@ class AppUser(BaseModel):
     is_active: bool = Field(default=False, description="Whether the user is active")
     title: str | None = Field(default=None, description="Title of the user")
 
+    @model_validator(mode="after")
+    def _normalize_alternate_emails(self) -> "AppUser":
+        self.alternate_emails = normalize_alternate_emails(self.email, self.alternate_emails)
+        return self
+
     def to_arango_base_user(self) -> dict:
         return {
             "_key": self.id,
             "orgId": self.org_id,
             "email": self.email,
+            "alternateEmails": list(self.alternate_emails),
             "fullName": self.full_name,
             "userId": self.source_user_id,
             "isActive": self.is_active,
@@ -2900,6 +2924,7 @@ class AppUser(BaseModel):
         return AppUser(
             id=data.get("id", data.get("_key")),
             email=data.get("email", ""),
+            alternate_emails=list(data.get("alternateEmails") or []),
             org_id=data.get("orgId", ""),
             user_id=data.get("userId"),
             is_active=data.get("isActive", False),

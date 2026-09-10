@@ -722,6 +722,7 @@ class MicrosoftBusinessCentralConnector(BaseConnector):
             connector_id=self.connector_id,
             source_user_id=email,
             email=email,
+            alternate_emails=self._entra.alternates_by_email.get(email, []) if self._entra else [],
             full_name=email,
             org_id=self.data_entities_processor.org_id,
             is_active=True,

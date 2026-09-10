@@ -21,6 +21,7 @@ from msgraph.generated.models.o_data_errors.o_data_error import ODataError
 from msgraph.generated.models.search_response import SearchResponse
 from msgraph.generated.users.users_request_builder import UsersRequestBuilder
 
+from app.connectors.sources.microsoft.common.entra_identity import alternate_addresses
 from app.models.entities import AppUser, FileRecord
 from app.models.permission import Permission, PermissionType
 
@@ -221,7 +222,7 @@ class MSGraphClient:
             async with self.rate_limiter:
                 query_params = UsersRequestBuilder.UsersRequestBuilderGetQueryParameters(
                     select=['id', 'displayName', 'userPrincipalName', 'accountEnabled',
-                            'mail', 'jobTitle', 'department', 'surname']
+                            'mail', 'proxyAddresses', 'otherMails', 'jobTitle', 'department', 'surname']
                 )
 
                 request_configuration = RequestConfiguration(
@@ -250,6 +251,9 @@ class MSGraphClient:
                     source_user_id=user.id,
                     full_name=user.display_name,
                     email=user.mail or user.user_principal_name,
+                    alternate_emails=alternate_addresses(
+                        user.mail, user.user_principal_name, user.proxy_addresses, user.other_mails
+                    ),
                     is_active=user.account_enabled,
                     title=user.job_title,
                     source_created_at=user.created_date_time.timestamp() if user.created_date_time else None,

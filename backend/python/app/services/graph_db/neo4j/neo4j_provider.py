@@ -100,10 +100,20 @@ EDGE_DELETE_BATCH_SIZE = 2000  # Batch size for edge deletion to avoid huge sing
 
 
 def _user_email_match(alias: str) -> str:
-    """Cypher predicate: `$email` is the node's primary e-mail or one of its alternate e-mails."""
+    """Cypher predicate: `$email` is the node's primary, one of its alternate (linked sign-in) or one of its
+    source (connector-reported) e-mails."""
     return (
         f"(toLower({alias}.email) = toLower($email) "
-        f"OR toLower($email) IN [x IN coalesce({alias}.alternateEmails, []) | toLower(x)])"
+        f"OR toLower($email) IN [x IN coalesce({alias}.alternateEmails, []) | toLower(x)] "
+        f"OR toLower($email) IN [x IN coalesce({alias}.sourceEmails, []) | toLower(x)])"
+    )
+
+
+def _user_email_rank(alias: str) -> str:
+    """Cypher ORDER BY key: primary e-mail (0) before alternate (1) before source (2) match."""
+    return (
+        f"CASE WHEN toLower({alias}.email) = toLower($email) THEN 0 "
+        f"WHEN toLower($email) IN [x IN coalesce({alias}.alternateEmails, []) | toLower(x)] THEN 1 ELSE 2 END"
     )
 
 class Neo4jProvider(IGraphDBProvider):
@@ -3115,7 +3125,7 @@ class Neo4jProvider(IGraphDBProvider):
             MATCH (u:User)
             WHERE {_user_email_match("u")}{org_filter}
             RETURN u
-            ORDER BY CASE WHEN toLower(u.email) = toLower($email) THEN 0 ELSE 1 END
+            ORDER BY {_user_email_rank("u")}
             LIMIT 2
             """
             parameters: dict[str, str] = {"email": email}
@@ -3282,7 +3292,7 @@ class Neo4jProvider(IGraphDBProvider):
             WHERE {_user_email_match("u")}
             MATCH (u)-[r:USER_APP_RELATION]->(app)
             RETURN u, r.sourceUserId AS sourceUserId
-            ORDER BY CASE WHEN toLower(u.email) = toLower($email) THEN 0 ELSE 1 END
+            ORDER BY {_user_email_rank("u")}
             LIMIT 1
             """
 
@@ -6024,10 +6034,16 @@ class Neo4jProvider(IGraphDBProvider):
                     )
                     continue
 
-                # Check if user exists in this org
-                user_record = await self.get_user_by_email(user.email, transaction, org_id=org_id)
+                # Check if user exists in this org, by the source's primary address first, then its aliases
+                user_record = None
+                for candidate in (user.email, *user.alternate_emails):
+                    user_record = await self.get_user_by_email(candidate, transaction, org_id=org_id)
+                    if user_record:
+                        break
 
-                if not user_record:
+                if user_record:
+                    await self._merge_source_emails(user_record.id, [user.email, *user.alternate_emails], transaction)
+                else:
                     # Create new user
                     user_data = user.to_arango_base_user()
                     user_data["id"] = user.id
@@ -6081,6 +6097,21 @@ class Neo4jProvider(IGraphDBProvider):
         except Exception as e:
             self.logger.error(f"❌ Batch upsert app users failed: {str(e)}")
             raise
+
+    async def _merge_source_emails(self, user_id: str, emails: list[str], transaction: str | None = None) -> None:
+        """Set-union `emails` into the User's `sourceEmails` (lower-cased, never its own `email`).
+
+        `alternateEmails` is owned by edrak-ai provisioning (replace semantics), so connector-learned
+        addresses accumulate in their own property.
+        """
+        query = """
+        MATCH (u:User {id: $user_id})
+        WITH u, [x IN coalesce(u.sourceEmails, []) | toLower(x)] + [x IN $emails | toLower(x)] AS candidates
+        WITH u, [x IN candidates WHERE x <> toLower(u.email)] AS candidates
+        SET u.sourceEmails = reduce(acc = [], x IN candidates | CASE WHEN x IN acc THEN acc ELSE acc + x END)
+        RETURN u.sourceEmails AS sourceEmails
+        """
+        await self.client.execute_query(query, parameters={"user_id": user_id, "emails": emails}, txn_id=transaction)
 
     async def ensure_all_team_with_users(self, org_id: str) -> None:
         """
@@ -6480,7 +6511,7 @@ class Neo4jProvider(IGraphDBProvider):
             WHERE (n:User OR n:Group OR n:Person)
             AND {_user_email_match("n")}
             RETURN n.id AS id
-            ORDER BY CASE WHEN toLower(n.email) = toLower($email) THEN 0 ELSE 1 END
+            ORDER BY {_user_email_rank("n")}
             LIMIT 1
             """
 
@@ -6512,8 +6543,10 @@ class Neo4jProvider(IGraphDBProvider):
             MATCH (n)
             WHERE (n:User OR n:Group OR n:Person)
             AND (toLower(n.email) IN [e IN $emails | toLower(e)]
-                 OR any(x IN coalesce(n.alternateEmails, []) WHERE toLower(x) IN [e IN $emails | toLower(e)]))
-            RETURN n.email AS email, n.alternateEmails AS alternateEmails, n.id AS id, labels(n) AS labels
+                 OR any(x IN coalesce(n.alternateEmails, []) WHERE toLower(x) IN [e IN $emails | toLower(e)])
+                 OR any(x IN coalesce(n.sourceEmails, []) WHERE toLower(x) IN [e IN $emails | toLower(e)]))
+            RETURN n.email AS email, n.alternateEmails AS alternateEmails, n.sourceEmails AS sourceEmails,
+                   n.id AS id, labels(n) AS labels
             """
 
             results = await self.client.execute_query(
@@ -6524,6 +6557,7 @@ class Neo4jProvider(IGraphDBProvider):
 
             result_map = {}
             alternate_hits: list[tuple[str, tuple[str, str, str]]] = []
+            source_hits: list[tuple[str, tuple[str, str, str]]] = []
             for r in results:
                 email = r["email"]
                 entity_id = r["id"]
@@ -6550,9 +6584,13 @@ class Neo4jProvider(IGraphDBProvider):
                     (requested, entry)
                     for requested in alternate_email_matches(unique_emails, r.get("alternateEmails"))
                 )
+                source_hits.extend(
+                    (requested, entry)
+                    for requested in alternate_email_matches(unique_emails, r.get("sourceEmails"))
+                )
 
-            # A primary-address match always wins over an alternate-address match.
-            for requested, entry in alternate_hits:
+            # Ranking: primary address, then alternate (linked sign-in), then source (connector-reported).
+            for requested, entry in alternate_hits + source_hits:
                 result_map.setdefault(requested, entry)
 
             return result_map

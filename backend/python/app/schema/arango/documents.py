@@ -45,6 +45,10 @@ user_schema = {
             "lastName": {"type": "string"},
             "fullName": {"type": "string"},
             "email": {"type": "string"},
+            # linked sign-in addresses, owned by the Node provisioning API (replace semantics)
+            "alternateEmails": {"type": "array", "items": {"type": "string"}},
+            # addresses connector directories reported for this person (set union across syncs)
+            "sourceEmails": {"type": "array", "items": {"type": "string"}},
             "designation": {"type": "string"},
             "profileId": {"type": ["string", "null"]},
             "businessPhones": {

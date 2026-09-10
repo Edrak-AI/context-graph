@@ -167,3 +167,33 @@ removes its reverse-index entries. Registration or renewal errors never fail a s
 (one per run). Without `FRONTEND_PUBLIC_URL` or `scopedJwtSecret` nothing is registered for Microsoft or Drive;
 without `GOOGLE_PUBSUB_TOPIC` nothing for Gmail; the connectors simply poll. Notifications for a connector that is
 inactive or gone get `404` from `/notify`, which edrak-ai can use to drop the stale subscription/channel.
+
+## Identity matching (which platform user a connector's person is)
+
+Sources report people by their **primary** address (Entra primary `SMTP:` proxy / UPN, Google Workspace
+`primaryEmail`, permission grantee e-mails), while people may sign in to Edrak with an **alias domain**. The graph
+resolves an address against a `User` node in three tiers, first hit wins (`_user_email_match` /
+`_user_email_rank` in the Neo4j and Arango providers):
+
+1. `email` — the address the person signs in to Edrak with.
+2. `alternateEmails` — linked sign-ins, owned by edrak-ai provisioning (`POST /api/v1/users/internal/provision`,
+   replace semantics, unique per org in Mongo).
+3. `sourceEmails` — addresses **learned from connector directories**: when an `AppUser` links to a platform user
+   (`batch_upsert_app_users`, tried by the source primary then each `AppUser.alternate_emails`), its primary +
+   alternates are set-unioned into this list (lower-cased, never the user's own `email`), so repeated syncs and
+   several connectors accumulate instead of replacing.
+
+Connectors fill `AppUser.alternate_emails` from their own directory data — no tenant changes needed:
+
+| Connector | Source of alternates |
+|---|---|
+| Teams, OneDrive, SharePoint Online (`MSGraphClient.get_all_users`), Outlook (`USER_SYNC_SELECT_FIELDS`) | Graph `proxyAddresses` (`smtp:`/`SMTP:`), `otherMails`, `userPrincipalName` via `entra_identity.alternate_addresses` |
+| Dynamics 365 Sales | `EntraUserEmailResolver.resolve_identities` (same `getByIds` call) + the Dataverse address |
+| Business Central, SAP (`group:` principals) | `EntraGroupResolver.alternates_by_email`, filled while expanding groups |
+| Google Drive / Gmail workspace | Directory `users.list` (`projection=full`): `aliases`, `nonEditableAliases`, non-primary `emails[].address` |
+| Individual/personal connectors, SharePoint site user lists, Teams roster-only members | none (single address known) |
+
+An `AppUser` that matches nobody still creates the inactive placeholder node as before (with its
+`alternateEmails`); when edrak-ai later provisions that person the entity handler adopts the node and moves the
+placeholder's address into `sourceEmails`. Uniqueness is enforced only for `email`/`alternateEmails`;
+`sourceEmails` are best-effort — an address on two users resolves by the ranking above and logs a warning.

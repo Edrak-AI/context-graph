@@ -233,10 +233,20 @@ EDGE_COLLECTIONS = [
 
 
 def _user_email_match(alias: str) -> str:
-    """AQL predicate: `@email` is the document's primary e-mail or one of its alternate e-mails."""
+    """AQL predicate: `@email` is the document's primary, one of its alternate (linked sign-in) or one of its
+    source (connector-reported) e-mails."""
     return (
         f"(LOWER({alias}.email) == LOWER(@email) "
-        f"OR LOWER(@email) IN (FOR x IN ({alias}.alternateEmails || []) RETURN LOWER(x)))"
+        f"OR LOWER(@email) IN (FOR x IN ({alias}.alternateEmails || []) RETURN LOWER(x)) "
+        f"OR LOWER(@email) IN (FOR x IN ({alias}.sourceEmails || []) RETURN LOWER(x)))"
+    )
+
+
+def _user_email_rank(alias: str) -> str:
+    """AQL SORT key: primary e-mail (0) before alternate (1) before source (2) match."""
+    return (
+        f"(LOWER({alias}.email) == LOWER(@email) ? 0 : "
+        f"(LOWER(@email) IN (FOR x IN ({alias}.alternateEmails || []) RETURN LOWER(x)) ? 1 : 2))"
     )
 
 class ArangoHTTPProvider(IGraphDBProvider):
@@ -4702,7 +4712,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
         query = f"""
         FOR user IN {CollectionNames.USERS.value}
             FILTER {_user_email_match("user")}{org_filter}
-            SORT LOWER(user.email) == LOWER(@email) ? 0 : 1
+            SORT {_user_email_rank("user")}
             LIMIT 2
             RETURN user
         """
@@ -4978,11 +4988,11 @@ class ArangoHTTPProvider(IGraphDBProvider):
                         RETURN a
                 )
 
-                // Then find the user by email (primary first, then alternate)
+                // Then find the user by email (primary first, then alternate, then source)
                 LET user = FIRST(
                     FOR u IN {CollectionNames.USERS.value}
                         FILTER {_user_email_match("u")}
-                        SORT LOWER(u.email) == LOWER(@email) ? 0 : 1
+                        SORT {_user_email_rank("u")}
                         RETURN u
                 )
 
@@ -6649,10 +6659,16 @@ class ArangoHTTPProvider(IGraphDBProvider):
                     )
                     continue
 
-                # Check if user exists in this org
-                user_record = await self.get_user_by_email(user.email, transaction, org_id=org_id)
+                # Check if user exists in this org, by the source's primary address first, then its aliases
+                user_record = None
+                for candidate in (user.email, *user.alternate_emails):
+                    user_record = await self.get_user_by_email(candidate, transaction, org_id=org_id)
+                    if user_record:
+                        break
 
-                if not user_record:
+                if user_record:
+                    await self._merge_source_emails(user_record.id, [user.email, *user.alternate_emails], transaction)
+                else:
                     # Create new user
                     await self.batch_upsert_nodes(
                         [{**user.to_arango_base_user(), "orgId": org_id, "isActive": False}],
@@ -6697,6 +6713,21 @@ class ArangoHTTPProvider(IGraphDBProvider):
         except Exception as e:
             self.logger.error(f"❌ Batch upsert app users failed: {str(e)}")
             raise
+
+    async def _merge_source_emails(self, user_key: str, emails: list[str], transaction: str | None = None) -> None:
+        """Set-union `emails` into the user's `sourceEmails` (lower-cased, never its own `email`).
+
+        `alternateEmails` is owned by edrak-ai provisioning (replace semantics), so connector-learned
+        addresses accumulate in their own attribute.
+        """
+        query = f"""
+        FOR u IN {CollectionNames.USERS.value}
+            FILTER u._key == @user_key
+            LET candidates = APPEND((FOR x IN (u.sourceEmails || []) RETURN LOWER(x)), (FOR x IN @emails RETURN LOWER(x)))
+            UPDATE u WITH {{ sourceEmails: REMOVE_VALUE(UNIQUE(candidates), LOWER(u.email)) }} IN {CollectionNames.USERS.value}
+            RETURN NEW.sourceEmails
+        """
+        await self.http_client.execute_aql(query, bind_vars={"user_key": user_key, "emails": emails}, txn_id=transaction)
 
     async def ensure_all_team_with_users(self, org_id: str) -> None:
         """
@@ -7103,7 +7134,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
         query = f"""
         FOR doc IN {CollectionNames.USERS.value}
             FILTER {_user_email_match("doc")}
-            SORT LOWER(doc.email) == LOWER(@email) ? 0 : 1
+            SORT {_user_email_rank("doc")}
             LIMIT 1
             RETURN doc._key
         """
@@ -7186,13 +7217,15 @@ class ArangoHTTPProvider(IGraphDBProvider):
             # Deduplicate emails to avoid redundant queries
             unique_emails = list(set(emails))
 
-            # QUERY 1: Check users collection (primary or alternate e-mail)
+            # QUERY 1: Check users collection (primary, alternate or source e-mail)
             user_query = f"""
             FOR doc IN {CollectionNames.USERS.value}
                 FILTER doc.email IN @emails
                     OR LENGTH(INTERSECTION(
                         (FOR x IN (doc.alternateEmails || []) RETURN LOWER(x)), @emails_lower)) > 0
-                RETURN {{email: doc.email, alternateEmails: doc.alternateEmails, id: doc._key}}
+                    OR LENGTH(INTERSECTION(
+                        (FOR x IN (doc.sourceEmails || []) RETURN LOWER(x)), @emails_lower)) > 0
+                RETURN {{email: doc.email, alternateEmails: doc.alternateEmails, sourceEmails: doc.sourceEmails, id: doc._key}}
             """
             try:
                 users = await self.http_client.execute_aql(
@@ -7204,6 +7237,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
                     txn_id=transaction
                 )
                 alternate_hits: list[tuple[str, str]] = []
+                source_hits: list[tuple[str, str]] = []
                 for user in users:
                     if user["email"] in unique_emails:
                         result_map[user["email"]] = (
@@ -7215,8 +7249,12 @@ class ArangoHTTPProvider(IGraphDBProvider):
                         (requested, user["id"])
                         for requested in alternate_email_matches(unique_emails, user.get("alternateEmails"))
                     )
-                # A primary-address match always wins over an alternate-address match.
-                for requested, user_id in alternate_hits:
+                    source_hits.extend(
+                        (requested, user["id"])
+                        for requested in alternate_email_matches(unique_emails, user.get("sourceEmails"))
+                    )
+                # Ranking: primary address, then alternate (linked sign-in), then source (connector-reported).
+                for requested, user_id in alternate_hits + source_hits:
                     result_map.setdefault(requested, (user_id, CollectionNames.USERS.value, "USER"))
                 self.logger.debug(f"✅ Found {len(users)} users")
             except Exception as e:

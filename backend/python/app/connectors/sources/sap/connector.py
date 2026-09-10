@@ -94,7 +94,7 @@ from app.connectors.sources.microsoft.common.entra_identity import (
     GRAPH_BASE_URL,
     USER_EMAIL_SELECT,
     EntraGraphClient,
-    graph_user_email,
+    graph_user_identity,
 )
 from app.connectors.sources.sap.apps import SapApp
 from app.connectors.sources.sap.mapping import (
@@ -897,6 +897,7 @@ class SapConnector(BaseConnector):
             connector_id=self.connector_id,
             source_user_id=email,
             email=email,
+            alternate_emails=self._entra.alternates_by_email.get(email, []) if self._entra else [],
             full_name=email,
             org_id=self.data_entities_processor.org_id,
             is_active=True,
@@ -1313,8 +1314,9 @@ class EntraGroupResolver(EntraGraphClient):
     """Expands ``group:<display name or object id>`` into member e-mails via Microsoft Graph
     (app-only client credentials; needs ``GroupMember.Read.All`` + ``User.Read.All``).
 
-    Members are identified by their Entra primary address (``graph_user_email``) so the
-    result matches the addresses people sign in to Edrak with.  Disabled accounts and,
+    Members are identified by their Entra primary address (``graph_user_identity``) so the
+    result matches the addresses people sign in to Edrak with; their other directory
+    addresses are kept in ``alternates_by_email`` for ``AppUser.alternate_emails``.  Disabled accounts and,
     unless ``include_guests`` is set, B2B guests (``userType == Guest``) are skipped.
     Results are cached for the resolver's lifetime (= one connector instance / sync).
     Unknown groups — and display names shared by several groups, which cannot be told
@@ -1334,6 +1336,7 @@ class EntraGroupResolver(EntraGraphClient):
         super().__init__(tenant_id, client_id, client_secret, logger, http)
         self._include_guests = include_guests
         self._cache: Dict[str, Optional[List[str]]] = {}
+        self.alternates_by_email: Dict[str, List[str]] = {}
 
     async def _group_id(self, name_or_id: str) -> Optional[str]:
         if _GUID_RE.match(name_or_id):
@@ -1372,9 +1375,10 @@ class EntraGroupResolver(EntraGraphClient):
                     continue
                 if not self._include_guests and str(user.get("userType") or "").lower() == GUEST_USER_TYPE:
                     continue
-                email = graph_user_email(user)
+                email, alternates = graph_user_identity(user)
                 if email:
                     emails.append(email)
+                    self.alternates_by_email[email] = alternates
             url = payload.get("@odata.nextLink")
             params = None
         return sorted(set(emails))

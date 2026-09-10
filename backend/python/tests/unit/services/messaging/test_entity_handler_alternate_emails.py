@@ -91,6 +91,8 @@ class TestUserAdded:
         """A connector already created an inactive node for the alternate; the platform user takes it over."""
         existing = MagicMock()
         existing.id = "connector-node"
+        existing.email = ALTERNATE
+        existing.source_emails = ["sujit@edrak.onmicrosoft.com"]
         gp = _graph_provider({ALTERNATE: existing})
         svc = _service(gp)
 
@@ -109,16 +111,20 @@ class TestUserAdded:
         assert user_data["userId"] == "mongo-1"
         assert user_data["email"] == PRIMARY
         assert user_data["alternateEmails"] == [ALTERNATE]
+        # the address the connector created the node under stays resolvable (sourceEmails), joined with what it learned
+        assert user_data["sourceEmails"] == ["sujit@edrak.onmicrosoft.com", ALTERNATE]
         assert user_data["isActive"] is True
 
     async def test_existing_user_without_field_keeps_graph_value(self) -> None:
         existing = MagicMock()
         existing.id = "existing"
+        existing.email = PRIMARY
         gp = _graph_provider({PRIMARY: existing})
         svc = _service(gp)
 
         assert await svc.process_event("userAdded", {"orgId": "org-1", "userId": "mongo-1", "email": PRIMARY}) is True
         assert "alternateEmails" not in _upserted_user(gp)
+        assert "sourceEmails" not in _upserted_user(gp)  # same primary address: nothing to carry over
 
 
 class TestUserUpdated:

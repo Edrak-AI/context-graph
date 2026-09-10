@@ -142,7 +142,8 @@ class OutlookAPIFields:
         "surname"
     ]
 
-    # User directory fields fetched during user sync (userType drives guest exclusion)
+    # User directory fields fetched during user sync (userType drives guest exclusion,
+    # proxyAddresses/otherMails feed AppUser.alternate_emails)
     USER_SYNC_SELECT_FIELDS: list[str] = [
         "id",
         "displayName",
@@ -150,6 +151,8 @@ class OutlookAPIFields:
         "surname",
         "mail",
         "userPrincipalName",
+        "proxyAddresses",
+        "otherMails",
         "userType",
     ]
 

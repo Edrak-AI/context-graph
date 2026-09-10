@@ -95,6 +95,7 @@ from app.connectors.sources.microsoft.common.delegated_auth import (
     DelegatedTokenProvider,
     build_delegated_graph_client,
 )
+from app.connectors.sources.microsoft.common.entra_identity import alternate_addresses
 from app.connectors.sources.microsoft.common.msgraph_client import RecordUpdate
 from app.connectors.sources.microsoft.common.outlook_constants import (
     MessagesDeltaResult,
@@ -757,6 +758,9 @@ class OutlookConnector(BaseConnector):
                         connector_id=self.connector_id,
                         source_user_id=user.id,
                         email=user.mail or user.user_principal_name,
+                        alternate_emails=alternate_addresses(
+                            user.mail, user.user_principal_name, user.proxy_addresses, user.other_mails
+                        ),
                         full_name=full_name
                     )
                     all_users.append(app_user)

@@ -17,7 +17,9 @@ from app.connectors.sources.microsoft.common import entra_identity
 from app.connectors.sources.microsoft.common.entra_identity import (
     USER_EMAIL_SELECT,
     EntraUserEmailResolver,
+    alternate_addresses,
     graph_user_email,
+    graph_user_identity,
     primary_smtp_address,
 )
 
@@ -52,6 +54,32 @@ class TestPrimarySmtpAddress:
         assert graph_user_email({}) is None
 
 
+class TestAlternateAddresses:
+    def test_collects_every_other_address_lowercased_and_deduped(self) -> None:
+        assert alternate_addresses(
+            "khalid@edrak.com",
+            "khalid@edrak.onmicrosoft.com",
+            ["SMTP:Khalid@edrak.com", "smtp:Khalid@FavApps.co", "smtp:khalid@edrak.onmicrosoft.com", "SIP:khalid@edrak.com", "X500:/o=Exchange/ou=..."],
+            ["khalid@favapps.co", "khalid.personal@gmail.com"],
+        ) == ["khalid@favapps.co", "khalid@edrak.onmicrosoft.com", "khalid.personal@gmail.com"]
+
+    def test_upn_and_mail_are_alternates_when_they_differ_from_the_primary(self) -> None:
+        # the SMTP: entry is the primary; both `mail` (an alias here) and the UPN are alternates
+        assert alternate_addresses("alias@edrak.com", "sujit@edrak.onmicrosoft.com", ["SMTP:sujit@edrak.com"]) == [
+            "alias@edrak.com",
+            "sujit@edrak.onmicrosoft.com",
+        ]
+
+    def test_empty_when_only_one_address_is_known(self) -> None:
+        assert alternate_addresses("only@edrak.com", "only@edrak.com", None, None) == []
+        assert alternate_addresses(None, "upn@edrak.onmicrosoft.com", [], []) == []
+        assert alternate_addresses(None, None, ["SMTP:"], ["not-an-address"]) == []
+
+    def test_graph_user_identity(self) -> None:
+        assert graph_user_identity(USERS["aad-1"]) == ("sujit@edrak.com", ["alias@edrak.com", "sujit@favapps.co", "sujit@edrak.onmicrosoft.com"])
+        assert graph_user_identity({"mail": "a@b.com", "proxyAddresses": "SMTP:x@y.com", "otherMails": "z@y.com"}) == ("a@b.com", [])
+
+
 # ---------------------------------------------------------------------------
 # Resolver against a mocked Graph
 # ---------------------------------------------------------------------------
@@ -61,7 +89,7 @@ GET_BY_IDS = "https://graph.microsoft.com/v1.0/directoryObjects/getByIds"
 
 USERS: dict[str, dict[str, Any]] = {
     "aad-1": {"id": "aad-1", "mail": "alias@edrak.com", "userPrincipalName": "sujit@edrak.onmicrosoft.com",
-              "proxyAddresses": ["smtp:alias@edrak.com", "SMTP:Sujit@edrak.com"]},
+              "proxyAddresses": ["smtp:alias@edrak.com", "SMTP:Sujit@edrak.com"], "otherMails": ["Sujit@FavApps.co"]},
     "aad-2": {"id": "aad-2", "mail": None, "userPrincipalName": "Nour@edrak.onmicrosoft.com", "proxyAddresses": []},
     "aad-3": {"id": "aad-3", "userPrincipalName": "no-at-sign"},
 }
@@ -106,12 +134,25 @@ class TestEntraUserEmailResolver:
 
         call = graph.get_by_ids_calls()[0]
         assert call.url.params["$select"] == USER_EMAIL_SELECT
+        assert "otherMails" in USER_EMAIL_SELECT and "proxyAddresses" in USER_EMAIL_SELECT
         assert json.loads(call.content) == {"ids": ["aad-1", "aad-2", "aad-3", "aad-missing"], "types": ["user"]}
 
         # Every id is cached (including the ones Graph did not return): no second round-trip.
         again = asyncio.run(r.resolve_emails(["aad-1", "aad-missing", "aad-3"]))
         assert again == {"aad-1": "sujit@edrak.com"}
         assert len(graph.get_by_ids_calls()) == 1 and graph.tokens_issued == 1
+
+    def test_resolve_identities_returns_alternates_from_the_same_call(self) -> None:
+        graph = Graph()
+        r = _resolver(graph)
+        result = asyncio.run(r.resolve_identities(["aad-1", "aad-2", "aad-3", "aad-missing"]))
+        assert result == {
+            "aad-1": ("sujit@edrak.com", ["alias@edrak.com", "sujit@favapps.co", "sujit@edrak.onmicrosoft.com"]),
+            "aad-2": ("nour@edrak.onmicrosoft.com", []),
+        }
+        # resolve_emails is a view over the same cache: no extra Graph round-trip
+        assert asyncio.run(r.resolve_emails(["aad-1", "aad-2"])) == {"aad-1": "sujit@edrak.com", "aad-2": "nour@edrak.onmicrosoft.com"}
+        assert len(graph.get_by_ids_calls()) == 1
 
     def test_chunks_at_graph_limit(self) -> None:
         graph = Graph()

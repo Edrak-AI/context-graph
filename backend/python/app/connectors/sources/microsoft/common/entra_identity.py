@@ -6,8 +6,11 @@ and the platform account is created with the address they sign in to Edrak with
 of a user's address (often the ``@<tenant>.onmicrosoft.com`` UPN), so matching on
 that alone silently drops permissions.  ``primary_smtp_address`` picks the address
 Entra treats as primary — the ``SMTP:`` (upper-case) entry of ``proxyAddresses``,
-then ``mail``, then the UPN — and ``EntraUserEmailResolver`` fetches those fields
-for a batch of Entra object ids through ``POST /directoryObjects/getByIds``.
+then ``mail``, then the UPN — and ``alternate_addresses`` collects every other
+address the directory lists (``smtp:`` aliases, ``otherMails``, the UPN) so the
+graph can link the person even when they sign in to Edrak with an alias domain.
+``EntraUserEmailResolver`` fetches those fields for a batch of Entra object ids
+through ``POST /directoryObjects/getByIds``.
 
 Graph calls need the *application* permission ``User.Read.All`` (admin consent).
 When the tenant has not granted it Graph answers 401/403; the resolver then logs
@@ -33,13 +36,14 @@ if TYPE_CHECKING:
 
 GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0"
 GRAPH_SCOPE = "https://graph.microsoft.com/.default"
-USER_EMAIL_SELECT = "id,mail,userPrincipalName,proxyAddresses,accountEnabled"
+USER_EMAIL_SELECT = "id,mail,userPrincipalName,proxyAddresses,otherMails,accountEnabled"
 
 _MAX_HTTP_RETRIES = 5
 _RETRY_STATUS = {HttpStatusCode.TOO_MANY_REQUESTS.value, 502, HttpStatusCode.SERVICE_UNAVAILABLE.value, 504}
 _TOKEN_REFRESH_SKEW_S = 120
 _GET_BY_IDS_MAX = 1000  # Graph's documented limit per getByIds call
 _PRIMARY_SMTP_PREFIX = "SMTP:"  # upper-case = primary; "smtp:" entries are aliases
+_SMTP_PREFIX_LEN = len(_PRIMARY_SMTP_PREFIX)
 _DENIED_STATUS = {HttpStatusCode.UNAUTHORIZED.value, HttpStatusCode.FORBIDDEN.value}
 
 
@@ -64,13 +68,43 @@ def primary_smtp_address(
     return _clean_email(mail) or _clean_email(user_principal_name)
 
 
+def alternate_addresses(
+    mail: object,
+    user_principal_name: object,
+    proxy_addresses: Iterable[object] | None = None,
+    other_mails: Iterable[object] | None = None,
+) -> list[str]:
+    """Every address of the user other than ``primary_smtp_address`` (lower-cased, deduped, in directory order)."""
+    primary = primary_smtp_address(mail, user_principal_name, proxy_addresses)
+    candidates: list[object] = []
+    for entry in proxy_addresses or ():
+        text = str(entry or "")
+        if text[:_SMTP_PREFIX_LEN].upper() == _PRIMARY_SMTP_PREFIX:
+            candidates.append(text[_SMTP_PREFIX_LEN:])
+    candidates.extend(other_mails or ())
+    candidates.extend((mail, user_principal_name))
+    result: list[str] = []
+    for candidate in candidates:
+        email = _clean_email(candidate)
+        if email and email != primary and email not in result:
+            result.append(email)
+    return result
+
+
+def _string_list(value: object) -> list[object] | None:
+    return value if isinstance(value, list) else None
+
+
 def graph_user_email(user: Mapping[str, Any]) -> str | None:
     """``primary_smtp_address`` over a Graph ``user`` JSON object."""
-    proxies = user.get("proxyAddresses")
-    return primary_smtp_address(
-        user.get("mail"),
-        user.get("userPrincipalName"),
-        proxies if isinstance(proxies, list) else None,
+    return primary_smtp_address(user.get("mail"), user.get("userPrincipalName"), _string_list(user.get("proxyAddresses")))
+
+
+def graph_user_identity(user: Mapping[str, Any]) -> tuple[str | None, list[str]]:
+    """``(primary, alternates)`` over a Graph ``user`` JSON object."""
+    proxies = _string_list(user.get("proxyAddresses"))
+    return graph_user_email(user), alternate_addresses(
+        user.get("mail"), user.get("userPrincipalName"), proxies, _string_list(user.get("otherMails"))
     )
 
 
@@ -141,7 +175,7 @@ class EntraGraphClient:
 
 
 class EntraUserEmailResolver(EntraGraphClient):
-    """Entra object id → primary e-mail, batched and cached for one connector sync.
+    """Entra object id → primary e-mail (+ alternates), batched and cached for one connector sync.
 
     ``unavailable`` flips to ``True`` on the first 401/403 (missing ``User.Read.All``
     consent) and every later call returns ``{}`` without touching Graph.
@@ -156,11 +190,11 @@ class EntraUserEmailResolver(EntraGraphClient):
         http: httpx.AsyncClient | None = None,
     ) -> None:
         super().__init__(tenant_id, client_id, client_secret, logger, http)
-        self._cache: dict[str, str | None] = {}
+        self._cache: dict[str, tuple[str, list[str]] | None] = {}
         self.unavailable = False
 
-    async def resolve_emails(self, object_ids: Sequence[str]) -> dict[str, str]:
-        """Return ``{object_id: email}`` for the ids Graph knows; unknown ids are absent."""
+    async def resolve_identities(self, object_ids: Sequence[str]) -> dict[str, tuple[str, list[str]]]:
+        """Return ``{object_id: (primary email, alternate emails)}`` for the ids Graph knows; unknown ids are absent."""
         wanted = list(dict.fromkeys(str(i).strip() for i in object_ids if i and str(i).strip()))
         missing = [i for i in wanted if i not in self._cache]
         if missing and not self.unavailable:
@@ -168,7 +202,11 @@ class EntraUserEmailResolver(EntraGraphClient):
                 chunk = missing[start:start + _GET_BY_IDS_MAX]
                 if not await self._fetch_chunk(chunk):
                     break
-        return {i: email for i in wanted if (email := self._cache.get(i))}
+        return {i: identity for i in wanted if (identity := self._cache.get(i))}
+
+    async def resolve_emails(self, object_ids: Sequence[str]) -> dict[str, str]:
+        """Return ``{object_id: primary email}`` for the ids Graph knows; unknown ids are absent."""
+        return {i: primary for i, (primary, _) in (await self.resolve_identities(object_ids)).items()}
 
     async def _fetch_chunk(self, ids: list[str]) -> bool:
         try:
@@ -193,10 +231,11 @@ class EntraUserEmailResolver(EntraGraphClient):
             self._logger.error("Microsoft Graph user lookup failed: %s", e)
             return False
 
-        found: dict[str, str | None] = {}
+        found: dict[str, tuple[str, list[str]] | None] = {}
         for user in payload.get("value") or []:
             if isinstance(user, dict) and user.get("id"):
-                found[str(user["id"])] = graph_user_email(user)
+                primary, alternates = graph_user_identity(user)
+                found[str(user["id"])] = (primary, alternates) if primary else None
         for object_id in ids:
             self._cache[object_id] = found.get(object_id)
         return True

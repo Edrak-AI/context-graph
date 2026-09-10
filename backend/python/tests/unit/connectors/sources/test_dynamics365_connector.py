@@ -81,9 +81,9 @@ class FakeResolver:
         self.closed = False
         FakeResolver.instances.append(self)
 
-    async def resolve_emails(self, object_ids: list[str]) -> dict[str, str]:
+    async def resolve_identities(self, object_ids: list[str]) -> dict[str, tuple[str, list[str]]]:
         self.requested.append(list(object_ids))
-        return {"aad-1": "sujit@edrak.com", "aad-app": "app@edrak.com"}
+        return {"aad-1": ("sujit@edrak.com", ["sujit@favapps.co"]), "aad-app": ("app@edrak.com", [])}
 
     async def close(self) -> None:
         self.closed = True
@@ -174,6 +174,18 @@ class TestUserIdentity:
         assert resolver.requested == [["aad-1", "aad-2"], ["aad-4"]]
         assert len(FakeResolver.instances) == 1
         assert c.user_sync_point.points["users"]["lastSyncTimestamp"] > 0
+
+    def test_alternate_emails_come_from_resolve_identities_plus_the_dataverse_address(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        FakeResolver.instances = []
+        monkeypatch.setattr(dyn_connector, "EntraUserEmailResolver", FakeResolver)
+        c, processor = _connector()
+        asyncio.run(c._sync_security_model([]))
+
+        alternates = {u.source_user_id: u.alternate_emails for u in processor.users}
+        # Graph alternates first, then the Dataverse address the row itself carried (so grants keyed on it still resolve)
+        assert alternates["u-1"] == ["sujit@favapps.co", "sujit@edrak.onmicrosoft.com"]
+        # unknown to Graph / no Entra id: nothing but the Dataverse address is known → no alternates
+        assert alternates["u-2"] == [] and alternates["u-3"] == []
 
     def test_without_credentials_uses_dataverse_addresses_only(self, monkeypatch: pytest.MonkeyPatch) -> None:
         FakeResolver.instances = []

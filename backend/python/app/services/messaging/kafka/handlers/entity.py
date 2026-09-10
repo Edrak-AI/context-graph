@@ -17,6 +17,7 @@ from app.containers.connector import (
 )
 from app.edition_services import get_data_entities_processor_cls
 from app.services.graph_db.interface.graph_db_provider import IGraphDBProvider
+from app.models.entities import normalize_alternate_emails
 from app.utils.time_conversion import get_epoch_timestamp_in_ms
 
 
@@ -243,6 +244,11 @@ class EntityEventService(BaseEventService):
                 }
                 if alternate_emails is not None:
                     user_data["alternateEmails"] = alternate_emails
+                if existing_user.email and existing_user.email.lower() != str(payload["email"]).lower():
+                    # adopting a connector-created node: its address keeps resolving through sourceEmails
+                    user_data["sourceEmails"] = normalize_alternate_emails(
+                        payload["email"], [*existing_user.source_emails, existing_user.email]
+                    )
             else:
                 user_key = str(uuid4())
                 user_data = {

@@ -725,14 +725,14 @@ class MicrosoftDynamics365Connector(BaseConnector):
     # Users, teams, business units, roles
     # ------------------------------------------------------------------
 
-    async def _official_emails(self, rows: List[Dict[str, Any]]) -> Dict[str, str]:
-        """Entra object id → primary e-mail for one page of ``systemuser`` rows; ``{}`` when Graph is not permitted."""
+    async def _official_identities(self, rows: List[Dict[str, Any]]) -> Dict[str, Tuple[str, List[str]]]:
+        """Entra object id → (primary e-mail, alternates) for one page of ``systemuser`` rows; ``{}`` when Graph is not permitted."""
         ids = [str(r["azureactivedirectoryobjectid"]) for r in rows if r.get("azureactivedirectoryobjectid")]
         if not ids or not all((self._tenant_id, self._client_id, self._client_secret)):
             return {}
         if self._entra_users is None:
             self._entra_users = EntraUserEmailResolver(self._tenant_id, self._client_id, self._client_secret, self.logger)
-        return await self._entra_users.resolve_emails(ids)
+        return await self._entra_users.resolve_identities(ids)
 
     async def _role_privileges(self, role_id: str) -> List[Dict[str, Any]]:
         """``RetrieveRolePrivilegesRole`` of one role copy; unreadable copies grant nothing."""
@@ -761,12 +761,13 @@ class MicrosoftDynamics365Connector(BaseConnector):
             },
         ):
             rows = [row for row in page if not is_application_user(row)]
-            official = await self._official_emails(rows)
+            official = await self._official_identities(rows)
             batch: List[AppUser] = []
             for row in rows:
                 user_id = row.get("systemuserid")
                 stored = systemuser_email(row)
-                email = official.get(str(row.get("azureactivedirectoryobjectid") or "")) or stored
+                primary, alternates = official.get(str(row.get("azureactivedirectoryobjectid") or ""), (None, []))
+                email = primary or stored
                 if not email or not user_id:
                     continue
                 if stored and email != stored:
@@ -776,6 +777,8 @@ class MicrosoftDynamics365Connector(BaseConnector):
                     connector_id=self.connector_id,
                     source_user_id=str(user_id),
                     email=email,
+                    # the Dataverse address is kept as an alternate so grants keyed on it still resolve
+                    alternate_emails=[*alternates, stored] if stored else list(alternates),
                     full_name=row.get("fullname") or email,
                     org_id=org_id,
                     is_active=not bool(row.get("isdisabled")),
