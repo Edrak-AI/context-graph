@@ -4666,6 +4666,27 @@ class TestGetRecordGraphDoc:
         assert "vr-1" in vr_map
 
     @pytest.mark.asyncio
+    async def test_get_record_content_unavailable_sets_none_and_warns(self) -> None:
+        """A 404 from the storage API for one record (typed RecordContentUnavailableError)
+        is a per-record condition: the map entry becomes None so callers skip the hit,
+        a WARNING names the record and status, and nothing is raised."""
+        from app.exceptions.indexing_exceptions import RecordContentUnavailableError
+
+        blob_store = AsyncMock()
+        blob_store.get_record_from_storage = AsyncMock(
+            side_effect=RecordContentUnavailableError(
+                "Failed to retrieve record from storage", virtual_record_id="vr-gone", status=404
+            )
+        )
+        vr_map = {}
+        with patch("app.utils.chat_helpers.logger") as log:  # create_logger() sets propagate=False
+            await get_record("vr-gone", vr_map, blob_store, "org-1")
+
+        assert vr_map == {"vr-gone": None}
+        messages = [c.args[0] % c.args[1:] for c in log.warning.call_args_list]
+        assert any("vr-gone" in m and "status=404" in m for m in messages), messages
+
+    @pytest.mark.asyncio
     async def test_get_record_exception_reraised(self):
         """Lines 667-668: Exception in get_record is re-raised."""
         blob_store = AsyncMock()

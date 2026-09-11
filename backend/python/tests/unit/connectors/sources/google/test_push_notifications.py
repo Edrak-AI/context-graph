@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import json
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
@@ -141,7 +142,9 @@ def gmail_manager(
 
 
 def rows(point: FakeSyncPoint) -> list[dict[str, Any]]:
-    return point.points["webhooks"]["webhooks"]
+    stored = point.points["webhooks"]["webhooks"]
+    assert isinstance(stored, str)  # one JSON string: Neo4j rejects a list of maps
+    return json.loads(stored)
 
 
 class TestPureHelpers:

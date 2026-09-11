@@ -169,3 +169,31 @@ class StorageVersionUnavailableError(IndexingError):
         self.status = status
         self.code = code
         self.reason = reason or message
+
+
+class RecordContentUnavailableError(IndexingError):
+    """Raised by ``BlobStorage.get_record_from_storage`` when the Node storage
+    service has no readable JSON for a record that *is* indexed: a non-2xx
+    download (typically 404 after a pod rollout wiped the LOCAL provider's
+    files, ``File not found or not accessible: record_<vrid>.json``) or a 200
+    whose payload carries no ``record``.
+
+    Retrieval treats it as per-record: the hit is dropped with a warning and
+    the remaining hits are still returned, instead of failing the whole search.
+
+    ``status`` is the HTTP status of the failed download (``None`` when the
+    response was 2xx but empty).
+    """
+
+    def __init__(
+        self,
+        message: str,
+        virtual_record_id: str = None,
+        status: int = None,
+    ) -> None:
+        super().__init__(
+            message,
+            details={"virtual_record_id": virtual_record_id, "status": status},
+        )
+        self.virtual_record_id = virtual_record_id
+        self.status = status

@@ -17,6 +17,7 @@ from app.config.constants.service import config_node_constants
 from app.connectors.sources.atlassian.jira.enrichment.record_identifiers import (
     is_jira_ticket_record,
 )
+from app.exceptions.indexing_exceptions import RecordContentUnavailableError
 from app.models.blocks import BlockType, GroupType, SemanticMetadata
 from app.models.entities import (
     CodeFileRecord,
@@ -2880,6 +2881,18 @@ async def get_record(virtual_record_id: str,virtual_record_id_to_result: dict[st
         else:
             virtual_record_id_to_result[virtual_record_id] = None
 
+    except RecordContentUnavailableError as e:
+        # Storage has no readable JSON for this one record (e.g. 404 after a
+        # rollout wiped local files). Mark it None so every consumer skips the
+        # hit -- `record is None: continue` in search_with_filters and
+        # get_flattened_results -- instead of turning the whole search into a 500.
+        logger.warning(
+            "Dropping search hit: record content unavailable (virtual_record_id=%s, status=%s): %s",
+            virtual_record_id,
+            e.status,
+            e.message,
+        )
+        virtual_record_id_to_result[virtual_record_id] = None
     except Exception as e:
         raise e
 

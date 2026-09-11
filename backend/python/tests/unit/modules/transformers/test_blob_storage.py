@@ -7,6 +7,7 @@ from unittest.mock import ANY, AsyncMock, MagicMock, patch
 import pytest
 from yarl import URL
 
+from app.exceptions.indexing_exceptions import RecordContentUnavailableError
 from app.modules.transformers.blob_storage import BlobStorage
 
 
@@ -678,8 +679,11 @@ class TestGetRecordFromStorage:
         mock_session.__aexit__ = AsyncMock(return_value=False)
 
         with patch("app.modules.transformers.blob_storage.aiohttp.ClientSession", return_value=mock_session):
-            with pytest.raises(Exception, match="Failed to retrieve record"):
+            with pytest.raises(RecordContentUnavailableError, match="Failed to retrieve record") as exc_info:
                 await bs.get_record_from_storage("vr-1", "org-1")
+        # typed so retrieval can drop just this hit instead of failing the whole search
+        assert exc_info.value.virtual_record_id == "vr-1"
+        assert exc_info.value.status == 404
 
 
 # ===================================================================

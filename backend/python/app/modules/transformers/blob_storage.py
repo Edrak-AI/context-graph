@@ -18,7 +18,10 @@ from app.config.constants.service import (
     TokenScopes,
     config_node_constants,
 )
-from app.exceptions.indexing_exceptions import StorageVersionUnavailableError
+from app.exceptions.indexing_exceptions import (
+    RecordContentUnavailableError,
+    StorageVersionUnavailableError,
+)
 from app.modules.transformers.transformer import TransformContext, Transformer
 from app.services.graph_db.interface.graph_db_provider import IGraphDBProvider
 from app.utils.request_context import inject_request_headers
@@ -1473,13 +1476,28 @@ class BlobStorage(Transformer):
                         if record is not None:
                             return record
                         self.logger.error("❌ No record found for virtual_record_id: %s", virtual_record_id)
-                        raise Exception("No record found for virtual_record_id")
+                        raise RecordContentUnavailableError(
+                            "No record found for virtual_record_id",
+                            virtual_record_id=virtual_record_id,
+                        )
                     else:
                         self.logger.error("❌ No record found for virtual_record_id: %s", virtual_record_id)
-                        raise Exception("No record found for virtual_record_id")
+                        raise RecordContentUnavailableError(
+                            "No record found for virtual_record_id",
+                            virtual_record_id=virtual_record_id,
+                        )
                 else:
                     self.logger.error("❌ Failed to retrieve record: status %s, virtual_record_id: %s", resp.status, virtual_record_id)
-                    raise Exception("Failed to retrieve record from storage")
+                    raise RecordContentUnavailableError(
+                        "Failed to retrieve record from storage",
+                        virtual_record_id=virtual_record_id,
+                        status=resp.status,
+                    )
+        except RecordContentUnavailableError:
+            # Already logged above with status + virtual_record_id; callers
+            # decide whether one unreadable record is fatal (retrieval drops
+            # the hit). No second stack trace for an expected condition.
+            raise
         except Exception as e:
             self.logger.exception(
                 "❌ Error retrieving record from storage (virtual_record_id=%s)",

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -106,6 +107,12 @@ class FakeSyncPoint:
         self.points[key] = data
 
 
+def rows(point: FakeSyncPoint) -> list[dict[str, Any]]:
+    stored = point.points["webhooks"]["webhooks"]
+    assert isinstance(stored, str)  # one JSON string: Neo4j rejects a list of maps
+    return json.loads(stored)
+
+
 def _manager(api: FakeBc, point: FakeSyncPoint, now: datetime = NOW) -> GraphSubscriptionManager:
     return GraphSubscriptionManager(
         BcSubscriptionTransport(api.send_json), "conn-1", URL, "state", LOGGER,
@@ -120,7 +127,7 @@ class TestBcTransport:
         regs = asyncio.run(_manager(api, point).ensure(resources))
         assert [r.id for r in regs] == ["s-1"]
         assert api.rows["s-1"]["clientState"] == "state"
-        assert point.points["webhooks"]["webhooks"][0]["id"] == "s-1"
+        assert rows(point)[0]["id"] == "s-1"
 
         # more than 12 h left: untouched
         asyncio.run(_manager(api, point, now=NOW + timedelta(days=2)).renew_expiring(BC_RENEW_WITHIN_MINUTES))
@@ -135,7 +142,7 @@ class TestBcTransport:
         # BC dropped it: renew 404 -> recreate
         del api.rows["s-1"]
         asyncio.run(_manager(api, point, now=late + timedelta(days=3)).renew_expiring(BC_RENEW_WITHIN_MINUTES))
-        assert [r["id"] for r in point.points["webhooks"]["webhooks"]] == ["s-2"]
+        assert [r["id"] for r in rows(point)] == ["s-2"]
 
         asyncio.run(_manager(api, point).remove_all())
         assert api.rows == {}

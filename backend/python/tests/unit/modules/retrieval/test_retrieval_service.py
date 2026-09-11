@@ -1607,6 +1607,124 @@ class TestSearchWithFilters:
         # But records list is still returned, so we should get a response
         assert result["status"] == "success" or result["status_code"] == 200
 
+    # -- one unreadable record must not fail the whole search (US dev, image edrak21) --
+
+    _TWO_RECORDS = [
+        {
+            "_key": "rec1", "virtualRecordId": "vr1", "origin": "onedrive", "recordName": "Doc 1",
+            "webUrl": "https://example.com/1", "mimeType": "application/pdf", "recordType": "FILE",
+        },
+        {
+            "_key": "rec2", "virtualRecordId": "vr2", "origin": "onedrive", "recordName": "Doc 2",
+            "webUrl": "https://example.com/2", "mimeType": "application/pdf", "recordType": "FILE",
+        },
+    ]
+
+    @staticmethod
+    def _hit(vrid: str, content: str, score: float) -> dict:
+        return {
+            "score": score,
+            "content": content,
+            "citationType": "vectordb|document",
+            "metadata": {"virtualRecordId": vrid, "orgId": "o1", "isBlockGroup": False, "blockIndex": 0},
+        }
+
+    @staticmethod
+    async def _echo_flattened(results, *args, **kwargs) -> list[dict]:
+        """Stand-in for get_flattened_results: one text result per hit it was given."""
+        return [
+            {
+                "block_type": "text", "score": r["score"], "content": r["content"],
+                "citationType": r.get("citationType"), "metadata": r["metadata"],
+            }
+            for r in results
+        ]
+
+    def _two_hit_search(self, retrieval_service, mock_graph_provider, mock_blob_store, unavailable) -> None:
+        from app.exceptions.indexing_exceptions import RecordContentUnavailableError
+
+        mock_graph_provider.get_accessible_virtual_record_ids.return_value = {"vr1": "rec1", "vr2": "rec2"}
+        mock_graph_provider.get_user_by_user_id.return_value = {"email": "u@t.com"}
+        mock_graph_provider.get_records_by_record_ids.return_value = [dict(r) for r in self._TWO_RECORDS]
+        retrieval_service._execute_parallel_searches = AsyncMock(
+            return_value=[self._hit("vr1", "content 1", 0.9), self._hit("vr2", "content 2", 0.8)]
+        )
+
+        async def fetch(virtual_record_id, org_id, lookup_result=None) -> dict:
+            if virtual_record_id in unavailable:
+                # what BlobStorage raises on `File not found or not accessible: record_<vrid>.json`
+                raise RecordContentUnavailableError(
+                    "Failed to retrieve record from storage", virtual_record_id=virtual_record_id, status=404
+                )
+            return {"record_name": f"Doc {virtual_record_id[-1]}", "block_containers": {"blocks": [], "block_groups": []}}
+
+        mock_blob_store.get_record_from_storage = AsyncMock(side_effect=fetch)
+
+    @pytest.mark.asyncio
+    async def test_unreadable_record_drops_only_that_hit(
+        self, retrieval_service, mock_graph_provider, mock_blob_store
+    ) -> None:
+        """After a pod rollout wiped local storage, the Node API answers 404 for some
+        records' JSON. The bare Exception from get_record_from_storage used to escape
+        the per-hit fetch and hit the outer except: HTTP 500, no answer, although the
+        other hits were fine. Now the hit is dropped with a WARNING and the rest is returned."""
+        self._two_hit_search(retrieval_service, mock_graph_provider, mock_blob_store, unavailable={"vr1"})
+        flattened = AsyncMock(side_effect=self._echo_flattened)
+
+        with patch("app.utils.chat_helpers.create_record_instance_from_dict", return_value=None), \
+             patch("app.modules.retrieval.retrieval_service.get_flattened_results", new=flattened), \
+             patch("app.utils.chat_helpers.logger") as helpers_log:
+            result = await retrieval_service.search_with_filters(
+                queries=["test"], user_id="u1", org_id="o1", knowledge_search=True,
+            )
+
+        assert result["status"] == Status.SUCCESS.value
+        assert result["status_code"] == 200
+        assert [sr["content"] for sr in result["searchResults"]] == ["content 2"]
+        assert [sr["metadata"]["virtualRecordId"] for sr in result["searchResults"]] == ["vr2"]
+        # only the readable record reached the flattening step
+        passed = flattened.await_args.args[0]
+        assert [r["metadata"]["virtualRecordId"] for r in passed] == ["vr2"]
+        # both records were attempted exactly once
+        assert sorted(c.kwargs["virtual_record_id"] for c in mock_blob_store.get_record_from_storage.await_args_list) == ["vr1", "vr2"]
+        # one WARNING naming the record and the storage status (chat_helpers' logger does not propagate)
+        warned = [c.args[0] % c.args[1:] for c in helpers_log.warning.call_args_list]
+        assert [w for w in warned if "vr1" in w and "status=404" in w], warned
+        assert not [w for w in warned if "vr2" in w]
+
+    @pytest.mark.asyncio
+    async def test_all_records_unreadable_returns_empty_results_not_500(
+        self, retrieval_service, mock_graph_provider, mock_blob_store
+    ) -> None:
+        self._two_hit_search(retrieval_service, mock_graph_provider, mock_blob_store, unavailable={"vr1", "vr2"})
+        flattened = AsyncMock(side_effect=self._echo_flattened)
+
+        with patch("app.utils.chat_helpers.create_record_instance_from_dict", return_value=None), \
+             patch("app.modules.retrieval.retrieval_service.get_flattened_results", new=flattened):
+            result = await retrieval_service.search_with_filters(
+                queries=["test"], user_id="u1", org_id="o1", knowledge_search=True,
+            )
+
+        assert result["status_code"] == 200
+        assert result["searchResults"] == []
+        assert flattened.await_count == 0  # nothing left to flatten
+
+    @pytest.mark.asyncio
+    async def test_other_storage_errors_still_fail_the_search(
+        self, retrieval_service, mock_graph_provider, mock_blob_store
+    ) -> None:
+        """Only the typed per-record condition is tolerated; a generic storage failure
+        keeps the existing behaviour (outer except -> error response)."""
+        self._two_hit_search(retrieval_service, mock_graph_provider, mock_blob_store, unavailable=set())
+        mock_blob_store.get_record_from_storage = AsyncMock(side_effect=RuntimeError("storage down"))
+
+        with patch("app.modules.retrieval.retrieval_service.get_flattened_results", new=AsyncMock(return_value=[])):
+            result = await retrieval_service.search_with_filters(
+                queries=["test"], user_id="u1", org_id="o1", knowledge_search=True,
+            )
+
+        assert result["status"] == Status.ERROR.value
+
     @pytest.mark.asyncio
     async def test_fetch_files_exception_returns_empty_map(
         self, retrieval_service, mock_graph_provider

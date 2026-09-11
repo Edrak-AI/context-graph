@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import json
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
@@ -93,6 +94,13 @@ class FakeSyncPoint:
         self.points[key] = data
 
 
+def rows(point: FakeSyncPoint) -> list[dict[str, Any]]:
+    """Registrations as stored: one JSON string under ``webhooks`` (Neo4j cannot hold a list of maps)."""
+    stored = point.points["webhooks"]["webhooks"]
+    assert isinstance(stored, str)
+    return json.loads(stored)
+
+
 class FakeGraph:
     """In-memory ``/subscriptions``. ``fail`` maps a resource (create) or id (renew) to a status code."""
 
@@ -159,7 +167,7 @@ class TestGraphSubscriptionManager:
         assert created["notificationUrl"].endswith("/graph/conn-1")
         assert created["expirationDateTime"] == format_graph_datetime(expiration_for(DRIVE_ITEM_MAX_MINUTES, NOW))
         assert graph.subscriptions["sub-2"]["expirationDateTime"] == format_graph_datetime(expiration_for(CHAT_MESSAGE_MAX_MINUTES, NOW))
-        stored = point.points["webhooks"]["webhooks"]
+        stored = rows(point)
         assert [(r["id"], r["resource"], r["maxMinutes"]) for r in stored] == [
             ("sub-1", DRIVE.resource, DRIVE_ITEM_MAX_MINUTES), ("sub-2", CHANNEL.resource, CHAT_MESSAGE_MAX_MINUTES),
         ]
@@ -176,7 +184,7 @@ class TestGraphSubscriptionManager:
         renews = [c for c in graph.calls if c[0] == "renew"]
         assert renews == [("renew", "sub-2")]  # the 60-minute channel subscription, not the 3-day drive one
         assert graph.subscriptions["sub-2"]["expirationDateTime"] == format_graph_datetime(expiration_for(CHAT_MESSAGE_MAX_MINUTES, later))
-        assert point.points["webhooks"]["webhooks"][1]["expiresAt"] == graph.subscriptions["sub-2"]["expirationDateTime"]
+        assert rows(point)[1]["expiresAt"] == graph.subscriptions["sub-2"]["expirationDateTime"]
 
     def test_renew_404_recreates(self) -> None:
         graph, point = FakeGraph(), FakeSyncPoint()
@@ -185,7 +193,7 @@ class TestGraphSubscriptionManager:
         asyncio.run(_manager(graph, point, now=NOW + timedelta(hours=2)).renew_expiring(within_minutes=120))
         assert ("renew", "sub-1") in graph.calls
         assert graph.calls[-1] == ("create", CHANNEL.resource)
-        assert [r["id"] for r in point.points["webhooks"]["webhooks"]] == ["sub-2"]
+        assert [r["id"] for r in rows(point)] == ["sub-2"]
 
     def test_403_is_logged_once_and_skipped(self, caplog: pytest.LogCaptureFixture) -> None:
         graph, point = FakeGraph(fail={CHANNEL.resource: 403, "teams/t2/channels/c2/messages": 403}), FakeSyncPoint()
@@ -213,12 +221,59 @@ class TestGraphSubscriptionManager:
         del graph.subscriptions["sub-2"]  # already gone on Graph's side: 404 is tolerated
         asyncio.run(_manager(graph, point).remove_all())
         assert graph.subscriptions == {}
-        assert point.points["webhooks"]["webhooks"] == []
+        assert rows(point) == []
 
     def test_registration_roundtrip(self) -> None:
         reg = Registration("id", "res", "updated", "2026-09-11T00:00:00Z", 60)
         assert Registration.from_dict(reg.to_dict()) == reg
         assert Registration.from_dict({"resource": "no-id"}) is None
+
+
+class TestSubscriptionStore:
+    """The sync point is a Neo4j node on US dev: a property may be a primitive or a list of
+    primitives, never a map. Storing ``[reg.to_dict(), ...]`` failed every upkeep run with
+    ``Neo.ClientError.Statement.TypeError ... Encountered: Map{maxMinutes -> Long(4230), ...}``."""
+
+    REGS = [
+        Registration("sub-1", "users/u1/drive/root", "updated", "2026-09-12T00:00:00Z", DRIVE_ITEM_MAX_MINUTES),
+        Registration("sub-2", "teams/t1/channels/c1/messages", "created,updated,deleted", None, CHAT_MESSAGE_MAX_MINUTES),
+    ]
+
+    def test_save_stores_one_json_string_and_load_restores_registrations(self) -> None:
+        point = FakeSyncPoint()
+        store = SubscriptionStore(point)
+        asyncio.run(store.save(self.REGS))
+
+        stored = point.points["webhooks"]["webhooks"]
+        assert isinstance(stored, str)
+        assert json.loads(stored) == [r.to_dict() for r in self.REGS]
+        # nothing but primitives reaches the graph store
+        assert all(not isinstance(v, (dict, list)) for v in point.points["webhooks"].values())
+
+        assert asyncio.run(SubscriptionStore(point).load()) == self.REGS
+
+    def test_load_accepts_legacy_list_of_dicts(self) -> None:
+        point = FakeSyncPoint()
+        point.points["webhooks"] = {"webhooks": [r.to_dict() for r in self.REGS]}  # written by earlier builds on Arango
+        assert asyncio.run(SubscriptionStore(point).load()) == self.REGS
+
+    def test_load_tolerates_missing_empty_and_malformed(self) -> None:
+        assert asyncio.run(SubscriptionStore(FakeSyncPoint()).load()) == []
+        for bad in ("", "   ", "not json", "{}", 42, None, ["not-a-dict", 1]):
+            point = FakeSyncPoint()
+            point.points["webhooks"] = {"webhooks": bad}
+            assert asyncio.run(SubscriptionStore(point).load()) == [], bad
+
+    def test_manager_roundtrip_survives_a_new_run(self) -> None:
+        graph, point = FakeGraph(), FakeSyncPoint()
+        asyncio.run(_manager(graph, point).ensure([DRIVE, CHANNEL]))
+        assert isinstance(point.points["webhooks"]["webhooks"], str)
+        calls_before = len(graph.calls)
+        regs = asyncio.run(_manager(graph, point).registrations())
+        assert [(r.id, r.resource, r.max_minutes) for r in regs] == [
+            ("sub-1", DRIVE.resource, DRIVE_ITEM_MAX_MINUTES), ("sub-2", CHANNEL.resource, CHAT_MESSAGE_MAX_MINUTES),
+        ]
+        assert graph.calls[calls_before:] == []  # loaded from the store: no adoption ``list``, no re-create
 
 
 class TestSyncGraphSubscriptionsHook:
