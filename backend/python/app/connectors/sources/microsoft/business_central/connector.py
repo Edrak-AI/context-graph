@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
 import httpx
@@ -71,6 +72,8 @@ from app.connectors.sources.microsoft.business_central.mapping import (
     DEFAULT_RECONCILE_INTERVAL_HOURS,
     ENTITIES_FILTER_KEY,
     ENTITY_SPECS,
+    FIELD_LAST_SYNC,
+    FIELD_POLICY_FINGERPRINTS,
     MODIFIED_FIELD,
     RECONCILE_INTERVAL_FILTER_KEY,
     TOKEN_SCOPE,
@@ -82,14 +85,17 @@ from app.connectors.sources.microsoft.business_central.mapping import (
     GrantEntity,
     PermissionGrant,
     ReconcileMode,
+    access_policy_fingerprint,
     api_base_url,
     build_key_page_params,
     build_modified_filter,
     build_page_params,
     build_single_params,
+    changed_access_policies,
     company_grants,
     company_group_external_id,
     company_group_name,
+    company_id_of_external_id,
     company_path,
     company_web_url,
     diff_known_against_live,
@@ -158,6 +164,7 @@ CONNECTOR_KEY = "microsoftbusinesscentral"  # ConnectorFactory registry key / fi
 USERS_SYNC_POINT_KEY = "users"
 GROUPS_SYNC_POINT_KEY = "groups"
 COMPANIES_SYNC_POINT_KEY = "companies"
+ACCESS_POLICY_SYNC_POINT_KEY = "accessPolicy"   # per-company access-policy fingerprints (see _reconcile_access_policies)
 ENTITY_SYNC_POINT_PREFIX = "entity"
 
 _MAX_HTTP_RETRIES = 5
@@ -690,6 +697,7 @@ class MicrosoftBusinessCentralConnector(BaseConnector):
         self._known_records_cache = None
         await self._sync_access_model()
         await self._sync_record_groups()
+        await self._reconcile_access_policies()
         for company in self._companies:
             for spec in specs:
                 await self._sync_entity(company, spec, incremental=incremental)
@@ -824,6 +832,81 @@ class MicrosoftBusinessCentralConnector(BaseConnector):
         if groups:
             await self.data_entities_processor.on_new_record_groups(groups)
 
+    # ------------------------------------------------------------------
+    # Access-policy reconciliation (security review S06)
+    # ------------------------------------------------------------------
+
+    async def _reconcile_access_policies(self) -> None:
+        """Repair the grants of *unchanged* records when a company's access policy changes.
+
+        Records carry direct grants (``inherit_permissions=False``) and the record
+        processor only ever adds permission edges on upsert; the incremental sync also
+        only revisits rows whose ``lastModifiedDateTime`` moved.  So switching a company
+        from org-wide (``*``) to restricted used to leave the old ORG edge on every row
+        that did not change in Business Central.  A fingerprint of each company's
+        effective grants (``mapping.access_policy_fingerprint``) is kept in the
+        ``accessPolicy`` sync point; whenever it differs from the stored one — or was
+        never stored — the permission edges of **all** the company's records are
+        replaced (``on_updated_record_permissions`` deletes every permission edge of the
+        record and writes the current grants in one transaction), regardless of source
+        timestamps.  The new fingerprint is recorded only once every record of the
+        company was reconciled, so a partial failure is retried on the next sync.
+        """
+        point = await self.records_sync_point.read_sync_point(ACCESS_POLICY_SYNC_POINT_KEY) or {}
+        stored_raw = point.get(FIELD_POLICY_FINGERPRINTS)
+        stored: dict[str, object] = dict(stored_raw) if isinstance(stored_raw, Mapping) else {}
+        current = {company.id: access_policy_fingerprint(self._resolved_access(company)) for company in self._companies}
+        changed = changed_access_policies(stored, current)
+        if changed:
+            by_id = {company.id: company for company in self._companies}
+            reconciled, failed = await self._replace_company_record_permissions([by_id[cid] for cid in changed])
+            for company_id in changed:
+                company = by_id[company_id]
+                reason = "policy changed" if company_id in stored else "no recorded policy"
+                if failed.get(company_id):
+                    self.logger.error(
+                        "Business Central company %s: %d records could not be reconciled after the access policy change "
+                        "(%d done); the reconciliation is retried on the next sync",
+                        company.label, failed[company_id], reconciled.get(company_id, 0),
+                    )
+                    continue
+                self.logger.info("Reconciled %d records for company %s: %s", reconciled.get(company_id, 0), company.label, reason)
+                stored[company_id] = current[company_id]
+        await self.records_sync_point.update_sync_point(
+            ACCESS_POLICY_SYNC_POINT_KEY,
+            {FIELD_POLICY_FINGERPRINTS: stored, FIELD_LAST_SYNC: get_epoch_timestamp_in_ms()},
+        )
+
+    def _resolved_access(self, company: Company) -> CompanyAccess:
+        access = self._access_by_company.get(company.id)
+        if access is None:
+            raise RuntimeError(f"Business Central company {company.label} has no resolved access model; run the access sync first")
+        return access
+
+    async def _replace_company_record_permissions(self, companies: list[Company]) -> tuple[dict[str, int], dict[str, int]]:
+        """Re-derive the grants of every stored record of ``companies`` (all entity sets)
+        and replace the records' permission edges with them.  One pass over the
+        connector's records; returns ``({companyId: reconciled}, {companyId: failed})``."""
+        by_id = {company.id: company for company in companies}
+        permissions = {company.id: self._company_permissions(company) for company in companies}
+        reconciled: dict[str, int] = {}
+        failed: dict[str, int] = {}
+        async for record in self._iter_connector_records():
+            company_id = company_id_of_external_id(str(getattr(record, "external_record_id", "") or ""))
+            if company_id not in by_id:
+                continue
+            try:
+                await self.data_entities_processor.on_updated_record_permissions(record, list(permissions[company_id]))
+            except Exception as e:
+                failed[company_id] = failed.get(company_id, 0) + 1
+                self.logger.error(
+                    "Failed to reconcile permissions of Business Central record %s (%s): %s",
+                    getattr(record, "id", None), getattr(record, "external_record_id", None), e, exc_info=True,
+                )
+                continue
+            reconciled[company_id] = reconciled.get(company_id, 0) + 1
+        return reconciled, failed
+
     async def _sync_entity(self, company: Company, spec: EntitySpec, *, incremental: bool) -> None:
         key = _entity_sync_point_key(company.id, spec)
         state = EntitySyncState.from_sync_point(await self.records_sync_point.read_sync_point(key))
@@ -917,6 +1000,21 @@ class MicrosoftBusinessCentralConnector(BaseConnector):
             live.update(seen_external_ids(company.id, spec, rows))
         return live
 
+    async def _iter_connector_records(self) -> AsyncGenerator[Record, None]:
+        """Every record the graph holds for this connector, keyset-paged."""
+        after_key: str | None = None
+        while True:
+            page = await self.data_entities_processor.get_records_by_status(
+                self.connector_id, status_filters=[], limit=_KNOWN_RECORDS_PAGE, after_key=after_key,
+            )
+            if not page:
+                return
+            for record in page:
+                yield record
+            after_key = str(page[-1].id) if getattr(page[-1], "id", None) else None
+            if len(page) < _KNOWN_RECORDS_PAGE or not after_key:
+                return
+
     async def _known_records(self, company: Company, spec: EntitySpec) -> dict[str, str]:
         """``{external_record_id: record_id}`` the graph holds for one company × entity set.
 
@@ -924,23 +1022,13 @@ class MicrosoftBusinessCentralConnector(BaseConnector):
         by ``bc:<companyId>:<entitySet>:`` prefix; later lookups are dictionary hits."""
         if self._known_records_cache is None:
             cache: dict[str, dict[str, str]] = {}
-            after_key: str | None = None
-            while True:
-                page = await self.data_entities_processor.get_records_by_status(
-                    self.connector_id, status_filters=[], limit=_KNOWN_RECORDS_PAGE, after_key=after_key,
-                )
-                if not page:
-                    break
-                for record in page:
-                    external_id = str(getattr(record, "external_record_id", "") or "")
-                    record_id = getattr(record, "id", None)
-                    if not external_id or not record_id:
-                        continue
-                    prefix = external_id[: external_id.rfind(":") + 1]
-                    cache.setdefault(prefix, {})[external_id] = str(record_id)
-                after_key = str(page[-1].id) if getattr(page[-1], "id", None) else None
-                if len(page) < _KNOWN_RECORDS_PAGE or not after_key:
-                    break
+            async for record in self._iter_connector_records():
+                external_id = str(getattr(record, "external_record_id", "") or "")
+                record_id = getattr(record, "id", None)
+                if not external_id or not record_id:
+                    continue
+                prefix = external_id[: external_id.rfind(":") + 1]
+                cache.setdefault(prefix, {})[external_id] = str(record_id)
             self._known_records_cache = cache
         return dict(self._known_records_cache.get(record_id_prefix(company.id, spec), {}))
 

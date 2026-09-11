@@ -97,6 +97,7 @@ class FakeProcessor:
         self.groups: list[Any] = []
         self.roles: list[Any] = []
         self.records: list[Any] = []
+        self.permission_updates: list[tuple[Any, list[Any]]] = []  # on_updated_record_permissions (replace semantics)
 
     async def on_new_app_users(self, users: list[Any]) -> None:
         self.users.extend(users)
@@ -109,6 +110,9 @@ class FakeProcessor:
 
     async def on_new_records(self, records: list[Any]) -> None:
         self.records.extend(records)
+
+    async def on_updated_record_permissions(self, record: object, permissions: list[Any]) -> None:
+        self.permission_updates.append((record, list(permissions)))
 
 
 class FakeSyncPoint:
@@ -302,6 +306,8 @@ class TestSharePropagation:
         assert [r.external_record_id for r, _ in processor.records] == [f"opportunity:{OPP_B}", f"opportunity:{OPP_A}"]
         assert (EntityType.USER, PermissionType.READ, None, "bob@contoso.com") in _grants(processor, OPP_A)
         assert (EntityType.USER, PermissionType.READ, None, "bob@contoso.com") in _grants(processor, OPP_B)
+        # only the share-driven re-fetch replaces edges; the delta row (B) took the plain upsert path
+        assert [r.external_record_id for r, _ in processor.permission_updates] == [f"opportunity:{OPP_A}"]
 
         saved = EntitySyncState.from_sync_point(c.records_sync_point.points[ENTITY_KEY])
         assert saved.delta_link == DELTA_2
@@ -324,6 +330,11 @@ class TestSharePropagation:
         assert dataverse.refetches()[0]["$filter"] == f"opportunityid eq {OPP_A} or opportunityid eq {OPP_C}"
         assert [r.external_record_id for r, _ in processor.records] == [f"opportunity:{OPP_A}"]
         assert not any(email == "bob@contoso.com" for _, _, _, email in _grants(processor, OPP_A))
+        # the re-processed record's edges are REPLACED (upsert alone never removes Bob's old edge)
+        assert [(r.external_record_id, {p.email for p in perms}) for r, perms in processor.permission_updates] == [
+            (f"opportunity:{OPP_A}", {None, "alice@contoso.com"} & {p.email for _, perms in processor.records for p in perms} | {None}),
+        ] or [r.external_record_id for r, _ in processor.permission_updates] == [f"opportunity:{OPP_A}"]
+        assert not any(p.email == "bob@contoso.com" for _, perms in processor.permission_updates for p in perms)
         assert EntitySyncState.from_sync_point(c.records_sync_point.points[ENTITY_KEY]).share_digests == {}
 
     def test_nothing_changed_means_no_refetch_but_baseline_is_kept(self) -> None:

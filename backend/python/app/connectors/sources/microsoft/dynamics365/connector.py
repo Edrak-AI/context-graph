@@ -1150,7 +1150,9 @@ class MicrosoftDynamics365Connector(BaseConnector):
         for start in range(0, len(changed), PRIMARY_ID_FILTER_BATCH_SIZE):
             rows = await self._fetch_rows_by_id(spec, changed[start:start + PRIMARY_ID_FILTER_BATCH_SIZE])
             reapplied += len(rows)
-            await self._process_rows(spec, rows, start_ms, end_ms)
+            # replace, not add: an *unshare* must take the old principal's edge away, and the
+            # record processor's upsert path only ever adds permission edges
+            await self._process_rows(spec, rows, start_ms, end_ms, replace_permissions=True)
         state.share_digests = current_digests
         self.logger.info("Re-applied grants for %d %s records whose shares changed", reapplied, spec.display_name.lower())
         return reapplied
@@ -1209,8 +1211,13 @@ class MicrosoftDynamics365Connector(BaseConnector):
         return upserted, deleted
 
     async def _process_rows(
-        self, spec: EntitySpec, rows: List[Dict[str, Any]], start_ms: Optional[int], end_ms: Optional[int]
+        self, spec: EntitySpec, rows: List[Dict[str, Any]], start_ms: Optional[int], end_ms: Optional[int],
+        *, replace_permissions: bool = False,
     ) -> int:
+        """Upsert ``rows`` with their derived grants.  ``replace_permissions`` additionally
+        replaces every record's permission edges with exactly the derived set (the upsert
+        alone never removes an edge) — used when a record is re-processed because its
+        share list changed."""
         batch: List[Tuple[Record, List[Permission]]] = []
         for row in rows:
             if not row_in_modified_bounds(row, start_ms, end_ms):
@@ -1224,6 +1231,11 @@ class MicrosoftDynamics365Connector(BaseConnector):
                 batch.append(attachment)
         if batch:
             await self.data_entities_processor.on_new_records(batch)
+            if replace_permissions:
+                # ``on_new_records`` rebinds each record object to its stored id, so the
+                # replacement targets the existing graph record
+                for record, permissions in batch:
+                    await self.data_entities_processor.on_updated_record_permissions(record, list(permissions))
         return len(batch)
 
     # ------------------------------------------------------------------

@@ -13,20 +13,39 @@ Optional headless mode (opt-in per connector instance):
 
 Each strategy shares the same headers but uses different
 TLS fingerprints / impersonation profiles.
+
+Egress policy (SSRF guard): no transport follows redirects on its own.  Every hop —
+the initial URL, each ``Location`` and every image/subresource fetched through
+``fetch_url_with_fallback`` — is resolved and validated by a ``DestinationPolicy``
+(``destination_policy.py``) and the validated addresses are pinned to the connection
+(aiohttp resolver, ``CURLOPT_RESOLVE``, pinned requests connection pool).  A blocked
+destination yields a ``FetchResponse`` with status 451 and
+``X-Fetch-Skip-Reason: destination_blocked`` instead of a connection failure, so the
+caller never queues it for a retry.
 """
 from __future__ import annotations
 
 import asyncio
 import contextlib
-import logging
 import random
+from collections.abc import Awaitable
 from dataclasses import dataclass
-from typing import Any, Callable, Coroutine, List, Optional, Tuple, cast
-from urllib.parse import urlparse
+from typing import TYPE_CHECKING, Any, Callable, Coroutine, List, Optional, Tuple, cast
+from urllib.parse import urljoin, urlparse
 
 import aiohttp
 
 from app.config.constants.http_status_code import HttpStatusCode
+from app.connectors.sources.web.destination_policy import (
+    DestinationBlocked,
+    DestinationPolicy,
+    PinnedTarget,
+)
+
+if TYPE_CHECKING:
+    import logging
+
+    import requests
 
 # ---------------------------------------------------------------------------
 # Unified response wrapper
@@ -37,6 +56,10 @@ REQUEST_TIMEOUT = 15
 # asyncio.sleep yields to the event loop, so other concurrent domain fetches are
 # never blocked while one URL is backing off.
 MAX_RATE_LIMIT_BACKOFF = 300  # 5 minutes
+
+# Status returned when the destination policy refuses a hop (not retryable anywhere).
+DESTINATION_BLOCKED_STATUS = 451
+_REDIRECT_CODES = {301, 302, 303, 307, 308}
 
 # ---------------------------------------------------------------------------
 # Shared stealth headers
@@ -127,17 +150,72 @@ _BOT_DETECTION_CODES = {403, 999, 520, 521, 522, 523, 524, 525, 526, 527, 528, 5
 # ---------------------------------------------------------------------------
 
 
+def _redirect_location(response: FetchResponse) -> Optional[str]:
+    if response.status_code not in _REDIRECT_CODES:
+        return None
+    location = response.headers.get("Location") or response.headers.get("location")
+    return location or None
+
+
+async def _follow_redirects(
+    url: str,
+    fetch_once: Callable[[PinnedTarget], Awaitable[Optional[FetchResponse]]],
+    policy: DestinationPolicy,
+    logger: logging.Logger,
+    label: str,
+) -> Optional[FetchResponse]:
+    """Run ``fetch_once`` for ``url`` and follow up to ``policy.max_redirects`` ``Location``
+    hops, resolving + validating every hop first.  Raises ``DestinationBlocked`` when a
+    hop is refused; returns ``None`` when the chain is longer than allowed."""
+    current = url
+    for hop in range(policy.max_redirects + 1):
+        target = await policy.resolve(current)  # raises DestinationBlocked
+        response = await fetch_once(target)
+        if response is None:
+            return None
+        location = _redirect_location(response)
+        if location is None:
+            response.final_url = current
+            return response
+        next_url = urljoin(current, location)
+        if hop == policy.max_redirects:
+            logger.warning("⚠️ [%s] Too many redirects for %s (last hop → %s)", label, url, next_url)
+            return None
+        logger.debug("↪️ [%s] %s redirected (%s) to %s", label, current, response.status_code, next_url)
+        current = next_url
+    return None
+
+
+def _blocked_response(error: DestinationBlocked) -> FetchResponse:
+    return FetchResponse(
+        status_code=DESTINATION_BLOCKED_STATUS,
+        content_bytes=b"",
+        headers={"X-Fetch-Skip-Reason": "destination_blocked"},
+        final_url=error.url,
+        strategy="destination_policy",
+        success=False,
+        error_message=str(error),
+    )
+
+
 async def _try_aiohttp(
     session: aiohttp.ClientSession,
     url: str,
     headers: dict,
     timeout: int,
     logger: logging.Logger,
+    policy: Optional[DestinationPolicy] = None,
 ) -> Optional[FetchResponse]:
-    """Strategy 1: aiohttp — lightweight, already async."""
-    try:
+    """Strategy 1: aiohttp — lightweight, already async.
+
+    Redirects are followed manually so every hop passes the destination policy; the
+    connector's session additionally resolves through ``PolicyResolver`` so aiohttp
+    only ever connects to validated addresses."""
+    policy = policy or DestinationPolicy.default()
+
+    async def fetch_once(target: PinnedTarget) -> Optional[FetchResponse]:
         async with session.get(
-            url, headers=headers, allow_redirects=True, timeout=aiohttp.ClientTimeout(total=timeout)
+            target.url, headers=headers, allow_redirects=False, timeout=aiohttp.ClientTimeout(total=timeout)
         ) as response:
             content_bytes = await response.read()
             return FetchResponse(
@@ -147,6 +225,11 @@ async def _try_aiohttp(
                 final_url=str(response.url),
                 strategy="aiohttp",
             )
+
+    try:
+        return await _follow_redirects(url, fetch_once, policy, logger, "aiohttp")
+    except DestinationBlocked:
+        raise
     except asyncio.TimeoutError:
         logger.warning("⚠️ [aiohttp] Timeout fetching %s", url)
         return None
@@ -165,10 +248,13 @@ def _sync_curl_cffi_fetch(
     use_http2: bool,
     profiles: Optional[list] = None,
     logger: Optional[logging.Logger] = None,
+    resolve_entry: Optional[str] = None,
 ) -> Optional[FetchResponse]:
     """
-    Synchronous curl_cffi fetch with profile rotation.
-    Meant to be called via run_in_executor.
+    Synchronous curl_cffi fetch with profile rotation — one hop, no redirects.
+    Meant to be called via run_in_executor.  ``resolve_entry`` (``host:port:addrs``,
+    from ``PinnedTarget.curl_resolve_entry``) pins the connection to the addresses
+    the destination policy validated (``CURLOPT_RESOLVE``).
     """
     try:
         from curl_cffi import CurlOpt
@@ -190,7 +276,10 @@ def _sync_curl_cffi_fetch(
                 if not use_http2:
                     with contextlib.suppress(Exception):
                         _ = sess.curl.setopt(CurlOpt.HTTP_VERSION, 2)  # CURL_HTTP_VERSION_1_1
-                resp = sess.get(url, headers=headers, allow_redirects=True)
+                if resolve_entry:
+                    # not suppressed: an unpinned request must not go out
+                    sess.curl.setopt(CurlOpt.RESOLVE, [resolve_entry.encode()])
+                resp = sess.get(url, headers=headers, allow_redirects=False)
                 return FetchResponse(
                     status_code=resp.status_code,
                     content_bytes=resp.content,
@@ -210,27 +299,48 @@ async def _try_curl_cffi(
     timeout: int,
     use_http2: bool,
     logger: logging.Logger,
+    policy: Optional[DestinationPolicy] = None,
 ) -> Optional[FetchResponse]:
-    """Strategy 2/3: curl_cffi with browser impersonation (run in executor to avoid blocking)."""
+    """Strategy 2/3: curl_cffi with browser impersonation (run in executor to avoid blocking).
+    Each redirect hop is validated and DNS-pinned before curl is asked to fetch it."""
     label = f"curl_cffi(h2={use_http2})"
-    try:
+    policy = policy or DestinationPolicy.default()
+
+    async def fetch_once(target: PinnedTarget) -> Optional[FetchResponse]:
         loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(
+        return await loop.run_in_executor(
             None,
             _sync_curl_cffi_fetch,
-            url,
+            target.url,
             headers,
             timeout,
             use_http2,
             None,  # profiles parameter (5th)
             logger,  # logger parameter (6th)
+            target.curl_resolve_entry(),
         )
+
+    try:
+        result = await _follow_redirects(url, fetch_once, policy, logger, label)
         if result is None:
             logger.warning(f"⚠️ [{label}] All profiles exhausted for {url}")
         return result
+    except DestinationBlocked:
+        raise
     except Exception as e:
         logger.error(f"❌ [{label}] Unexpected error for {url}: {e}", exc_info=True)
         return None
+
+
+def _create_cloudscraper(logger: logging.Logger) -> Optional[requests.Session]:
+    try:
+        import cloudscraper
+    except ImportError:
+        logger.error("❌ [cloudscraper] Not installed")
+        return None
+    return cloudscraper.create_scraper(
+        browser={"browser": "chrome", "platform": "windows", "mobile": False}
+    )
 
 
 def _sync_cloudscraper_fetch(
@@ -238,19 +348,27 @@ def _sync_cloudscraper_fetch(
     headers: dict,
     timeout: int,
     logger: logging.Logger,
+    target: Optional[PinnedTarget] = None,
+    policy: Optional[DestinationPolicy] = None,
+    scraper: Optional[requests.Session] = None,
 ) -> Optional[FetchResponse]:
-    """Synchronous cloudscraper fetch. Meant to be called via run_in_executor."""
-    try:
-        import cloudscraper
-    except ImportError:
-        logger.error("❌ [cloudscraper] Not installed")
-        return None
+    """Synchronous cloudscraper fetch — one hop, no redirects.  Meant to be called via
+    run_in_executor.  With ``target`` the scraper's connection pool is pinned to the
+    validated address (SNI / certificate checks stay on the real host and the ``Host``
+    header names it); without a pin the request is refused when a policy is given."""
+    if scraper is None:
+        scraper = _create_cloudscraper(logger)
+        if scraper is None:
+            return None
 
     try:
-        scraper = cloudscraper.create_scraper(
-            browser={"browser": "chrome", "platform": "windows", "mobile": False}
-        )
-        resp = scraper.get(url, headers=headers, timeout=timeout, allow_redirects=True)
+        if target is not None:
+            (policy or DestinationPolicy.default()).pin_requests_session(scraper, target)
+            headers = {**headers, "Host": target.host_header}
+        elif policy is not None:
+            logger.error("❌ [cloudscraper] Refusing unpinned request for %s", url)
+            return None
+        resp = scraper.get(url, headers=headers, timeout=timeout, allow_redirects=False)
         return FetchResponse(
             status_code=resp.status_code,
             content_bytes=resp.content,
@@ -267,21 +385,37 @@ async def _try_cloudscraper(
     headers: dict,
     timeout: int,
     logger: logging.Logger,
+    policy: Optional[DestinationPolicy] = None,
 ) -> Optional[FetchResponse]:
-    """Strategy 4: cloudscraper with JS challenge solving (run in executor)."""
+    """Strategy 4: cloudscraper with JS challenge solving (run in executor).
+    One scraper (cookie jar) per URL; every hop is validated and pinned first."""
+    policy = policy or DestinationPolicy.default()
+
     try:
         loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(
-            None,
-            _sync_cloudscraper_fetch,
-            url,
-            headers,
-            timeout,
-            logger,
-        )
+        scraper = await loop.run_in_executor(None, _create_cloudscraper, logger)
+        if scraper is None:
+            return None
+
+        async def fetch_once(target: PinnedTarget) -> Optional[FetchResponse]:
+            return await loop.run_in_executor(
+                None,
+                _sync_cloudscraper_fetch,
+                target.url,
+                headers,
+                timeout,
+                logger,
+                target,
+                policy,
+                scraper,
+            )
+
+        result = await _follow_redirects(url, fetch_once, policy, logger, "cloudscraper")
         if result is None:
             logger.warning(f"⚠️ [cloudscraper] Failed for {url}")
         return result
+    except DestinationBlocked:
+        raise
     except Exception as e:
         logger.error(f"❌ [cloudscraper] Unexpected error for {url}: {e}", exc_info=True)
         return None
@@ -302,6 +436,7 @@ async def fetch_url_with_fallback(
     max_retries_per_strategy: int = 2,
     max_size_mb: Optional[int] = None,
     preferred_strategy: Optional[str] = None,
+    policy: Optional[DestinationPolicy] = None,
 ) -> Optional[FetchResponse]:
     """
     Fetch a URL using a multi-strategy fallback chain.
@@ -336,28 +471,46 @@ async def fetch_url_with_fallback(
                                    fetches to the same strategy that worked for the parent page.
                                    If the name doesn't match any known strategy the full chain is
                                    used as a safety net.
+        policy:                    Destination policy applied to every hop of every strategy
+                                   (default: the environment-driven policy).  A refused hop
+                                   returns a 451 ``destination_policy`` response.
     Returns:
         FetchResponse on success or non-retryable error, None if all strategies fail.
     """
     headers = build_stealth_headers(url, referer=referer, extra=extra_headers)
+    policy = policy or DestinationPolicy.default()
+
+    # Pre-check the destination before any transport is asked (each strategy re-resolves
+    # and pins every hop; this only decides early and uniformly for a blocked start URL).
+    try:
+        await policy.resolve(url)
+    except DestinationBlocked as e:
+        logger.warning("🚫 Blocked %s: %s", url, e.reason)
+        return _blocked_response(e)
 
     if max_size_mb is not None:
         max_size_bytes = max_size_mb * 1024 * 1024
 
-        try:
+        async def head_once(target: PinnedTarget) -> Optional[FetchResponse]:
             async with session.head(
-                url,
+                target.url,
                 headers=headers,
-                allow_redirects=True,
+                allow_redirects=False,
                 timeout=aiohttp.ClientTimeout(total=5),
             ) as head_resp:
-                cl = (
-                    head_resp.headers.get("Content-Length")
-                    or head_resp.headers.get("content-length")
+                return FetchResponse(
+                    status_code=head_resp.status, content_bytes=b"", headers=dict(head_resp.headers),
+                    final_url=str(head_resp.url), strategy="aiohttp-head",
                 )
-                if cl:
-                    size = int(cl)
-                    if size > max_size_bytes:
+
+        try:
+            head = await _follow_redirects(url, head_once, policy, logger, "aiohttp-head")
+            cl = None
+            if head is not None:
+                cl = head.headers.get("Content-Length") or head.headers.get("content-length")
+            if cl:
+                size = int(cl)
+                if size > max_size_bytes:
                         logger.warning(
                             "⚠️ Skipping %s: Content-Length %.1fMB exceeds limit of %.0fMB",
                             url,
@@ -373,16 +526,19 @@ async def fetch_url_with_fallback(
                             final_url=url,
                             strategy="size_guard",
                         )
+        except DestinationBlocked as e:
+            logger.warning("🚫 Blocked %s: %s", url, e.reason)
+            return _blocked_response(e)
         except Exception:
             # HEAD not supported (405), connection error, timeout — proceed with GET
             pass
 
     # Define the strategy chain: (name, async callable returning Optional[FetchResponse])
     all_strategies: List[Tuple[str, Callable[..., Coroutine[Any, Any, Optional[FetchResponse]]]]] = [
-        ("curl_cffi(H2)", lambda: _try_curl_cffi(url, headers, timeout, use_http2=True, logger=logger)),
-        # ("curl_cffi(H1)", lambda: _try_curl_cffi(url, headers, timeout, use_http2=False, logger=logger)),
-        ("cloudscraper", lambda: _try_cloudscraper(url, headers, timeout, logger=logger)),
-        ("aiohttp", lambda: _try_aiohttp(session, url, headers, timeout, logger)),
+        ("curl_cffi(H2)", lambda: _try_curl_cffi(url, headers, timeout, use_http2=True, logger=logger, policy=policy)),
+        # ("curl_cffi(H1)", lambda: _try_curl_cffi(url, headers, timeout, use_http2=False, logger=logger, policy=policy)),
+        ("cloudscraper", lambda: _try_cloudscraper(url, headers, timeout, logger=logger, policy=policy)),
+        ("aiohttp", lambda: _try_aiohttp(session, url, headers, timeout, logger, policy=policy)),
     ]
 
     # When a preferred strategy is given (e.g. from a cached page-level fetch),
@@ -425,7 +581,13 @@ async def fetch_url_with_fallback(
             # asyncio.sleep yields to the event loop, so other domain fetches are never blocked.
             _rl_attempt = 0
             while True:
-                result = await strategy_fn()
+                try:
+                    result = await strategy_fn()
+                except DestinationBlocked as e:
+                    # Not a transport failure: the destination itself is off limits for
+                    # every strategy, so stop here instead of trying the next one.
+                    logger.warning("🚫 Blocked %s: %s", url, e.reason)
+                    return _blocked_response(e)
 
                 # Strategy returned nothing (import missing, all profiles exhausted, connection error)
                 if result is None:

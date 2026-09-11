@@ -1,20 +1,59 @@
+from __future__ import annotations
+
 import asyncio
+import logging
 import math
 import os
 import re
 import threading
 import uuid
 from dataclasses import dataclass
-from typing import Any, Coroutine, Optional, TypeVar, Union
+from typing import TYPE_CHECKING, Any, Coroutine, Optional, TypeVar, Union
+from urllib.parse import urlparse
+
+from app.connectors.sources.web.destination_policy import (
+    DestinationBlocked,
+    DestinationPolicy,
+)
+
+if TYPE_CHECKING:
+    from playwright.async_api import BrowserContext, Page, Request, Route
 
 T = TypeVar("T")
 
 _HTTP_STATUS_RE = re.compile(r"HTTP\s+(\d{3})")
 
-from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode
-from crawl4ai.async_dispatcher import SemaphoreDispatcher
+from crawl4ai import AsyncWebCrawler, BrowserConfig, CacheMode, CrawlerRunConfig
 from crawl4ai.async_crawler_strategy import AsyncPlaywrightCrawlerStrategy
+from crawl4ai.async_dispatcher import SemaphoreDispatcher
 from crawl4ai.browser_adapter import UndetectedAdapter
+
+_logger = logging.getLogger(__name__)
+
+# Browser-internal schemes that never reach the network; everything else is checked.
+_BROWSER_LOCAL_SCHEMES = frozenset({"data", "blob", "about", "chrome", "chrome-extension", "chrome-error", "devtools"})
+
+
+async def guard_browser_request(policy: DestinationPolicy, route: Route, request: Request | None = None) -> bool:
+    """Playwright route handler body: let the request through only when its destination
+    passes ``policy`` (resolve + validate every address); abort it otherwise.  Applied to
+    every request the headless browser makes — navigations, each redirect hop (a new
+    request in Playwright), images, scripts, XHR — so a public page cannot pull the
+    browser onto an internal address.  Returns True when the request was allowed."""
+    request = request if request is not None else route.request
+    url = str(getattr(request, "url", "") or "")
+    scheme = urlparse(url).scheme.lower()
+    if scheme in _BROWSER_LOCAL_SCHEMES:
+        await route.continue_()
+        return True
+    try:
+        await policy.resolve(url)
+    except DestinationBlocked as e:
+        _logger.warning("🚫 [crawl4ai] Blocked browser request to %s: %s", url, e.reason)
+        await route.abort("blockedbyclient")
+        return False
+    await route.continue_()
+    return True
 
 
 class _SharedSemaphoreDispatcher(SemaphoreDispatcher):
@@ -292,6 +331,7 @@ for (const p of __panels) {
             magic=True,
         )
         self._concurrency = concurrency
+        self._destination_policy = DestinationPolicy.default()
         self._semaphore: Optional[asyncio.Semaphore] = None
         self._crawler: Optional[AsyncWebCrawler] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -325,9 +365,22 @@ for (const p of __panels) {
             browser_config=self._browser_config,
             browser_adapter=UndetectedAdapter(),
         )
+        # Egress policy for the browser: intercept every request of every page context.
+        strategy.set_hook("on_page_context_created", self._install_request_guard)
         crawler = AsyncWebCrawler(crawler_strategy=strategy)
         await crawler.start()
         return crawler
+
+    async def _install_request_guard(self, page: Page, context: BrowserContext | None = None, **_: object) -> Page:
+        """crawl4ai ``on_page_context_created`` hook: route all requests of the context
+        (or of the page when no context is handed over) through ``guard_browser_request``.
+        Failing to install the guard fails the crawl — never fall back to unguarded."""
+        scope = context if context is not None else page
+        await scope.route("**/*", self._guard_route)
+        return page
+
+    async def _guard_route(self, route: Route, request: Request | None = None) -> None:
+        await guard_browser_request(self._destination_policy, route, request)
 
     async def _run_in_browser_thread(self, coro: Coroutine[Any, Any, T]) -> T:
         """Schedule a coroutine on the browser thread's loop and await the result."""

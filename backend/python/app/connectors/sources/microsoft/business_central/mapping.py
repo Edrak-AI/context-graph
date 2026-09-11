@@ -63,6 +63,7 @@ Arabic and other non-Latin content is never transliterated or trimmed.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import unicodedata
@@ -115,6 +116,7 @@ ORG_WIDE_GROUP_REF = "*"        # value: explicit opt-in to org-wide (everyone i
 # Sync-point document fields (camelCase like the other connectors' sync points).
 FIELD_LAST_SYNC = "lastSyncTimestamp"
 FIELD_LAST_RECONCILE = "lastReconcileTimestamp"
+FIELD_POLICY_FINGERPRINTS = "fingerprints"   # ``{companyId: access_policy_fingerprint}`` in the access-policy sync point
 
 # Business Central renders "empty" dates / GUIDs as these sentinels.
 _EMPTY_DATE_PREFIX = "0001-01-01"
@@ -582,6 +584,14 @@ def record_id_prefix(company_id: str, spec: EntitySpec) -> str:
     return f"{RECORD_ID_PREFIX}:{company_id}:{spec.entity_set}:"
 
 
+def company_id_of_external_id(external_id: str) -> str | None:
+    """Company id embedded in a ``bc:<companyId>:<entitySet>:<id>`` record id (``None`` for foreign ids)."""
+    parts = str(external_id or "").split(":")
+    if len(parts) != 4 or parts[0] != RECORD_ID_PREFIX or not all(parts[1:]):
+        return None
+    return parts[1]
+
+
 def split_external_id(external_id: str) -> tuple[str, EntitySpec, str]:
     """Inverse of ``record_external_id``; raises ``ValueError`` for foreign ids."""
     parts = str(external_id or "").split(":")
@@ -1002,6 +1012,30 @@ def company_grants(access: CompanyAccess) -> list[PermissionGrant]:
     if access.org_wide:
         grants.append(PermissionGrant(GrantEntity.ORG, GrantRole.READER, reason="companyAccessGroups '*' opt-in"))
     return grants
+
+
+def access_policy_fingerprint(access: CompanyAccess) -> str:
+    """Stable digest of the *effective* grants of one company (its group grant plus the
+    optional ORG grant) — exactly what ``company_grants`` puts on the record group and on
+    every record.  Stored per company in the connector's sync point; when it changes the
+    connector re-derives and replaces the permission edges of all the company's records,
+    because incremental sync only revisits rows whose source timestamp moved and a
+    narrowed policy leaves the old direct ORG grant on unchanged records otherwise.
+    Entra group *membership* is not part of it: that is maintained through the company
+    group's membership edges, which are replaced on every sync."""
+    grants = sorted(
+        (grant.entity_type.value, grant.role.value, grant.external_id or "") for grant in company_grants(access)
+    )
+    return hashlib.sha256(json.dumps(grants, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def changed_access_policies(stored: Mapping[str, object] | None, current: Mapping[str, str]) -> list[str]:
+    """Company ids (in ``current`` order) whose fingerprint differs from the stored one or
+    was never stored.  A missing baseline counts as changed: the first sync after this
+    check was introduced (or after a company appears) repairs whatever grants the
+    records carry — on a brand-new connector there are no records yet, so it is free."""
+    stored = stored or {}
+    return [company_id for company_id, fingerprint in current.items() if stored.get(company_id) != fingerprint]
 
 
 def company_group_name(company: Company) -> str:

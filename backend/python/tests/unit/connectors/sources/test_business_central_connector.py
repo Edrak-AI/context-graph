@@ -31,6 +31,7 @@ try:  # pragma: no cover - environment dependent
         connector as bc_connector,
     )
     from app.connectors.sources.microsoft.business_central.connector import (
+        ACCESS_POLICY_SYNC_POINT_KEY,
         MicrosoftBusinessCentralConnector,
         _entity_sync_point_key,
         grants_to_permissions,
@@ -46,12 +47,14 @@ from app.connectors.sources.microsoft.business_central.mapping import (
 from app.connectors.sources.microsoft.business_central.mapping import (
     FIELD_LAST_RECONCILE,
     FIELD_LAST_SYNC,
+    FIELD_POLICY_FINGERPRINTS,
     MS_PER_HOUR,
     Company,
     CompanyAccess,
     GrantEntity,
     GrantRole,
     PermissionGrant,
+    access_policy_fingerprint,
     company_group_external_id,
     parse_company_access_mapping,
     record_external_id,
@@ -115,6 +118,8 @@ class FakeProcessor:
         self.groups: list[tuple[Any, list[Any]]] = []
         self.record_groups: list[tuple[Any, list[Any]]] = []
         self.page_calls: list[dict[str, Any]] = []
+        self.permission_updates: list[tuple[Any, list[Any]]] = []   # on_updated_record_permissions calls (replace semantics)
+        self.fail_permission_updates_for: set[str] = set()          # record ids whose update raises
 
     async def on_new_records(self, batch: list[tuple[Any, list[Any]]]) -> None:
         self.upserts.extend(batch)
@@ -127,6 +132,11 @@ class FakeProcessor:
 
     async def on_new_record_groups(self, groups: list[tuple[Any, list[Any]]]) -> None:
         self.record_groups.extend(groups)
+
+    async def on_updated_record_permissions(self, record: FakeRecord, permissions: list[Any]) -> None:
+        if record.id in self.fail_permission_updates_for:
+            raise RuntimeError(f"graph write failed for {record.id}")
+        self.permission_updates.append((record, list(permissions)))
 
     async def get_records_by_status(self, connector_id: str, status_filters: list[str], limit: int | None = None,
                                     offset: int = 0, record_group_id: str | None = None, is_placeholder: bool | None = None,
@@ -580,6 +590,137 @@ class TestEntitySync:
         assert record is not None and record.record_type.value == "PRODUCT"
         assert (record.product_code, record.product_family, record.sku, record.list_price, record.is_active) == ("1000", "FURNITURE", "0123", 500.25, True)
         assert c._build_record(CRONUS, SPECS["items"], {"number": "no-id"}) is None
+
+
+# ---------------------------------------------------------------------------
+# Access-policy reconciliation (security review S06)
+# ---------------------------------------------------------------------------
+
+
+ORG_WIDE = CompanyAccess(company=CRONUS, group_refs=("*",))
+RESTRICTED = CompanyAccess(company=CRONUS, group_refs=("BC Readers",))
+CRONUS_GROUP = (EntityType.GROUP, PermissionType.READ, company_group_external_id(CRONUS.id))
+ORG_READ = (EntityType.ORG, PermissionType.READ, None)
+
+
+def _perm_tuples(perms: list[Any]) -> list[tuple[Any, Any, Any]]:
+    return [(p.entity_type, p.type, p.external_id) for p in perms]
+
+
+def _policy_connector(
+    *, current: CompanyAccess, stored: CompanyAccess | None, known: list[FakeRecord] | None = None,
+) -> tuple[MicrosoftBusinessCentralConnector, FakeProcessor]:
+    """Connector whose CRONUS access is ``current`` while the sync point remembers ``stored``
+    (``None`` = nothing recorded yet).  ARABIC stays restricted-by-nobody in both."""
+    points = {}
+    if stored is not None:
+        points[ACCESS_POLICY_SYNC_POINT_KEY] = {FIELD_POLICY_FINGERPRINTS: {
+            CRONUS.id: access_policy_fingerprint(stored),
+            ARABIC.id: access_policy_fingerprint(CompanyAccess(company=ARABIC)),
+        }}
+    known = known if known is not None else [
+        FakeRecord("inv-1", record_external_id(CRONUS.id, SPECS["salesInvoices"], "1")),   # unchanged in BC
+        FakeRecord("so-7", record_external_id(CRONUS.id, SO, "7")),
+        FakeRecord("cust-9", record_external_id(ARABIC.id, CUST, "9")),                     # other company
+    ]
+    c, _, processor = _connector(lambda *_: _response(200, {}), FakeProcessor(known), points=points)
+    c._access_by_company = {CRONUS.id: current, ARABIC.id: CompanyAccess(company=ARABIC)}
+    return c, processor
+
+
+class TestAccessPolicyReconciliation:
+    def test_unchanged_invoice_loses_org_grant_when_company_becomes_restricted(self, caplog: pytest.LogCaptureFixture) -> None:
+        c, processor = _policy_connector(current=RESTRICTED, stored=ORG_WIDE)
+        with caplog.at_level(logging.INFO, logger="test-bc"):
+            asyncio.run(c._reconcile_access_policies())
+
+        # every CRONUS record — the untouched invoice included — had its edges REPLACED with the
+        # restricted grant only; ORG is gone, ARABIC's records were not touched
+        updates = {r.id: _perm_tuples(p) for r, p in processor.permission_updates}
+        assert updates == {"inv-1": [CRONUS_GROUP], "so-7": [CRONUS_GROUP]}
+        assert all(ORG_READ not in perms for perms in updates.values())
+        assert processor.upserts == []  # no content re-upsert, no source-timestamp dependence
+        fingerprints = c.records_sync_point.points[ACCESS_POLICY_SYNC_POINT_KEY][FIELD_POLICY_FINGERPRINTS]
+        assert fingerprints[CRONUS.id] == access_policy_fingerprint(RESTRICTED)
+        assert fingerprints[ARABIC.id] == access_policy_fingerprint(CompanyAccess(company=ARABIC))
+        messages = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
+        assert "Reconciled 2 records for company CRONUS SA: policy changed" in messages
+        assert not any(r.levelno >= logging.WARNING for r in caplog.records)
+
+    def test_unchanged_policy_triggers_no_reconciliation(self, caplog: pytest.LogCaptureFixture) -> None:
+        c, processor = _policy_connector(current=RESTRICTED, stored=RESTRICTED)
+        with caplog.at_level(logging.INFO, logger="test-bc"):
+            asyncio.run(c._reconcile_access_policies())
+        assert processor.permission_updates == [] and processor.page_calls == []
+        assert not any("Reconciled" in r.getMessage() for r in caplog.records)
+        assert c.records_sync_point.points[ACCESS_POLICY_SYNC_POINT_KEY][FIELD_POLICY_FINGERPRINTS][CRONUS.id] == access_policy_fingerprint(RESTRICTED)
+
+    def test_explicit_star_opt_in_grants_org_on_every_record(self) -> None:
+        c, processor = _policy_connector(current=ORG_WIDE, stored=RESTRICTED)
+        asyncio.run(c._reconcile_access_policies())
+        updates = {r.id: _perm_tuples(p) for r, p in processor.permission_updates}
+        assert updates == {"inv-1": [CRONUS_GROUP, ORG_READ], "so-7": [CRONUS_GROUP, ORG_READ]}
+        assert c.records_sync_point.points[ACCESS_POLICY_SYNC_POINT_KEY][FIELD_POLICY_FINGERPRINTS][CRONUS.id] == access_policy_fingerprint(ORG_WIDE)
+
+    def test_missing_baseline_reconciles_once_then_is_recorded(self, caplog: pytest.LogCaptureFixture) -> None:
+        c, processor = _policy_connector(current=RESTRICTED, stored=None)
+        with caplog.at_level(logging.INFO, logger="test-bc"):
+            asyncio.run(c._reconcile_access_policies())
+        # first run after the upgrade: both companies get repaired (existing installs may carry stale ORG edges)
+        assert sorted(r.id for r, _ in processor.permission_updates) == ["cust-9", "inv-1", "so-7"]
+        messages = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
+        assert "Reconciled 2 records for company CRONUS SA: no recorded policy" in messages
+        assert "Reconciled 1 records for company شركة المثال: no recorded policy" in messages
+        assert len(processor.page_calls) == 1  # one pass over the connector's records for all changed companies
+
+        processor.permission_updates.clear()
+        processor.page_calls.clear()
+        asyncio.run(c._reconcile_access_policies())
+        assert processor.permission_updates == [] and processor.page_calls == []
+
+    def test_partial_failure_keeps_old_fingerprint_so_the_next_sync_retries(self, caplog: pytest.LogCaptureFixture) -> None:
+        c, processor = _policy_connector(current=RESTRICTED, stored=ORG_WIDE)
+        processor.fail_permission_updates_for = {"so-7"}
+        with caplog.at_level(logging.INFO, logger="test-bc"):
+            asyncio.run(c._reconcile_access_policies())
+        assert [r.id for r, _ in processor.permission_updates] == ["inv-1"]
+        fingerprints = c.records_sync_point.points[ACCESS_POLICY_SYNC_POINT_KEY][FIELD_POLICY_FINGERPRINTS]
+        assert fingerprints[CRONUS.id] == access_policy_fingerprint(ORG_WIDE)  # not advanced
+        errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+        assert any("CRONUS SA" in m and "1 records could not be reconciled" in m and "retried on the next sync" in m for m in errors)
+        assert not any("Reconciled 1 records for company CRONUS SA" in r.getMessage() for r in caplog.records)
+
+        processor.fail_permission_updates_for = set()
+        processor.permission_updates.clear()
+        asyncio.run(c._reconcile_access_policies())
+        assert sorted(r.id for r, _ in processor.permission_updates) == ["inv-1", "so-7"]
+        assert c.records_sync_point.points[ACCESS_POLICY_SYNC_POINT_KEY][FIELD_POLICY_FINGERPRINTS][CRONUS.id] == access_policy_fingerprint(RESTRICTED)
+
+    def test_fails_closed_without_a_resolved_access_model(self) -> None:
+        c, _ = _policy_connector(current=RESTRICTED, stored=None)
+        c._access_by_company = {}
+        with pytest.raises(RuntimeError, match="no resolved access model"):
+            asyncio.run(c._reconcile_access_policies())
+
+    def test_run_reconciles_after_groups_and_before_the_entity_sync(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        c, _, _ = _connector(lambda *_: _response(200, COMPANIES_PAYLOAD))
+        order: list[str] = []
+
+        def record(name: str) -> Callable[..., Any]:
+            async def _step(*_: object, **__: object) -> None:
+                order.append(name)
+            return _step
+
+        async def _filters(*_: object, **__: object) -> tuple[FilterCollection, FilterCollection]:
+            return FilterCollection(), FilterCollection()
+
+        c.config_service = FakeConfigService({})
+        monkeypatch.setattr(bc_connector, "load_connector_filters", _filters)
+        for name in ("_sync_access_model", "_sync_record_groups", "_reconcile_access_policies", "_sync_entity", "_sync_change_notifications"):
+            monkeypatch.setattr(c, name, record(name))
+        asyncio.run(c._run(incremental=True))
+        assert order[:3] == ["_sync_access_model", "_sync_record_groups", "_reconcile_access_policies"]
+        assert order[3:] == ["_sync_entity"] * (len(order) - 4) + ["_sync_change_notifications"]
 
 
 # ---------------------------------------------------------------------------

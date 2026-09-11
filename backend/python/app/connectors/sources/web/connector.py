@@ -1,11 +1,8 @@
 import asyncio
 import base64
 import hashlib
-import ipaddress
-import os
 import random
 import re
-import socket
 import uuid
 from collections import deque
 from dataclasses import dataclass
@@ -68,6 +65,7 @@ from app.models.entities import (
     RecordType,
     User,
 )
+from app.connectors.sources.web.destination_policy import DestinationPolicy, private_networks_allowed
 from app.connectors.sources.web.fetch_strategy import FetchResponse, fetch_url_with_fallback
 from app.connectors.sources.web.crawl4ai_fetcher import Crawl4AIFetcher, FetchResult, get_shared_fetcher, release_shared_fetcher, resolve_fetch_status_code
 from app.connectors.sources.web.csr_detection import CSR_PROBE_JS, PRE_HYDRATION_INIT_SCRIPT, analyze_rendering
@@ -176,11 +174,11 @@ def _web_private_networks_allowed() -> bool:
     (intranet hosts, Kubernetes services, the cloud metadata endpoint) would be
     indexed and — for a team-scope instance — granted org-wide READ. Blocked by
     default; set CGRAPH_WEB_ALLOW_PRIVATE_NETWORKS=true for a deployment that
-    deliberately crawls internal sites.
+    deliberately crawls internal sites.  The check itself lives in
+    ``destination_policy.DestinationPolicy`` and is applied to every request
+    (initial page, redirect hops, images, headless-browser subresources).
     """
-    return os.getenv("CGRAPH_WEB_ALLOW_PRIVATE_NETWORKS", "").strip().lower() in (
-        "1", "true", "yes",
-    )
+    return private_networks_allowed()
 
 
 class WebApp(App):
@@ -392,8 +390,9 @@ class WebConnector(BaseConnector):
         self.sync_filters: FilterCollection = FilterCollection()
         self.indexing_filters: FilterCollection = FilterCollection()
 
-        # host -> True when it resolves to a non-public address (see _is_private_network_target)
-        self._private_host_cache: Dict[str, bool] = {}
+        # Egress policy applied to every request (see destination_policy.py); the crawl
+        # session below resolves through it so aiohttp only connects to validated addresses.
+        self._destination_policy = DestinationPolicy.default()
 
     async def init(self) -> bool:
         """Initialize the web connector with configuration."""
@@ -421,10 +420,12 @@ class WebConnector(BaseConnector):
             # Load creator email if needed (for personal scope permission creation)
             await self._load_creator_email()
 
-            # Initialize aiohttp session with realistic browser headers
+            # Initialize aiohttp session with realistic browser headers.  The connector
+            # resolves through the destination policy (SSRF guard): validated addresses only.
             timeout = aiohttp.ClientTimeout(total=30)
             self.session = aiohttp.ClientSession(
                 timeout=timeout,
+                connector=self._destination_policy.aiohttp_connector(),
                 headers={
                     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
                     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
@@ -579,6 +580,7 @@ class WebConnector(BaseConnector):
                 url=self.url,
                 session=self.session,
                 logger=self.logger,
+                policy=self._destination_policy,
                 max_retries_per_strategy=1,  # keep it fast for a connection test
             )
 
@@ -1211,6 +1213,7 @@ class WebConnector(BaseConnector):
                         url=current_url,
                         session=self.session,
                         logger=self.logger,
+                        policy=self._destination_policy,
                         referer=referer,
                         timeout=15,
                         max_size_mb=self.max_size_mb,
@@ -1595,6 +1598,7 @@ class WebConnector(BaseConnector):
                         url=url,
                         session=self.session,
                         logger=self.logger,
+                        policy=self._destination_policy,
                         referer=referer,
                         timeout=15,
                         max_size_mb=self.max_size_mb,
@@ -1843,6 +1847,7 @@ class WebConnector(BaseConnector):
                         url=file_record.weburl,
                         session=self.session,
                         logger=self.logger,
+                        policy=self._destination_policy,
                         referer=referer,
                     )
                 if result is None or result.status_code >= HttpStatusCode.BAD_REQUEST.value:
@@ -2037,57 +2042,15 @@ class WebConnector(BaseConnector):
     async def _is_private_network_target(self, url: str) -> bool:
         """True when ``url`` must not be crawled because its host is not publicly routable.
 
-        Any resolved address that is not global (RFC1918, loopback, link-local incl. the
-        cloud metadata endpoint, unspecified, multicast, reserved) blocks the URL. A host
-        that fails to resolve is *not* treated as private — the fetch fails on its own.
-        Always False when CGRAPH_WEB_ALLOW_PRIVATE_NETWORKS is on. Results are cached per
-        host for the lifetime of the connector instance.
+        Delegates to the connector's ``DestinationPolicy``: every resolved address must
+        be global (RFC1918, loopback, link-local incl. the cloud metadata endpoint,
+        unspecified, multicast, reserved and IPv4-mapped/6to4/NAT64 forms all block),
+        a host that fails to resolve is blocked too (fail closed), and only blocked
+        hosts are cached — briefly.  Always False when CGRAPH_WEB_ALLOW_PRIVATE_NETWORKS
+        is on.  The same policy is enforced inside every transport for redirect hops,
+        images and headless-browser requests.
         """
-        if _web_private_networks_allowed():
-            return False
-        try:
-            host = urlparse(url).hostname
-        except Exception:
-            return True
-        if not host:
-            return True
-        host = host.lower().rstrip(".")
-        cached = self._private_host_cache.get(host)
-        if cached is not None:
-            return cached
-
-        addresses: List[str] = []
-        try:
-            addresses = [str(ipaddress.ip_address(host))]
-        except ValueError:
-            try:
-                infos = await asyncio.get_running_loop().getaddrinfo(
-                    host, None, type=socket.SOCK_STREAM
-                )
-                addresses = [info[4][0] for info in infos if info and info[4]]
-            except Exception as e:
-                self.logger.debug("Could not resolve %s for private-network check: %s", host, e)
-                self._private_host_cache[host] = False
-                return False
-
-        blocked = host == "localhost"
-        for addr in addresses:
-            try:
-                ip = ipaddress.ip_address(addr.split("%", 1)[0])
-            except ValueError:
-                continue
-            if not ip.is_global:
-                blocked = True
-                break
-
-        if blocked:
-            self.logger.warning(
-                "Skipping %s: host %s resolves to a private/internal address "
-                "(CGRAPH_WEB_ALLOW_PRIVATE_NETWORKS is off)",
-                url, host,
-            )
-        self._private_host_cache[host] = blocked
-        return blocked
+        return await self._destination_policy.is_blocked(url)
 
     def _is_valid_url(self, url: str, base_url: str) -> bool:
         """Check if a URL should be crawled."""
@@ -2518,8 +2481,9 @@ class WebConnector(BaseConnector):
                 token = await self._get_storage_token()
                 download_endpoint = f"{storage_url}/api/v1/document/internal/{record.storage_document_id}/download"
 
-                owned_session = self.session is None
-                session = self.session or aiohttp.ClientSession()
+                # The storage service is an internal address: never use the crawl session,
+                # whose resolver refuses non-public destinations.
+                session = aiohttp.ClientSession()
                 try:
                     async with session.get(
                         download_endpoint,
@@ -2533,8 +2497,7 @@ class WebConnector(BaseConnector):
                                 if signed_url:
                                     return signed_url
                 finally:
-                    if owned_session:
-                        await session.close()
+                    await session.close()
             except Exception as e:
                 self.logger.warning("Failed to get storage signed URL for record %s: %s", record.id, e)
 
@@ -2855,6 +2818,7 @@ class WebConnector(BaseConnector):
                 url=absolute_url,
                 session=self.session,
                 logger=self.logger,
+                policy=self._destination_policy,
                 referer=base_url,
                 # Override Accept so servers don't return unsupported image types
                 extra_headers={"Accept": self._IMAGE_ACCEPT_HEADER},
@@ -3330,6 +3294,7 @@ class WebConnector(BaseConnector):
                     url=record.weburl,
                     session=self.session,
                     logger=self.logger,
+                    policy=self._destination_policy,
                     referer=referer,
                 )
 

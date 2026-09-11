@@ -8,6 +8,7 @@ httpx.  Fixtures are shaped like Business Central API v2.0 payloads.
 
 import pytest
 
+from app.connectors.sources.microsoft.business_central import mapping as m
 from app.connectors.sources.microsoft.business_central.mapping import (
     COMPANY_GROUP_PREFIX,
     DEFAULT_ENTITY_ORDER,
@@ -541,3 +542,38 @@ class TestRendering:
         metadata = build_metadata(CRONUS, SO, {"number": "1"}, TENANT, ENV)
         assert metadata["id"] == "" and metadata["url"] is None
         assert metadata["source"] == "microsoft-business-central"
+
+
+class TestAccessPolicyFingerprint:
+    """``access_policy_fingerprint`` / ``changed_access_policies`` (security review S06)."""
+
+    def test_fingerprint_tracks_effective_grants_not_group_membership(self) -> None:
+        company = m.Company(id="c1", name="Finance", display_name="Finance")
+        restricted = m.access_policy_fingerprint(m.CompanyAccess(company=company, group_refs=("Finance Readers",)))
+        other_group = m.access_policy_fingerprint(m.CompanyAccess(company=company, group_refs=("Other Readers",)))
+        nobody = m.access_policy_fingerprint(m.CompanyAccess(company=company))
+        org_wide = m.access_policy_fingerprint(m.CompanyAccess(company=company, group_refs=("*",)))
+        org_and_group = m.access_policy_fingerprint(m.CompanyAccess(company=company, group_refs=("Finance Readers", "*")))
+        assert len(restricted) == 64 and restricted == m.access_policy_fingerprint(m.CompanyAccess(company=company, group_refs=("Finance Readers",)))
+        # the Entra group named in the mapping is membership, not a grant: the record edges are identical
+        assert restricted == other_group == nobody
+        assert org_wide != restricted and org_wide == org_and_group
+        # another company gets another company group → different digest
+        assert m.access_policy_fingerprint(m.CompanyAccess(company=m.Company(id="c2", name="X", display_name="X"))) != nobody
+
+    def test_changed_access_policies(self) -> None:
+        current = {"c1": "aaa", "c2": "bbb", "c3": "ccc"}
+        assert m.changed_access_policies(None, current) == ["c1", "c2", "c3"]
+        assert m.changed_access_policies({}, current) == ["c1", "c2", "c3"]
+        assert m.changed_access_policies({"c1": "aaa", "c2": "bbb", "c3": "ccc"}, current) == []
+        assert m.changed_access_policies({"c1": "aaa", "c2": "OLD", "gone": "zzz"}, current) == ["c2", "c3"]
+        assert m.changed_access_policies({"c1": 1}, {"c1": "aaa"}) == ["c1"]
+
+    def test_company_id_of_external_id(self) -> None:
+        spec = m.ENTITY_SPECS["salesInvoices"]
+        assert m.company_id_of_external_id(m.record_external_id("c1", spec, "row-1")) == "c1"
+        assert m.company_id_of_external_id("bc:c1:salesInvoices:") is None
+        assert m.company_id_of_external_id("opportunity:abc") is None
+        assert m.company_id_of_external_id("") is None
+        assert m.company_id_of_external_id("bc:c1:x") is None
+
