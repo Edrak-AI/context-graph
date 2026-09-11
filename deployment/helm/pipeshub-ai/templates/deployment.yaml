@@ -331,6 +331,15 @@ spec:
             - name: pipeshub-storage
               mountPath: /data/pipeshub
               subPath: data
+            # Edrak: the Node storage service's LOCAL provider writes documents under
+            # $HOME/.local/<mountName> (hard-coded in local-storage.provider.ts), and
+            # $HOME is the app-home emptyDir above — so every pod rollout deleted all
+            # stored documents while their Mongo metadata survived (reindex then failed
+            # with STORAGE_DOWNLOAD_ERROR on uploadNextVersion). Persist that directory
+            # on the same PVC (2026-09-11).
+            - name: pipeshub-storage
+              mountPath: /home/user/.local
+              subPath: home-local
             {{- end }}
             {{- with .Values.volumeMounts }}
             {{- toYaml . | nindent 12 }}
