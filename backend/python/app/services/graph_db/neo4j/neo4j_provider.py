@@ -2400,14 +2400,29 @@ class Neo4jProvider(IGraphDBProvider):
             type_doc: Dictionary from type-specific collection (files, mails, etc.) or None
 
         Returns:
-            Properly typed Record instance (FileRecord, MailRecord, etc.)
+            Properly typed Record instance (FileRecord, MailRecord, etc.), or the
+            base Record when the type has no type collection / no IS_OF_TYPE node
+
+        Raises:
+            ValueError: the record dict itself is malformed (missing core fields)
         """
         record_type = record_dict.get("recordType")
 
-        # Check if this record type has a type collection
+        # No type collection or no type doc: generic connector rows (Dynamics 365
+        # accounts, Business Central customers, SAP business partners ...) are
+        # written as bare `Record`s with no IS_OF_TYPE node, so they must round-trip
+        # as the base Record — raising here made them unstreamable (404 from the
+        # internal stream route, record failed by the indexer).
         if not type_doc or record_type not in RECORD_TYPE_COLLECTION_MAPPING:
-            # No type collection or no type doc - use base Record
-            raise ValueError(f"No type collection or no type doc, record type:{record_type} or type doc:{type_doc}")
+            try:
+                return Record.from_arango_base_record(record_dict)
+            except Exception as e:
+                self.logger.warning(
+                    f"Failed to create base record for {record_type}: {str(e)}"
+                )
+                raise ValueError(
+                    f"Failed to create base record for {record_type}"
+                ) from e
 
         try:
             # Determine which collection this type uses

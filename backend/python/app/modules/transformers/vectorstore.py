@@ -15,6 +15,8 @@ No LangChain QdrantVectorStore is imported or used.
 
 import asyncio
 import os
+import random
+import re
 import time
 import uuid
 from typing import List, Optional
@@ -102,6 +104,65 @@ _TEXT_PROCESSING_TIMEOUT_S = 300  # 5 min for sentence-splitting a full record
 # batch than hosted API embedding providers, so they get a much longer allowance.
 _LOCAL_EMBEDDING_BATCH_TIMEOUT_S = 600  # 10 min per embedding batch on local CPU
 _REMOTE_EMBEDDING_BATCH_TIMEOUT_S = 120  # 2 min per embedding batch via hosted API
+
+# Hosted embedding APIs answer bursts with 429 / RESOURCE_EXHAUSTED (Gemini's
+# embed_content_paid_tier_requests quota, for instance). The indexing consumer
+# re-queues a failed record only three times within seconds, so a quota window
+# has to be waited out here or every attempt burns on the same limit.
+_EMBEDDING_RATE_LIMIT_MAX_ATTEMPTS = 5
+_EMBEDDING_RATE_LIMIT_BASE_DELAY_S = 5.0
+_EMBEDDING_RATE_LIMIT_MAX_DELAY_S = 60.0
+_EMBEDDING_RATE_LIMIT_JITTER_S = 2.0
+_RATE_LIMIT_TEXT_MARKERS = ("resource_exhausted", "quota", "rate limit", "too many requests")
+_RATE_LIMIT_STATUS_RE = re.compile(r"\b429\b")
+# Server hints, most structured first: google.rpc.RetryInfo ("'retryDelay': '21s'"),
+# the Gemini message ("Please retry in 21.7s"), a Retry-After style header.
+_RETRY_DELAY_PATTERNS = (
+    re.compile(r"retryDelay['\"]?\s*[:=]\s*['\"]?(\d+(?:\.\d+)?)\s*s", re.IGNORECASE),
+    re.compile(r"retry in\s+(\d+(?:\.\d+)?)\s*s", re.IGNORECASE),
+    re.compile(r"retry[- ]after['\"]?\s*[:=]\s*['\"]?(\d+(?:\.\d+)?)", re.IGNORECASE),
+)
+
+
+def _is_rate_limit_error(exc: BaseException) -> bool:
+    """True for 429 / quota errors.
+
+    langchain wraps the provider error (``GoogleGenerativeAIError("Error embedding
+    content (RESOURCE_EXHAUSTED): 429 ...")``), so status attributes are checked on
+    the exception and its causes, and the message text as a fallback.
+    """
+    err: BaseException | None = exc
+    for _ in range(5):
+        if err is None:
+            return False
+        for attr in ("status", "status_code", "code"):
+            value = getattr(err, attr, None)
+            if value == 429 or (isinstance(value, str) and value.upper() == "RESOURCE_EXHAUSTED"):
+                return True
+        text = str(err)
+        lowered = text.lower()
+        if _RATE_LIMIT_STATUS_RE.search(text) or any(m in lowered for m in _RATE_LIMIT_TEXT_MARKERS):
+            return True
+        err = err.__cause__ or err.__context__
+    return False
+
+
+def _parse_retry_delay_s(exc: BaseException) -> float | None:
+    """Seconds the server asked us to wait, if the error text carries a hint."""
+    text = str(exc)
+    for pattern in _RETRY_DELAY_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            return float(match.group(1))
+    return None
+
+
+def _rate_limit_backoff_s(exc: BaseException, attempt: int) -> float:
+    """Delay before retry ``attempt`` (1-based): the server hint when present,
+    otherwise exponential back-off from the base delay; capped, plus jitter."""
+    hinted = _parse_retry_delay_s(exc)
+    base = hinted if hinted is not None else _EMBEDDING_RATE_LIMIT_BASE_DELAY_S * (2 ** (attempt - 1))
+    return min(base, _EMBEDDING_RATE_LIMIT_MAX_DELAY_S) + random.uniform(0, _EMBEDDING_RATE_LIMIT_JITTER_S)
 
 
 def _detect_record_language(text_blocks: List) -> str:
@@ -1070,16 +1131,9 @@ class VectorStore(Transformer):
             if self._is_local_cpu_embedding()
             else _REMOTE_EMBEDDING_BATCH_TIMEOUT_S
         )
-        try:
-            dense_embeddings = await asyncio.wait_for(
-                self.dense_embeddings.aembed_documents(texts),
-                timeout=embedding_timeout,
-            )
-        except asyncio.TimeoutError:
-            raise EmbeddingError(
-                f"Dense embedding timed out after {embedding_timeout}s "
-                f"for batch of {len(texts)} texts (record {record_id})"
-            )
+        dense_embeddings = await self._embed_texts_with_rate_limit_retry(
+            texts, record_id, embedding_timeout
+        )
 
         # Sparse embeddings (provider-dependent)
         sparse_embeddings = await self._compute_sparse_embeddings(texts)
@@ -1096,6 +1150,38 @@ class VectorStore(Transformer):
         await self.vector_db_service.upsert_points(
             collection_name=collection_name, points=points
         )
+
+    async def _embed_texts_with_rate_limit_retry(
+        self, texts: list[str], record_id: str, embedding_timeout: float
+    ) -> list[list[float]]:
+        """Dense-embed one batch, waiting out 429 / quota errors.
+
+        Retries up to ``_EMBEDDING_RATE_LIMIT_MAX_ATTEMPTS`` with the server's
+        retry hint (or exponential back-off); any other error propagates at once.
+        """
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                return await asyncio.wait_for(
+                    self.dense_embeddings.aembed_documents(texts),
+                    timeout=embedding_timeout,
+                )
+            except asyncio.TimeoutError:
+                raise EmbeddingError(
+                    f"Dense embedding timed out after {embedding_timeout}s "
+                    f"for batch of {len(texts)} texts (record {record_id})"
+                )
+            except Exception as e:
+                if attempt >= _EMBEDDING_RATE_LIMIT_MAX_ATTEMPTS or not _is_rate_limit_error(e):
+                    raise
+                delay = _rate_limit_backoff_s(e, attempt)
+                self.logger.info(
+                    f"Embedding rate-limited for record {record_id} "
+                    f"(attempt {attempt}/{_EMBEDDING_RATE_LIMIT_MAX_ATTEMPTS}); "
+                    f"retrying in {delay:.1f}s: {e}"
+                )
+                await asyncio.sleep(delay)
 
     async def _process_document_chunks(
         self,
