@@ -761,6 +761,23 @@ class TestProcessUsersInBatches:
             await connector._process_users_in_batches([user_active, user_inactive])
             mock_sync.assert_called_once_with(user_active)
 
+    async def test_matches_platform_user_through_source_emails(self, connector):
+        """Workspace primary differs from the platform login; the link was learnt into sourceEmails."""
+        active_user = MagicMock()
+        active_user.email = "sami@favapp.co"
+        active_user.alternate_emails = []
+        active_user.source_emails = ["sami@edrakcorp.com"]
+        connector.data_entities_processor.get_all_active_users = AsyncMock(
+            return_value=[active_user]
+        )
+
+        user_alias = _make_app_user("Sami@EdrakCorp.com", "u1")
+        user_other = _make_app_user("nour@edrakcorp.com", "u2")
+
+        with patch.object(connector, "_run_sync_with_yield", new_callable=AsyncMock) as mock_sync:
+            await connector._process_users_in_batches([user_alias, user_other])
+            mock_sync.assert_called_once_with(user_alias)
+
     async def test_empty_users_list(self, connector):
         """Empty users list does not crash."""
         connector.data_entities_processor.get_all_active_users = AsyncMock(return_value=[])

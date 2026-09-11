@@ -127,6 +127,7 @@ from app.models.entities import (
     RecordGroup,
     RecordGroupType,
     RecordType,
+    match_app_users_to_platform_users,
 )
 from app.models.permission import EntityType, Permission, PermissionType
 from app.sources.client.microsoft.microsoft import (
@@ -649,19 +650,18 @@ class OutlookConnector(BaseConnector):
             # Get active users from database
             all_active_users = await self.data_entities_processor.get_all_active_users()
 
-            # Create mapping of email to source_user_id
-            email_to_source_id = {
-                user.email.lower(): user.source_user_id
-                for user in all_enterprise_users
-                if user.email
-            }
-
-            # Filter active users that exist in enterprise (add source_user_id)
+            # Filter active users that exist in enterprise (add source_user_id);
+            # alias-aware, see match_app_users_to_platform_users
             users_to_sync = []
-            for user in all_active_users:
-                if user.email and user.email.lower() in email_to_source_id:
-                    user.source_user_id = email_to_source_id[user.email.lower()]
-                    users_to_sync.append(user)
+            matched_ids: set[int] = set()
+            for enterprise_user, user in match_app_users_to_platform_users(
+                all_enterprise_users, all_active_users
+            ):
+                if id(user) in matched_ids:
+                    continue
+                matched_ids.add(id(user))
+                user.source_user_id = enterprise_user.source_user_id
+                users_to_sync.append(user)
 
             # Apply user filter
             users_filter = self.sync_filters.get(SyncFilterKey.USERS)

@@ -1118,6 +1118,32 @@ class TestProcessUsersInBatches:
         connector._run_sync_with_yield.assert_awaited_once_with("su1")
 
     @pytest.mark.asyncio
+    async def test_matches_platform_login_that_is_an_alias_of_the_upn(self):
+        """US dev 2026-09-11: 'Found 0 active users out of 6' — platform users log in as
+        <alias>@favapp.co while Graph reports <alias>@edrakcorp.onmicrosoft.com as the primary."""
+        connector = _make_connector()
+        connector.msgraph_client = MagicMock()
+        connector.max_concurrent_batches = 10
+
+        active_user = MagicMock()
+        active_user.email = "sami@favapp.co"
+        active_user.alternate_emails = []
+        active_user.source_emails = []
+        connector.data_entities_processor.get_all_active_users = AsyncMock(return_value=[active_user])
+
+        user = MagicMock()
+        user.email = "sami@edrakcorp.onmicrosoft.com"
+        user.alternate_emails = ["sami@favapp.co"]
+        user.source_user_id = "su-alias"
+
+        connector._user_has_onedrive = AsyncMock(return_value=True)
+        connector._run_sync_with_yield = AsyncMock()
+
+        await connector._process_users_in_batches([user])
+
+        connector._run_sync_with_yield.assert_awaited_once_with("su-alias")
+
+    @pytest.mark.asyncio
     async def test_no_active_users_skips(self):
         connector = _make_connector()
         connector.msgraph_client = MagicMock()

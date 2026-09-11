@@ -344,3 +344,31 @@ class TestSharePropagation:
         saved = c.records_sync_point.points[ENTITY_KEY]
         assert EntitySyncState.from_sync_point(saved).share_digests == {OPP_A: share_digest(bob_share)}
         assert saved[FIELD_DELTA_LINK] == DELTA_2 and saved[FIELD_CHANGE_TRACKING] == "enabled"
+
+
+# ---------------------------------------------------------------------------
+# Generic entities (accounts, contacts, notes ...) map onto a bare Record
+# ---------------------------------------------------------------------------
+
+
+class TestGenericEntityRecords:
+    def test_account_row_builds_a_publishable_record(self) -> None:
+        """US dev 2026-09-11: every non opportunity/incident row crashed on_new_records with
+        NotImplementedError from Record.to_kafka_record; the base class now has a default payload."""
+        c, _ = _connector()
+        c.environment_url = "https://contoso.crm4.dynamics.com"
+        c._security = SecurityContext(user_email_by_id={ALICE: "alice@contoso.com"}, known_team_ids=set())
+        account = ENTITY_SPECS["account"]
+        row = {
+            "accountid": "5b1c0d40-1111-4a2b-9c3d-000000000010", "name": "Trey Research", "accountnumber": "ACC-10",
+            "_ownerid_value": ALICE, "_owninguser_value": ALICE, "_owningbusinessunit_value": BU,
+            "createdon": "2026-01-01T00:00:00Z", "modifiedon": "2026-02-01T00:00:00Z",
+        }
+        record = c._build_record(account, row)
+        assert record is not None and type(record) is dyn_connector.Record
+        assert record.record_name == "Trey Research" and record.record_type.value == "OTHERS"
+        payload = record.to_kafka_record()
+        assert payload["recordId"] == record.id and payload["recordName"] == "Trey Research"
+        assert payload["connectorName"] == Connectors.MICROSOFT_DYNAMICS_365.value
+        assert payload["mimeType"] == record.mime_type and payload["webUrl"] == record.weburl
+        assert payload["externalRecordId"] == record.external_record_id

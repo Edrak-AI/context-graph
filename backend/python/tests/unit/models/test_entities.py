@@ -12,6 +12,7 @@ from app.config.constants.arangodb import CollectionNames, Connectors, MimeTypes
 from app.schema.node_schema_registry import get_node_schema
 from app.models.blocks import Block, BlockGroup, BlocksContainer, BlockType, GroupType, BlockGroupChildren, IndexRange
 from app.models.entities import (
+    AppUser,
     CodeFileRecord,
     DealRecord,
     FileRecord,
@@ -29,6 +30,8 @@ from app.models.entities import (
     SQLTableRecord,
     SQLViewRecord,
     TicketRecord,
+    User,
+    match_app_users_to_platform_users,
 )
 
 
@@ -266,10 +269,23 @@ class TestRecord:
         rec = Record.from_arango_base_record(arango_doc)
         assert rec.connector_name == Connectors.KNOWLEDGE_BASE
 
-    def test_to_kafka_record_raises_not_implemented(self):
-        rec = Record(**_record_kwargs())
-        with pytest.raises(NotImplementedError):
-            rec.to_kafka_record()
+    def test_to_kafka_record_default_shape(self):
+        """A bare Record (generic ERP/CRM entity) publishes the common payload instead of raising."""
+        rec = Record(**_record_kwargs(mime_type=MimeTypes.MARKDOWN.value, weburl="https://crm/acc/1"))
+        kafka = rec.to_kafka_record()
+        assert kafka["recordId"] == rec.id
+        assert kafka["recordName"] == "Test Record"
+        assert kafka["recordType"] == "FILE"
+        assert kafka["externalRecordId"] == "ext-123"
+        assert kafka["origin"] == "CONNECTOR"
+        assert kafka["connectorName"] == Connectors.GOOGLE_DRIVE.value
+        assert kafka["connectorId"] == "conn-456"
+        assert kafka["mimeType"] == MimeTypes.MARKDOWN.value
+        assert kafka["webUrl"] == "https://crm/acc/1"
+        assert kafka["version"] == 1
+        # same core keys the specialised subclasses emit, so the indexing consumer sees one shape
+        ticket_keys = set(TicketRecord(**_record_kwargs(record_type=RecordType.TICKET)).to_kafka_record())
+        assert ticket_keys <= set(kafka)
 
 
 # ============================================================================
@@ -3632,4 +3648,70 @@ class TestFileRecordSignedUrlRoute:
 
     def test_signed_url_route_defaults_to_none(self):
         assert self._make_file().to_kafka_record().get("signedUrlRoute") is None
+
+
+# ============================================================================
+# match_app_users_to_platform_users (alias-aware connector -> platform user link)
+# ============================================================================
+
+
+def _app_user(email: str, source_user_id: str = "su-1", alternate_emails=None) -> AppUser:
+    return AppUser(
+        app_name=Connectors.ONEDRIVE, connector_id="conn-1", source_user_id=source_user_id,
+        email=email, full_name="Someone", alternate_emails=list(alternate_emails or []),
+    )
+
+
+class TestMatchAppUsersToPlatformUsers:
+    def test_exact_primary_match(self):
+        platform = User(email="sami@favapp.co")
+        app = _app_user("sami@favapp.co")
+        assert match_app_users_to_platform_users([app], [platform]) == [(app, platform)]
+
+    def test_alias_on_app_user_side(self):
+        """Platform login is the alias domain; the directory reports the UPN as primary (the US dev case)."""
+        platform = User(email="sami@favapp.co")
+        app = _app_user("sami@edrakcorp.onmicrosoft.com", alternate_emails=["sami@favapp.co"])
+        assert match_app_users_to_platform_users([app], [platform]) == [(app, platform)]
+
+    def test_alias_on_platform_user_side(self):
+        platform = User(email="sami@favapp.co", alternate_emails=["sami@edrakcorp.onmicrosoft.com"])
+        app = _app_user("sami@edrakcorp.onmicrosoft.com")
+        assert match_app_users_to_platform_users([app], [platform]) == [(app, platform)]
+
+    def test_source_emails_on_platform_user_side(self):
+        platform = User(email="sami@favapp.co", source_emails=["sami@edrakcorp.onmicrosoft.com"])
+        app = _app_user("sami@edrakcorp.onmicrosoft.com")
+        assert match_app_users_to_platform_users([app], [platform]) == [(app, platform)]
+
+    def test_no_match_is_dropped(self):
+        platform = User(email="sami@favapp.co", alternate_emails=["s.ali@favapp.co"])
+        app = _app_user("nour@edrakcorp.onmicrosoft.com", alternate_emails=["nour@favapp.co"])
+        assert match_app_users_to_platform_users([app], [platform]) == []
+
+    def test_case_insensitive_on_both_sides(self):
+        platform = User(email="Sami@FavApp.co", source_emails=["SAMI@EdrakCorp.OnMicrosoft.com"])
+        by_primary = _app_user("sami@favapp.CO")
+        by_source = _app_user("sami@edrakcorp.onmicrosoft.com", source_user_id="su-2")
+        assert match_app_users_to_platform_users([by_primary, by_source], [platform]) == [
+            (by_primary, platform), (by_source, platform),
+        ]
+
+    def test_platform_primary_outranks_another_users_alias(self):
+        owner = User(email="shared@favapp.co")
+        other = User(email="other@favapp.co", source_emails=["shared@favapp.co"])
+        app = _app_user("shared@favapp.co")
+        assert match_app_users_to_platform_users([app], [other, owner]) == [(app, owner)]
+
+    def test_preserves_app_user_order_and_skips_empty_emails(self):
+        a, b = User(email="a@x.co"), User(email="b@x.co")
+        app_b, app_a, app_none = _app_user("b@x.co", "su-b"), _app_user("a@x.co", "su-a"), _app_user("", "su-none")
+        assert match_app_users_to_platform_users([app_b, app_none, app_a], [a, b]) == [(app_b, b), (app_a, a)]
+
+    def test_tolerates_mock_like_users_without_alias_lists(self):
+        """Connector tests stub platform users with MagicMock: non-list alias attributes are ignored."""
+        platform = MagicMock()
+        platform.email = "sami@favapp.co"
+        app = _app_user("sami@favapp.co")
+        assert match_app_users_to_platform_users([app], [platform]) == [(app, platform)]
 

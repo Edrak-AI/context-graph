@@ -92,6 +92,7 @@ from app.models.entities import (
     RecordGroupType,
     RecordType,
     User,
+    match_app_users_to_platform_users,
 )
 from app.models.permission import EntityType, Permission, PermissionType
 from app.sources.client.google.google import GoogleClient, configure_google_http_timeout
@@ -1694,12 +1695,10 @@ class GoogleGmailTeamConnector(BaseConnector):
         try:
             # Get all active users from organization
             all_active_users = await self.data_entities_processor.get_all_active_users()
-            active_user_emails = {active_user.email.lower() for active_user in all_active_users}
 
-            # Filter users to sync (only active users)
+            # Filter users to sync (only active users); alias-aware, see match_app_users_to_platform_users
             active_users = [
-                user for user in users
-                if user.email and user.email.lower() in active_user_emails
+                user for user, _ in match_app_users_to_platform_users(users, all_active_users)
             ]
 
             self.logger.info(f"Found {len(active_users)} active users out of {len(users)} total users")

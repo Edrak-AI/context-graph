@@ -2201,6 +2201,20 @@ class TestProcessUsersInBatches:
         connector_fullcov._run_sync_with_yield.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_matches_workspace_alias_to_platform_login(self, connector_fullcov):
+        platform_user = MagicMock()
+        platform_user.email = "sami@favapp.co"
+        platform_user.alternate_emails = []
+        platform_user.source_emails = []
+        connector_fullcov.data_entities_processor.get_all_active_users = AsyncMock(return_value=[platform_user])
+        connector_fullcov._run_sync_with_yield = AsyncMock()
+        workspace_user = AppUser(app_name=Connectors.GOOGLE_MAIL, connector_id="c", source_user_id="u1",
+                                 email="sami@edrakcorp.com", full_name="Sami",
+                                 alternate_emails=["sami@favapp.co"])
+        await connector_fullcov._process_users_in_batches([workspace_user])
+        connector_fullcov._run_sync_with_yield.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_no_active_users(self, connector_fullcov):
         connector_fullcov.data_entities_processor.get_all_active_users = AsyncMock(return_value=[])
         connector_fullcov._run_sync_with_yield = AsyncMock()

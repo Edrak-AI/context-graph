@@ -425,7 +425,38 @@ class Record(BaseModel):
         )
 
     def to_kafka_record(self) -> dict:
-        raise NotImplementedError("Implement this method in the subclass")
+        """Default record-event payload for records without a specialised subclass.
+
+        Connectors that map source rows onto plain ``Record`` instances (Dynamics
+        accounts/contacts, Business Central customers, SAP business partners ...)
+        publish through this. The shape is the common core the subclasses emit,
+        minus their type-specific extras; the indexing consumer reads every
+        field with ``.get()`` so nothing here is load-bearing for it.
+        """
+        return {
+            "recordId": self.id,
+            "orgId": self.org_id,
+            "recordName": self.record_name,
+            "recordType": self.record_type.value,
+            "externalRecordId": self.external_record_id,
+            "version": self.version,
+            "origin": self.origin.value,
+            "connectorName": self.connector_name.value,
+            "connectorId": self.connector_id,
+            "mimeType": self.mime_type,
+            "webUrl": self.weburl,
+            "createdAtTimestamp": self.created_at,
+            "updatedAtTimestamp": self.updated_at,
+            "sourceCreatedAtTimestamp": self.source_created_at,
+            "sourceLastModifiedTimestamp": self.source_updated_at,
+            "sizeInBytes": self.size_in_bytes,
+            "signedUrl": self.signed_url,
+            "signedUrlRoute": self.fetch_signed_url,
+            "externalRevisionId": self.external_revision_id,
+            "externalGroupId": self.external_record_group_id,
+            "parentExternalRecordId": self.parent_external_record_id,
+            "storageDocumentId": self.storage_document_id,
+        }
 
 class FileRecord(Record):
     is_file: bool
@@ -2933,6 +2964,65 @@ class AppUser(BaseModel):
             app_name=Connectors(data.get("appName", Connectors.UNKNOWN.value).replace("_", " ").upper()),
             connector_id=data.get("connectorId", ""),
         )
+
+
+def _user_email_keys(primary: object, *alias_lists: object) -> list[str]:
+    """Lower-cased addresses of one user, primary first; non-string values are ignored."""
+    keys: list[str] = []
+    if isinstance(primary, str) and primary.strip():
+        keys.append(primary.strip().lower())
+    for aliases in alias_lists:
+        if not isinstance(aliases, (list, tuple, set, frozenset)):
+            continue
+        for alias in normalize_alternate_emails(primary, aliases):
+            if alias not in keys:
+                keys.append(alias)
+    return keys
+
+
+def match_app_users_to_platform_users(
+    app_users: Iterable[AppUser], platform_users: Iterable[User]
+) -> list[tuple[AppUser, User]]:
+    """Link connector users to the platform users they belong to, alias-aware.
+
+    A connector user matches a platform user when ANY address on either side is
+    the same (case-insensitive): the AppUser's primary or ``alternate_emails``
+    against the User's primary, ``alternate_emails`` or ``source_emails``. The
+    platform side is ranked primary > alternate > source so a UPN that is one
+    person's primary and another's stale alias resolves to the former. Returns
+    ``(app_user, platform_user)`` pairs in ``app_users`` order, one per matched
+    AppUser; connector users without a platform account are left out.
+
+    This is the per-connector "active users" filter; the exact-e-mail version
+    lost every user whose platform login is an alias domain of their directory
+    primary (``alias@favapp.co`` vs ``alias@tenant.onmicrosoft.com``).
+    """
+    index: dict[str, tuple[int, User]] = {}
+    for user in platform_users:
+        ranked = (
+            (0, _user_email_keys(getattr(user, "email", None))),
+            (1, _user_email_keys(None, getattr(user, "alternate_emails", None))),
+            (2, _user_email_keys(None, getattr(user, "source_emails", None))),
+        )
+        for rank, keys in ranked:
+            for key in keys:
+                current = index.get(key)
+                if current is None or rank < current[0]:
+                    index[key] = (rank, user)
+
+    pairs: list[tuple[AppUser, User]] = []
+    for app_user in app_users:
+        best: tuple[int, User] | None = None
+        for key in _user_email_keys(
+            getattr(app_user, "email", None), getattr(app_user, "alternate_emails", None)
+        ):
+            hit = index.get(key)
+            if hit is not None and (best is None or hit[0] < best[0]):
+                best = hit
+        if best is not None:
+            pairs.append((app_user, best[1]))
+    return pairs
+
 
 class AppUserGroup(BaseModel):
     id: str = Field(description="Unique identifier for the user group", default_factory=lambda: str(uuid4()))

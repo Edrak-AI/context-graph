@@ -104,6 +104,7 @@ from app.models.entities import (
     RecordGroupType,
     RecordType,
     User,
+    match_app_users_to_platform_users,
 )
 from app.models.permission import EntityType, Permission, PermissionType
 from app.sources.client.google.google import GoogleClient
@@ -3159,11 +3160,10 @@ class GoogleDriveTeamConnector(BaseConnector):
     async def _get_users_to_sync(self, users: List[AppUser]) -> List[AppUser]:
         """Narrow the workspace's users down to those active in this deployment."""
         all_active_users = await self.data_entities_processor.get_all_active_users()
-        active_user_emails = {active_user.email.lower() for active_user in all_active_users}
 
+        # Alias-aware, see match_app_users_to_platform_users
         return [
-            user for user in users
-            if user.email and user.email.lower() in active_user_emails
+            user for user, _ in match_app_users_to_platform_users(users, all_active_users)
         ]
 
     async def _process_users_in_batches(self, users: List[AppUser]) -> None:

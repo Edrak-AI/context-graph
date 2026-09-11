@@ -1818,6 +1818,31 @@ class TestSyncUsersDeep:
         assert users[0].source_user_id == "su1"
         connector.data_entities_processor.on_new_app_users.assert_awaited_once()
 
+    @pytest.mark.asyncio
+    async def test_sync_users_links_platform_alias_to_enterprise_upn(self):
+        """Platform login <alias>@favapp.co, Graph primary <alias>@edrakcorp.onmicrosoft.com (alias listed)."""
+        connector = _make_connector()
+        connector.external_users_client = MagicMock()
+
+        enterprise_user = AppUser(
+            app_name=Connectors.OUTLOOK, connector_id="conn-1",
+            source_user_id="su-alias", email="sami@edrakcorp.onmicrosoft.com", full_name="Sami",
+            alternate_emails=["sami@favapp.co"],
+        )
+        connector._get_all_users_external = AsyncMock(return_value=[enterprise_user])
+
+        active_user = MagicMock()
+        active_user.email = "sami@favapp.co"
+        active_user.alternate_emails = []
+        active_user.source_emails = []
+        active_user.source_user_id = None
+        connector.data_entities_processor.get_all_active_users = AsyncMock(return_value=[active_user])
+        connector._populate_user_cache = AsyncMock()
+
+        users = await connector._sync_users()
+        assert users == [active_user]
+        assert active_user.source_user_id == "su-alias"
+
 
 # ===========================================================================
 # Deep Sync: _sync_user_groups (full flow, add groups)
