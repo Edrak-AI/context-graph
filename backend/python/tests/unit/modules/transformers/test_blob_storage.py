@@ -2,7 +2,7 @@
 
 import base64
 import json
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 from yarl import URL
@@ -1859,3 +1859,128 @@ class TestDownloadWithRangeRequestsDeep:
             await bs._download_with_range_requests(
                 mock_session, "https://s3.example.com/file", chunk_size_mb=1
             )
+
+
+# ===================================================================
+# apply — replacement document when the mapped storage doc is orphaned
+# (pod rollout wiped the LOCAL provider's emptyDir; Mongo doc / previous
+# version file gone while the vrid → doc-id mapping survived)
+# ===================================================================
+
+class TestApplyVersionUnavailableFallback:
+    """apply() must start a replacement document for 404 / 500 STORAGE_DOWNLOAD_ERROR,
+    remap the virtual record to it, and keep failing for anything else."""
+
+    def _bs_with_existing(self, upload_error, logger=None) -> BlobStorage:
+        bs = _make_blob_storage(logger=logger) if logger else _make_blob_storage()
+        bs.get_document_id_by_virtual_record_id = AsyncMock(
+            return_value={"record_doc_id": "orphan-doc"}
+        )
+        bs.upload_next_version = AsyncMock(side_effect=upload_error)
+        bs.save_record_to_storage = AsyncMock(return_value=("new-doc", 4096))
+        bs.store_virtual_record_mapping = AsyncMock()
+        return bs
+
+    @pytest.mark.asyncio
+    async def test_404_creates_replacement_and_updates_mapping(self) -> None:
+        from app.exceptions.indexing_exceptions import StorageVersionUnavailableError
+
+        logger = MagicMock()
+        bs = self._bs_with_existing(
+            StorageVersionUnavailableError(
+                "Storage document orphan-doc not found (status: 404)",
+                document_id="orphan-doc", status=404, code="NOT_FOUND",
+                reason="storage document not found",
+            ),
+            logger=logger,
+        )
+        ctx = MagicMock()
+        ctx.record = _make_record_mock()
+
+        await bs.apply(ctx)
+
+        bs.upload_next_version.assert_awaited_once()
+        bs.save_record_to_storage.assert_awaited_once_with("org-1", "rec-1", "vr-1", ANY)
+        bs.store_virtual_record_mapping.assert_awaited_once_with("org-1", "vr-1", "new-doc", 4096)
+        warning_msg = logger.warning.call_args.args[0] % logger.warning.call_args.args[1:]
+        assert "orphan-doc" in warning_msg
+        assert "storage document not found" in warning_msg
+        assert "HTTP 404" in warning_msg
+
+    @pytest.mark.asyncio
+    async def test_500_storage_download_error_creates_replacement(self) -> None:
+        from app.exceptions.indexing_exceptions import StorageVersionUnavailableError
+
+        bs = self._bs_with_existing(
+            StorageVersionUnavailableError(
+                "Previous version of storage document orphan-doc is unavailable (status: 500)",
+                document_id="orphan-doc", status=500, code="STORAGE_DOWNLOAD_ERROR",
+                reason="previous version file missing",
+            )
+        )
+        ctx = MagicMock()
+        ctx.record = _make_record_mock()
+
+        await bs.apply(ctx)
+
+        bs.save_record_to_storage.assert_awaited_once()
+        bs.store_virtual_record_mapping.assert_awaited_once_with("org-1", "vr-1", "new-doc", 4096)
+
+    @pytest.mark.asyncio
+    async def test_other_500_is_raised_without_replacement(self) -> None:
+        bs = self._bs_with_existing(Exception("Failed to upload next version (status: 500)"))
+        ctx = MagicMock()
+        ctx.record = _make_record_mock()
+
+        with pytest.raises(Exception, match="status: 500"):
+            await bs.apply(ctx)
+
+        bs.save_record_to_storage.assert_not_awaited()
+        bs.store_virtual_record_mapping.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_legacy_cannot_be_versioned_string_still_falls_back(self) -> None:
+        bs = self._bs_with_existing(Exception("This document cannot be versioned"))
+        ctx = MagicMock()
+        ctx.record = _make_record_mock()
+
+        await bs.apply(ctx)
+
+        bs.save_record_to_storage.assert_awaited_once()
+        bs.store_virtual_record_mapping.assert_awaited_once_with("org-1", "vr-1", "new-doc", 4096)
+
+    @pytest.mark.asyncio
+    async def test_end_to_end_404_from_node_creates_replacement(self) -> None:
+        """Real upload_next_version against a mocked Node 404 → replacement + remap."""
+        bs = _make_blob_storage()
+        bs.get_document_id_by_virtual_record_id = AsyncMock(
+            return_value={"record_doc_id": "orphan-doc"}
+        )
+        bs._get_auth_and_config = AsyncMock(
+            return_value=({"Authorization": "Bearer t"}, "http://node:3001", "local")
+        )
+        bs.save_record_to_storage = AsyncMock(return_value=("new-doc", 10))
+        bs.store_virtual_record_mapping = AsyncMock()
+
+        resp = AsyncMock()
+        resp.status = 404
+        resp.json = AsyncMock(
+            return_value={"error": {"code": "NOT_FOUND", "message": "Document not found"}}
+        )
+        resp.__aenter__ = AsyncMock(return_value=resp)
+        resp.__aexit__ = AsyncMock(return_value=False)
+        session = AsyncMock()
+        session.post = MagicMock(return_value=resp)
+        session.__aenter__ = AsyncMock(return_value=session)
+        session.__aexit__ = AsyncMock(return_value=False)
+
+        ctx = MagicMock()
+        ctx.record = _make_record_mock()
+        with patch(
+            "app.modules.transformers.blob_storage.aiohttp.ClientSession",
+            return_value=session,
+        ):
+            await bs.apply(ctx)
+
+        bs.save_record_to_storage.assert_awaited_once()
+        bs.store_virtual_record_mapping.assert_awaited_once_with("org-1", "vr-1", "new-doc", 10)

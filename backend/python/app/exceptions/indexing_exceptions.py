@@ -121,3 +121,51 @@ class BlockContainerValidationError(IndexingError):
             f"{context}Block container validation failed — {msg}",
             record_id=record_id,
         )
+
+
+class OcrNotConfiguredError(DocumentProcessingError):
+    """Raised when a PDF needs OCR but no OCR provider (or multimodal LLM
+    fallback) is configured in the AI models settings.
+
+    Terminal by design (DocumentProcessingError): retrying cannot succeed
+    until an administrator adds an OCR model. Callers that reached OCR only
+    as a *fallback* (Docling / pdfplumber failed first) should catch this and
+    re-raise their original error so the recorded failure reason stays the
+    real one instead of "no OCR configured".
+    """
+
+    pass
+
+
+class StorageVersionUnavailableError(IndexingError):
+    """Raised by ``BlobStorage.upload_next_version`` when the Node storage
+    service cannot append a version to the document referenced by the
+    virtual-record → doc-id mapping, and the caller should start a
+    *replacement* document instead:
+
+    * 400 "cannot be versioned" — legacy document that is not version-enabled
+    * 404 — the storage document itself is gone (orphaned mapping)
+    * 500 ``STORAGE_DOWNLOAD_ERROR`` / "Failed to get document from local
+      storage" — the previous version's file is missing (e.g. the LOCAL
+      provider's emptyDir was wiped by a pod rollout)
+
+    ``status`` is the HTTP status of the failed upload, ``code`` the Node
+    error code when present, ``reason`` a short human-readable explanation.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        document_id: str = None,
+        status: int = None,
+        code: str = None,
+        reason: str = None,
+    ) -> None:
+        super().__init__(
+            message,
+            details={"document_id": document_id, "status": status, "code": code},
+        )
+        self.document_id = document_id
+        self.status = status
+        self.code = code
+        self.reason = reason or message

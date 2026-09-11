@@ -3062,9 +3062,9 @@ class TestProcessPdfDocumentWithOcr:
 
     @pytest.mark.asyncio
     async def test_no_handler_no_multimodal_raises_indexing_error(self):
-        """When no OCR config and no multimodal LLM, raises IndexingError with scanned PDF message."""
+        """When no OCR config and no multimodal LLM, raises the explicit "no OCR configured" error."""
         from app.exceptions.indexing_exceptions import IndexingError
-        from app.events.processor import SCANNED_PDF_NO_OCR_MESSAGE
+        from app.events.processor import NO_OCR_CONFIGURED_MESSAGE
         proc, _, gp, config = _make_processor()
         gp.get_document.return_value = _base_record_dict(mimeType="application/pdf")
 
@@ -3074,7 +3074,7 @@ class TestProcessPdfDocumentWithOcr:
         })
 
         with patch("app.events.processor.is_multimodal_llm", return_value=False):
-            with pytest.raises(IndexingError, match=SCANNED_PDF_NO_OCR_MESSAGE):
+            with pytest.raises(IndexingError, match=NO_OCR_CONFIGURED_MESSAGE):
                 await _collect(
                     proc.process_pdf_document_with_ocr(
                         recordName="test.pdf",
@@ -3794,5 +3794,87 @@ class TestProcessSqlStructuredData:
                 proc.process_sql_structured_data(
                     "table1", "r1", b'{}', "vr1",
                     record_type="SQL_TABLE"
+                )
+            )
+
+# ===========================================================================
+# process_pdf_document_with_ocr — AI models config without an "ocr" entry
+# (the deployment never configured an OCR model; used to KeyError: 'ocr')
+# ===========================================================================
+
+
+class TestProcessPdfDocumentWithOcrNoOcrConfigured:
+    @pytest.mark.asyncio
+    async def test_missing_ocr_key_and_no_llm_raises_clear_error(self) -> None:
+        from app.events.processor import NO_OCR_CONFIGURED_MESSAGE
+        from app.exceptions.indexing_exceptions import (
+            DocumentProcessingError,
+            OcrNotConfiguredError,
+        )
+
+        proc, _, _gp, config = _make_processor()
+        config.get_config = AsyncMock(return_value={"llm": [], "embedding": []})
+
+        with pytest.raises(OcrNotConfiguredError, match="No OCR model configured") as exc_info:
+            await _collect(
+                proc.process_pdf_document_with_ocr(
+                    "test.pdf", "rec-1", 1, "upload", "org-1", b"pdf", "vr-1"
+                )
+            )
+
+        assert isinstance(exc_info.value, DocumentProcessingError)  # terminal, not retried
+        assert exc_info.value.doc_id == "rec-1"
+        assert str(exc_info.value) == NO_OCR_CONFIGURED_MESSAGE
+
+    @pytest.mark.asyncio
+    async def test_missing_ocr_key_and_non_multimodal_llm_raises_clear_error(self) -> None:
+        from app.exceptions.indexing_exceptions import OcrNotConfiguredError
+
+        proc, _, _gp, config = _make_processor()
+        config.get_config = AsyncMock(return_value={"llm": [{"provider": "openai"}]})
+
+        with patch("app.events.processor.is_multimodal_llm", return_value=False):
+            with pytest.raises(OcrNotConfiguredError, match="No OCR model configured"):
+                await _collect(
+                    proc.process_pdf_document_with_ocr(
+                        "test.pdf", "rec-1", 1, "upload", "org-1", b"pdf", "vr-1"
+                    )
+                )
+
+    @pytest.mark.asyncio
+    async def test_missing_ocr_key_with_multimodal_llm_uses_vlm_handler(self) -> None:
+        proc, _, _gp, config = _make_processor()
+        config.get_config = AsyncMock(return_value={"llm": [{"provider": "gemini"}]})
+
+        with patch("app.events.processor.is_multimodal_llm", return_value=True), \
+             patch("app.events.processor.OCRHandler") as mock_handler_cls:
+            handler = AsyncMock()
+            handler.process_document.side_effect = RuntimeError("stop here")
+            mock_handler_cls.return_value = handler
+
+            with pytest.raises(Exception, match="stop here"):
+                await _collect(
+                    proc.process_pdf_document_with_ocr(
+                        "test.pdf", "rec-1", 1, "upload", "org-1", b"pdf", "vr-1"
+                    )
+                )
+
+        assert mock_handler_cls.call_args.args[1] == OCRProvider.VLM_OCR.value
+        handler.process_document.assert_awaited_once_with(b"pdf")
+
+    @pytest.mark.asyncio
+    async def test_configured_but_unsupported_provider_keeps_scanned_message(self) -> None:
+        from app.events.processor import SCANNED_PDF_NO_OCR_MESSAGE
+        from app.exceptions.indexing_exceptions import OcrNotConfiguredError
+
+        proc, _, _gp, config = _make_processor()
+        config.get_config = AsyncMock(
+            return_value={"ocr": [{"provider": "somethingElse"}], "llm": []}
+        )
+
+        with pytest.raises(OcrNotConfiguredError, match=SCANNED_PDF_NO_OCR_MESSAGE):
+            await _collect(
+                proc.process_pdf_document_with_ocr(
+                    "test.pdf", "rec-1", 1, "upload", "org-1", b"pdf", "vr-1"
                 )
             )

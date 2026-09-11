@@ -7,6 +7,7 @@ these tests provide additional coverage for edge cases and boundary conditions.
 
 import hashlib
 import json
+from collections.abc import AsyncGenerator
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -2148,3 +2149,159 @@ class TestFailedGraphWritesAreNotReportedAsSuccess:
 
         assert result.skip_indexing is True
         assert doc["indexingStatus"] == ProgressStatus.QUEUED.value
+
+
+# ===========================================================================
+# _dispatch_pdf_binary — OCR fallback must not mask the original failure
+# when no OCR model is configured (Docling failed for a storage reason on
+# US dev; the recorded reason was "'ocr'" / "No OCR configured" instead).
+# ===========================================================================
+
+
+def _dispatch_kwargs() -> dict:
+    return {
+        "record_name": "report.pdf",
+        "record_id": "rec-1",
+        "record_version": 1,
+        "connector": "KB",
+        "org_id": "org-1",
+        "pdf_binary": b"%PDF-1.4",
+        "virtual_record_id": "vr-1",
+    }
+
+
+def _ocr_not_configured_gen(*args, **kwargs) -> AsyncGenerator:
+    from app.exceptions.indexing_exceptions import OcrNotConfiguredError
+
+    async def _gen() -> AsyncGenerator:
+        raise OcrNotConfiguredError("No OCR model configured", doc_id="rec-1")
+        yield  # noqa: unreachable
+    return _gen()
+
+
+class TestDispatchPdfBinaryOcrFallbackPreservesOriginalError:
+    @pytest.mark.asyncio
+    async def test_docling_failed_and_no_ocr_reraises_docling_error(self) -> None:
+        from app.exceptions.indexing_exceptions import OcrNotConfiguredError
+
+        ep, logger, processor, _gp = _make_event_processor()
+        storage_error = RuntimeError("Failed to upload next version (status: 500)")
+
+        async def docling_fails(*args, **kwargs) -> AsyncGenerator:
+            yield PipelineEvent(
+                event=IndexingEvent.DOCLING_FAILED,
+                data=PipelineEventData(record_id="rec-1", error=storage_error),
+            )
+
+        processor.process_pdf_with_docling = MagicMock(side_effect=docling_fails)
+        processor.process_pdf_document_with_ocr = MagicMock(side_effect=_ocr_not_configured_gen)
+
+        with patch.object(ep, "_pdf_needs_ocr", new_callable=AsyncMock, return_value=False), \
+             patch.dict("os.environ", {"ENABLE_PDFPLUMBER_PROCESSOR": "false"}):
+            with pytest.raises(RuntimeError, match="status: 500") as exc_info:
+                await _drain(ep._dispatch_pdf_binary(**_dispatch_kwargs()))
+
+        assert exc_info.value is storage_error
+        assert isinstance(exc_info.value.__cause__, OcrNotConfiguredError)
+        processor.process_pdf_document_with_ocr.assert_called_once()
+        # the original failure is logged at ERROR before the OCR attempt
+        error_logs = " | ".join(
+            str(c.args[0]) % tuple(c.args[1:]) for c in logger.error.call_args_list
+        )
+        assert "Docling processing failed for record rec-1" in error_logs
+        assert "status: 500" in error_logs
+
+    @pytest.mark.asyncio
+    async def test_docling_failed_without_error_object_raises_generic_docling_error(self) -> None:
+        ep, _logger, processor, _gp = _make_event_processor()
+
+        async def docling_fails(*args, **kwargs) -> AsyncGenerator:
+            yield PipelineEvent(event=IndexingEvent.DOCLING_FAILED, data=PipelineEventData(record_id="rec-1"))
+
+        processor.process_pdf_with_docling = MagicMock(side_effect=docling_fails)
+        processor.process_pdf_document_with_ocr = MagicMock(side_effect=_ocr_not_configured_gen)
+
+        with patch.object(ep, "_pdf_needs_ocr", new_callable=AsyncMock, return_value=False), \
+             patch.dict("os.environ", {"ENABLE_PDFPLUMBER_PROCESSOR": "false"}):
+            with pytest.raises(RuntimeError, match="Docling failed to parse report.pdf"):
+                await _drain(ep._dispatch_pdf_binary(**_dispatch_kwargs()))
+
+    @pytest.mark.asyncio
+    async def test_docling_failed_and_ocr_available_yields_ocr_events(self) -> None:
+        ep, _logger, processor, _gp = _make_event_processor()
+
+        async def docling_fails(*args, **kwargs) -> AsyncGenerator:
+            yield PipelineEvent(
+                event=IndexingEvent.DOCLING_FAILED,
+                data=PipelineEventData(record_id="rec-1", error=RuntimeError("boom")),
+            )
+
+        processor.process_pdf_with_docling = MagicMock(side_effect=docling_fails)
+        processor.process_pdf_document_with_ocr = MagicMock(side_effect=_mock_processor_gen)
+
+        with patch.object(ep, "_pdf_needs_ocr", new_callable=AsyncMock, return_value=False), \
+             patch.dict("os.environ", {"ENABLE_PDFPLUMBER_PROCESSOR": "false"}):
+            events = await _drain(ep._dispatch_pdf_binary(**_dispatch_kwargs()))
+
+        assert [e.event for e in events] == [IndexingEvent.PARSING_COMPLETE, IndexingEvent.INDEXING_COMPLETE]
+
+    @pytest.mark.asyncio
+    async def test_docling_failed_and_ocr_fails_differently_propagates_ocr_error(self) -> None:
+        """Only the "no OCR configured" case is swapped for the original error."""
+        ep, _logger, processor, _gp = _make_event_processor()
+
+        async def docling_fails(*args, **kwargs) -> AsyncGenerator:
+            yield PipelineEvent(
+                event=IndexingEvent.DOCLING_FAILED,
+                data=PipelineEventData(record_id="rec-1", error=RuntimeError("docling boom")),
+            )
+
+        async def ocr_breaks(*args, **kwargs) -> AsyncGenerator:
+            raise ValueError("ocr provider exploded")
+            yield  # noqa: unreachable
+
+        processor.process_pdf_with_docling = MagicMock(side_effect=docling_fails)
+        processor.process_pdf_document_with_ocr = MagicMock(side_effect=ocr_breaks)
+
+        with patch.object(ep, "_pdf_needs_ocr", new_callable=AsyncMock, return_value=False), \
+             patch.dict("os.environ", {"ENABLE_PDFPLUMBER_PROCESSOR": "false"}):
+            with pytest.raises(ValueError, match="ocr provider exploded"):
+                await _drain(ep._dispatch_pdf_binary(**_dispatch_kwargs()))
+
+    @pytest.mark.asyncio
+    async def test_pdfplumber_failed_and_no_ocr_reraises_pdfplumber_error(self) -> None:
+        from app.exceptions.indexing_exceptions import OcrNotConfiguredError
+
+        ep, logger, processor, _gp = _make_event_processor()
+
+        async def plumber_fails(*args, **kwargs) -> AsyncGenerator:
+            raise ValueError("pdfplumber choked")
+            yield  # noqa: unreachable
+
+        processor.process_pdf_with_pdf_plumber = MagicMock(side_effect=plumber_fails)
+        processor.process_pdf_document_with_ocr = MagicMock(side_effect=_ocr_not_configured_gen)
+
+        with patch.object(ep, "_pdf_needs_ocr", new_callable=AsyncMock, return_value=False), \
+             patch.dict("os.environ", {"ENABLE_PDFPLUMBER_PROCESSOR": "true"}):
+            with pytest.raises(ValueError, match="pdfplumber choked") as exc_info:
+                await _drain(ep._dispatch_pdf_binary(**_dispatch_kwargs()))
+
+        assert isinstance(exc_info.value.__cause__, OcrNotConfiguredError)
+        error_logs = " | ".join(
+            str(c.args[0]) % tuple(c.args[1:]) for c in logger.error.call_args_list
+        )
+        assert "PdfPlumber+OpenCV processing failed for record rec-1" in error_logs
+
+    @pytest.mark.asyncio
+    async def test_needs_ocr_and_no_ocr_configured_raises_clear_error(self) -> None:
+        from app.exceptions.indexing_exceptions import OcrNotConfiguredError
+
+        ep, _logger, processor, _gp = _make_event_processor()
+        processor.process_pdf_document_with_ocr = MagicMock(side_effect=_ocr_not_configured_gen)
+        processor.process_pdf_with_docling = MagicMock()
+
+        with patch.object(ep, "_pdf_needs_ocr", new_callable=AsyncMock, return_value=True):
+            with pytest.raises(OcrNotConfiguredError, match="No OCR model configured"):
+                await _drain(ep._dispatch_pdf_binary(**_dispatch_kwargs()))
+
+        processor.process_pdf_with_docling.assert_not_called()

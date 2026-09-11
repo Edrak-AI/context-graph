@@ -3,7 +3,7 @@ from collections.abc import AsyncGenerator, Awaitable, Callable
 from enum import Enum
 from typing import Optional
 
-from pydantic import BaseModel, Field, JsonValue
+from pydantic import BaseModel, ConfigDict, Field, JsonValue
 
 from app.services.resource_governor.models import ParseTier
 from app.utils.env_config import env_int as _env_int
@@ -73,6 +73,8 @@ class StreamMessage(BaseModel):
 class PipelineEventData(BaseModel):
     """Data yielded alongside a pipeline event."""
 
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     record_id: Optional[str] = None
     record_name: Optional[str] = None
     count: Optional[int] = None
@@ -82,6 +84,10 @@ class PipelineEventData(BaseModel):
     # the payload.
     tier: ParseTier | None = None
     size_bytes: int | None = None
+    # Set on DOCLING_FAILED: the exception that made the Docling path give up,
+    # so the caller's OCR fallback can surface the real failure instead of a
+    # secondary "no OCR configured" error when it cannot run either.
+    error: BaseException | None = None
 
 
 class PipelineEvent(BaseModel):

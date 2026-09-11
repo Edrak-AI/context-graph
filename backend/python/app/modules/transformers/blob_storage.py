@@ -18,6 +18,7 @@ from app.config.constants.service import (
     TokenScopes,
     config_node_constants,
 )
+from app.exceptions.indexing_exceptions import StorageVersionUnavailableError
 from app.modules.transformers.transformer import TransformContext, Transformer
 from app.services.graph_db.interface.graph_db_provider import IGraphDBProvider
 from app.utils.request_context import inject_request_headers
@@ -719,9 +720,70 @@ class BlobStorage(Transformer):
 
         return cleaned
 
-    def _is_non_versioned_exception(self, error: Exception) -> bool:
-        """Detect Node storage errors for legacy documents that are not version-enabled."""
+    def _is_version_unavailable_exception(self, error: Exception) -> bool:
+        """True when a next-version upload failed in a way that means "start a
+        replacement document": legacy non-versioned doc (400), doc missing
+        (404) or previous-version file missing (500 STORAGE_DOWNLOAD_ERROR).
+        The plain-string match is kept so wrapped/legacy errors still qualify.
+        """
+        if isinstance(error, StorageVersionUnavailableError):
+            return True
         return "cannot be versioned" in str(error).lower()
+
+    # Backward-compatible name: existing callers/tests still use it.
+    def _is_non_versioned_exception(self, error: Exception) -> bool:
+        return self._is_version_unavailable_exception(error)
+
+    @staticmethod
+    def _describe_version_failure(error: Exception) -> str:
+        if isinstance(error, StorageVersionUnavailableError):
+            extras = []
+            if error.status is not None:
+                extras.append(f"HTTP {error.status}")
+            if error.code:
+                extras.append(f"code={error.code}")
+            return f"{error.reason} ({', '.join(extras)})" if extras else error.reason
+        return "not version-enabled"
+
+    @staticmethod
+    def _classify_next_version_failure(
+        document_id: str, status: int | None, error_response: object
+    ) -> StorageVersionUnavailableError | None:
+        """Map a failed next-version upload to StorageVersionUnavailableError
+        when the right fix is a replacement document; None otherwise."""
+        code = None
+        message = ""
+        if isinstance(error_response, dict):
+            error_obj = error_response.get("error")
+            if isinstance(error_obj, dict):
+                code = error_obj.get("code")
+                message = str(error_obj.get("message", ""))
+            elif error_obj is not None:
+                message = str(error_obj)
+        lowered = message.lower()
+
+        if status == HttpStatusCode.BAD_REQUEST.value and "cannot be versioned" in lowered:
+            return StorageVersionUnavailableError(
+                "This document cannot be versioned",
+                document_id=document_id, status=status, code=code,
+                reason="document is not version-enabled",
+            )
+        if status == HttpStatusCode.NOT_FOUND.value:
+            return StorageVersionUnavailableError(
+                f"Storage document {document_id} not found (status: {status})",
+                document_id=document_id, status=status, code=code,
+                reason="storage document not found",
+            )
+        if status == HttpStatusCode.INTERNAL_SERVER_ERROR.value and (
+            code == "STORAGE_DOWNLOAD_ERROR"
+            or "failed to get document from local storage" in lowered
+        ):
+            return StorageVersionUnavailableError(
+                f"Previous version of storage document {document_id} is unavailable (status: {status})",
+                document_id=document_id, status=status, code=code,
+                reason="previous version file missing",
+            )
+        return None
 
     async def apply(self, ctx: TransformContext) -> TransformContext:
         record = ctx.record
@@ -747,11 +809,11 @@ class BlobStorage(Transformer):
                     org_id, record_id, existing_doc_id, record_dict, virtual_record_id
                 )
             except Exception as e:
-                if not self._is_non_versioned_exception(e):
+                if not self._is_version_unavailable_exception(e):
                     raise
                 self.logger.warning(
-                    "⚠️ Existing storage doc %s is not version-enabled; creating replacement document",
-                    existing_doc_id,
+                    "⚠️ Existing storage doc %s for vrid %s cannot take a new version (%s); creating replacement document",
+                    existing_doc_id, virtual_record_id, self._describe_version_failure(e),
                 )
                 document_id, file_size_bytes = await self.save_record_to_storage(
                     org_id, record_id, virtual_record_id, record_dict
@@ -777,6 +839,7 @@ class BlobStorage(Transformer):
             async with session.post(url, json=data, headers=headers) as response:
                 if response.status != HttpStatusCode.SUCCESS.value:
                     error_detail = ""
+                    error_response = None
                     try:
                         error_response = await response.json()
                         self.logger.error("❌ Failed to get signed URL. Status: %d, Error: %s",
@@ -799,8 +862,13 @@ class BlobStorage(Transformer):
                         self.logger.error("❌ Failed to get signed URL. Status: %d, Response: %s",
                                         response.status, error_text[:200])
                     if error_detail:
-                        raise aiohttp.ClientError(f"Failed with status {response.status}: {error_detail}")
-                    raise aiohttp.ClientError(f"Failed with status {response.status}")
+                        client_error = aiohttp.ClientError(f"Failed with status {response.status}: {error_detail}")
+                    else:
+                        client_error = aiohttp.ClientError(f"Failed with status {response.status}")
+                    # Let upload_next_version classify the failure without re-parsing the message.
+                    client_error.http_status = response.status
+                    client_error.error_response = error_response
+                    raise client_error
 
                 response_data = await response.json()
                 return response_data
@@ -1521,13 +1589,11 @@ class BlobStorage(Transformer):
                                 error_text = await response.text()
                                 self.logger.error("❌ Failed to upload next version. Status: %d, Response: %s",
                                                 response.status, error_text[:200])
-                            if (
-                                response.status == HttpStatusCode.BAD_REQUEST.value
-                                and isinstance(error_response, dict)
-                                and "cannot be versioned"
-                                in str(error_response.get("error", {}).get("message", "")).lower()
-                            ):
-                                raise Exception("This document cannot be versioned")
+                            typed_error = self._classify_next_version_failure(
+                                document_id, response.status, error_response
+                            )
+                            if typed_error is not None:
+                                raise typed_error
 
                             raise Exception(
                                 f"Failed to upload next version (status: {response.status})"
@@ -1538,7 +1604,17 @@ class BlobStorage(Transformer):
             else:
                 async with aiohttp.ClientSession() as session:
                     upload_url = f"{nodejs_endpoint}{Routes.STORAGE_DIRECT_UPLOAD.value.format(documentId=document_id)}"
-                    upload_result = await self._get_signed_url(session, upload_url, {}, headers)
+                    try:
+                        upload_result = await self._get_signed_url(session, upload_url, {}, headers)
+                    except aiohttp.ClientError as e:
+                        typed_error = self._classify_next_version_failure(
+                            document_id,
+                            getattr(e, "http_status", None),
+                            getattr(e, "error_response", None),
+                        )
+                        if typed_error is not None:
+                            raise typed_error from e
+                        raise
 
                     signed_url = upload_result.get('signedUrl')
                     if not signed_url:
@@ -1595,11 +1671,11 @@ class BlobStorage(Transformer):
                     )
                     metadata_document_id = doc_id
                 except Exception as e:
-                    if not self._is_non_versioned_exception(e):
+                    if not self._is_version_unavailable_exception(e):
                         raise
                     self.logger.warning(
-                        "⚠️ Existing metadata doc %s is not version-enabled; creating replacement metadata document",
-                        existing_metadata_doc_id,
+                        "⚠️ Existing metadata doc %s for vrid %s cannot take a new version (%s); creating replacement metadata document",
+                        existing_metadata_doc_id, virtual_record_id, self._describe_version_failure(e),
                     )
                     metadata_document_id = await self._create_metadata_document(
                         org_id, record_id, virtual_record_id, metadata_dict

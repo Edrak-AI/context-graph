@@ -1572,9 +1572,9 @@ class TestConvertRecordDictAdditional:
 class TestProcessPdfDocumentWithOcrAdditional:
     @pytest.mark.asyncio
     async def test_no_handler_no_multimodal_llm_raises_indexing_error(self):
-        """No OCR handler and no multimodal LLM raises IndexingError with scanned PDF message."""
+        """No OCR handler and no multimodal LLM raises the explicit "no OCR configured" error."""
         from app.exceptions.indexing_exceptions import IndexingError
-        from app.events.processor import SCANNED_PDF_NO_OCR_MESSAGE
+        from app.events.processor import NO_OCR_CONFIGURED_MESSAGE
         proc = _make_processor()
 
         proc.graph_provider.get_document = AsyncMock(
@@ -1587,7 +1587,7 @@ class TestProcessPdfDocumentWithOcrAdditional:
                 "llm": [],
             })
 
-            with pytest.raises(IndexingError, match=SCANNED_PDF_NO_OCR_MESSAGE):
+            with pytest.raises(IndexingError, match=NO_OCR_CONFIGURED_MESSAGE):
                 await _collect_events(
                     proc.process_pdf_document_with_ocr(
                         "test.pdf", "r1", "1", "src", "o1", b"pdfdata", "vr1"
@@ -1712,7 +1712,7 @@ class TestProcessPdfDocumentWithOcrAdditional:
     async def test_no_handler_multimodal_llm_check_exception(self):
         """Exception during multimodal LLM check causes IndexingError (no handler available)."""
         from app.exceptions.indexing_exceptions import IndexingError
-        from app.events.processor import SCANNED_PDF_NO_OCR_MESSAGE
+        from app.events.processor import NO_OCR_CONFIGURED_MESSAGE
         proc = _make_processor()
 
         proc.graph_provider.get_document = AsyncMock(
@@ -1725,7 +1725,7 @@ class TestProcessPdfDocumentWithOcrAdditional:
                 "llm": [{"provider": "openai"}],
             })
 
-            with pytest.raises(IndexingError, match=SCANNED_PDF_NO_OCR_MESSAGE):
+            with pytest.raises(IndexingError, match=NO_OCR_CONFIGURED_MESSAGE):
                 await _collect_events(
                     proc.process_pdf_document_with_ocr(
                         "test.pdf", "r1", "1", "src", "o1", b"pdfdata", "vr1"

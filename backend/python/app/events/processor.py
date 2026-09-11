@@ -16,6 +16,7 @@ from app.config.constants.service import config_node_constants
 from app.exceptions.indexing_exceptions import (
     DocumentProcessingError,
     IndexingError,
+    OcrNotConfiguredError,
     RecordStatusUpdateError,
 )
 from app.services.messaging.config import IndexingEvent, PipelineEvent, PipelineEventData
@@ -50,6 +51,9 @@ from app.utils.time_conversion import get_epoch_timestamp_in_ms
 
 
 SCANNED_PDF_NO_OCR_MESSAGE = "Scanned document, add Multimodal"
+NO_OCR_CONFIGURED_MESSAGE = (
+    "No OCR model configured: add an OCR provider or a multimodal LLM under AI models"
+)
 
 
 def convert_record_dict_to_record(record_dict: dict) -> Record:
@@ -377,7 +381,10 @@ class Processor:
             raise
         except Exception as e:
             self.logger.error(f"❌ Error processing PDF document with external Docling service: {str(e)}")
-            yield PipelineEvent(event=IndexingEvent.DOCLING_FAILED, data=PipelineEventData(record_id=recordId))
+            yield PipelineEvent(
+                event=IndexingEvent.DOCLING_FAILED,
+                data=PipelineEventData(record_id=recordId, error=e),
+            )
 
     async def process_pdf_document_with_ocr(
         self, recordName, recordId, version, source, orgId, pdf_binary, virtual_record_id, event_type: Optional[str] = None, prev_virtual_record_id: Optional[str] = None
@@ -393,7 +400,8 @@ class Processor:
             ai_models = await self.config_service.get_config(
                 config_node_constants.AI_MODELS.value
             )
-            ocr_configs = ai_models["ocr"]
+            # "ocr" is absent (not just empty) when no OCR model was ever configured.
+            ocr_configs = (ai_models or {}).get("ocr") or []
 
             # Configure OCR handler
             self.logger.debug("🛠️ Configuring OCR handler")
@@ -433,9 +441,12 @@ class Processor:
                     self.logger.debug("🤖 Setting up VLM OCR handler (multimodal LLM detected)")
                     handler = OCRHandler(self.logger, OCRProvider.VLM_OCR.value, config=self.config_service)
                     provider = OCRProvider.VLM_OCR.value
+                elif not ocr_configs:
+                    self.logger.warning("⚠️ OCR requested for %s but no OCR model and no multimodal LLM is configured", recordName)
+                    raise OcrNotConfiguredError(NO_OCR_CONFIGURED_MESSAGE, doc_id=recordId)
                 else:
                     self.logger.warning("⚠️ Scanned PDF detected but no OCR provider (Azure DI or multimodal LLM) is configured")
-                    raise IndexingError(SCANNED_PDF_NO_OCR_MESSAGE, record_id=recordId)
+                    raise OcrNotConfiguredError(SCANNED_PDF_NO_OCR_MESSAGE, doc_id=recordId)
 
             # Process document
             self.logger.info("🔄 Processing document with OCR handler")

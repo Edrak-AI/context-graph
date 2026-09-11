@@ -30,7 +30,7 @@ from app.config.constants.arangodb import (
     normalize_file_extension,
 )
 from app.events.processor import Processor
-from app.exceptions.indexing_exceptions import IndexingError
+from app.exceptions.indexing_exceptions import IndexingError, OcrNotConfiguredError
 from app.modules.parsers.pdf.ocr_handler import OCRStrategy
 from app.modules.transformers.pipeline import IndexingPipeline
 from app.events.dedup import DedupDecision, select_duplicate
@@ -274,13 +274,17 @@ class EventProcessor:
                 ):
                     yield event
             except Exception as e:
-                self.logger.warning(f"⚠️ PdfPlumber+OpenCV processing failed, falling back to OCR: {e}")
-                async for event in self.processor.process_pdf_document_with_ocr(
-                    recordName=record_name,
-                    recordId=record_id,
-                    version=record_version,
-                    source=connector,
-                    orgId=org_id,
+                self.logger.error(
+                    "❌ PdfPlumber+OpenCV processing failed for record %s (%s); falling back to OCR: %s",
+                    record_id, record_name, e,
+                )
+                async for event in self._ocr_fallback_after_failure(
+                    original_error=e,
+                    record_name=record_name,
+                    record_id=record_id,
+                    record_version=record_version,
+                    connector=connector,
+                    org_id=org_id,
                     pdf_binary=pdf_binary,
                     virtual_record_id=virtual_record_id,
                     event_type=event_type,
@@ -291,6 +295,7 @@ class EventProcessor:
 
         # Use docling for PDFs that don't need OCR
         docling_failed = False
+        docling_error: BaseException | None = None
         async for event in self.processor.process_pdf_with_docling(
             recordName=record_name,
             recordId=record_id,
@@ -301,10 +306,53 @@ class EventProcessor:
         ):
             if event.event == IndexingEvent.DOCLING_FAILED:
                 docling_failed = True
+                docling_error = event.data.error if event.data else None
             else:
                 yield event
 
         if docling_failed:
+            if docling_error is None:
+                docling_error = RuntimeError(
+                    f"Docling failed to parse {record_name} (no document returned)"
+                )
+            self.logger.error(
+                "❌ Docling processing failed for record %s (%s); falling back to OCR: %s",
+                record_id, record_name, docling_error,
+            )
+            async for event in self._ocr_fallback_after_failure(
+                original_error=docling_error,
+                record_name=record_name,
+                record_id=record_id,
+                record_version=record_version,
+                connector=connector,
+                org_id=org_id,
+                pdf_binary=pdf_binary,
+                virtual_record_id=virtual_record_id,
+                event_type=event_type,
+                prev_virtual_record_id=prev_virtual_record_id,
+            ):
+                yield event
+
+    async def _ocr_fallback_after_failure(
+        self,
+        *,
+        original_error: BaseException,
+        record_name: str,
+        record_id: str,
+        record_version: int,
+        connector: str,
+        org_id: str,
+        pdf_binary: bytes,
+        virtual_record_id: str,
+        event_type: str | None,
+        prev_virtual_record_id: str | None,
+    ) -> AsyncGenerator[PipelineEvent, None]:
+        """Run the OCR path after Docling/pdfplumber failed. If OCR cannot run
+        because no OCR model is configured, re-raise the ORIGINAL failure (with
+        the OCR error chained) so the recorded reason is the real one — e.g. a
+        storage error — rather than "no OCR configured".
+        """
+        try:
             async for event in self.processor.process_pdf_document_with_ocr(
                 recordName=record_name,
                 recordId=record_id,
@@ -317,6 +365,12 @@ class EventProcessor:
                 prev_virtual_record_id=prev_virtual_record_id,
             ):
                 yield event
+        except OcrNotConfiguredError as ocr_error:
+            self.logger.error(
+                "❌ OCR fallback unavailable for record %s (%s); reporting the original failure: %s",
+                record_id, ocr_error, original_error,
+            )
+            raise original_error from ocr_error
 
     def _use_service_pipeline(self) -> bool:
         """Return True when the new HTTP service pipeline should be used."""

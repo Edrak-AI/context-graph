@@ -551,3 +551,255 @@ class TestGetReconciliationMetadata:
 
         result = await bs.get_reconciliation_metadata("vr", "org")
         assert result is None
+
+
+# ---------------------------------------------------------------------------
+# upload_next_version — orphaned metadata after a pod rollout (emptyDir wiped)
+# The Node storage document / its previous version file is gone while the
+# graph mapping still points at it. These must become a typed
+# StorageVersionUnavailableError so the caller starts a replacement document.
+# ---------------------------------------------------------------------------
+
+
+def _patched_session(resp) -> object:
+    mock_session = AsyncMock()
+    mock_session.post = MagicMock(return_value=resp)
+    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_session.__aexit__ = AsyncMock(return_value=False)
+    return patch(
+        "app.modules.transformers.blob_storage.aiohttp.ClientSession",
+        return_value=mock_session,
+    )
+
+
+class TestUploadNextVersionUnavailable:
+    @pytest.mark.asyncio
+    async def test_local_404_document_missing_raises_typed_error(self) -> None:
+        from app.exceptions.indexing_exceptions import StorageVersionUnavailableError
+
+        bs = _make_bs()
+        _configure_auth(bs, "local")
+        err_resp = _resp(404, {"error": {"code": "NOT_FOUND", "message": "Document not found"}})
+
+        with _patched_session(err_resp):
+            with pytest.raises(StorageVersionUnavailableError) as exc_info:
+                await bs.upload_next_version("org-1", "rec-1", "doc-gone", {"a": 1}, "vr-1")
+
+        err = exc_info.value
+        assert err.status == 404
+        assert err.document_id == "doc-gone"
+        assert err.code == "NOT_FOUND"
+        assert bs._is_version_unavailable_exception(err) is True
+
+    @pytest.mark.asyncio
+    async def test_local_500_storage_download_error_raises_typed_error(self) -> None:
+        from app.exceptions.indexing_exceptions import StorageVersionUnavailableError
+
+        bs = _make_bs()
+        _configure_auth(bs, "local")
+        err_resp = _resp(
+            500,
+            {
+                "error": {
+                    "code": "STORAGE_DOWNLOAD_ERROR",
+                    "message": "Failed to get document from local storage",
+                }
+            },
+        )
+
+        with _patched_session(err_resp):
+            with pytest.raises(StorageVersionUnavailableError) as exc_info:
+                await bs.upload_next_version("org-1", "rec-1", "doc-123", {"a": 1}, "vr-1")
+
+        assert exc_info.value.status == 500
+        assert exc_info.value.code == "STORAGE_DOWNLOAD_ERROR"
+        assert "previous version" in exc_info.value.reason
+
+    @pytest.mark.asyncio
+    async def test_local_500_local_storage_message_without_code_raises_typed_error(self) -> None:
+        from app.exceptions.indexing_exceptions import StorageVersionUnavailableError
+
+        bs = _make_bs()
+        _configure_auth(bs, "local")
+        err_resp = _resp(500, {"error": {"message": "Failed to get document from local storage"}})
+
+        with _patched_session(err_resp):
+            with pytest.raises(StorageVersionUnavailableError):
+                await bs.upload_next_version("org-1", "rec-1", "doc-123", {"a": 1}, "vr-1")
+
+    @pytest.mark.asyncio
+    async def test_local_500_other_error_stays_generic(self) -> None:
+        from app.exceptions.indexing_exceptions import StorageVersionUnavailableError
+
+        bs = _make_bs()
+        _configure_auth(bs, "local")
+        err_resp = _resp(500, {"error": {"code": "INTERNAL_SERVER_ERROR", "message": "disk full"}})
+
+        with _patched_session(err_resp):
+            with pytest.raises(Exception, match="Failed to upload next version") as exc_info:
+                await bs.upload_next_version("org-1", "rec-1", "doc-123", {"a": 1}, "vr-1")
+
+        assert not isinstance(exc_info.value, StorageVersionUnavailableError)
+        assert bs._is_version_unavailable_exception(exc_info.value) is False
+
+    @pytest.mark.asyncio
+    async def test_local_400_cannot_be_versioned_is_typed_and_keeps_message(self) -> None:
+        from app.exceptions.indexing_exceptions import StorageVersionUnavailableError
+
+        bs = _make_bs()
+        _configure_auth(bs, "local")
+        err_resp = _resp(400, {"error": {"message": "This document cannot be versioned"}})
+
+        with _patched_session(err_resp):
+            with pytest.raises(StorageVersionUnavailableError, match="cannot be versioned") as exc_info:
+                await bs.upload_next_version("org-1", "rec-1", "doc-legacy", {"a": 1}, "vr-1")
+
+        assert exc_info.value.status == 400
+        # the legacy string match still works for both helper names
+        assert bs._is_non_versioned_exception(exc_info.value) is True
+        assert bs._is_non_versioned_exception(Exception("This document cannot be versioned")) is True
+
+    @pytest.mark.asyncio
+    async def test_local_400_other_message_stays_generic(self) -> None:
+        from app.exceptions.indexing_exceptions import StorageVersionUnavailableError
+
+        bs = _make_bs()
+        _configure_auth(bs, "local")
+        err_resp = _resp(400, {"error": {"message": "invalid form data"}})
+
+        with _patched_session(err_resp):
+            with pytest.raises(Exception, match="Failed to upload next version") as exc_info:
+                await bs.upload_next_version("org-1", "rec-1", "doc-123", {"a": 1}, "vr-1")
+        assert not isinstance(exc_info.value, StorageVersionUnavailableError)
+
+    @pytest.mark.asyncio
+    async def test_s3_signed_url_404_raises_typed_error(self) -> None:
+        """Direct-upload path: _get_signed_url's ClientError carries the HTTP status."""
+        import aiohttp
+
+        from app.exceptions.indexing_exceptions import StorageVersionUnavailableError
+
+        bs = _make_bs()
+        _configure_auth(bs, "s3")
+        client_error = aiohttp.ClientError("Failed with status 404: Document not found")
+        client_error.http_status = 404
+        client_error.error_response = {"error": {"code": "NOT_FOUND", "message": "Document not found"}}
+        bs._get_signed_url = AsyncMock(side_effect=client_error)
+
+        mock_session = AsyncMock()
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+        with patch(
+            "app.modules.transformers.blob_storage.aiohttp.ClientSession",
+            return_value=mock_session,
+        ):
+            with pytest.raises(StorageVersionUnavailableError) as exc_info:
+                await bs.upload_next_version("org-1", "rec-1", "doc-gone", {"a": 1}, "vr-1")
+        assert exc_info.value.status == 404
+        assert exc_info.value.__cause__ is client_error
+
+    @pytest.mark.asyncio
+    async def test_s3_signed_url_other_error_propagates_unchanged(self) -> None:
+        import aiohttp
+
+        bs = _make_bs()
+        _configure_auth(bs, "s3")
+        client_error = aiohttp.ClientError("Failed with status 503: unavailable")
+        client_error.http_status = 503
+        client_error.error_response = {"error": {"message": "unavailable"}}
+        bs._get_signed_url = AsyncMock(side_effect=client_error)
+
+        mock_session = AsyncMock()
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+        with patch(
+            "app.modules.transformers.blob_storage.aiohttp.ClientSession",
+            return_value=mock_session,
+        ):
+            with pytest.raises(aiohttp.ClientError, match="status 503"):
+                await bs.upload_next_version("org-1", "rec-1", "doc-1", {"a": 1}, "vr-1")
+
+    @pytest.mark.asyncio
+    async def test_get_signed_url_attaches_status_and_body_to_client_error(self) -> None:
+        import aiohttp
+
+        bs = _make_bs()
+        body = {"error": {"code": "STORAGE_DOWNLOAD_ERROR", "message": "Failed to get document from local storage"}}
+        resp = _resp(500, body)
+        session = AsyncMock()
+        session.post = MagicMock(return_value=resp)
+
+        with pytest.raises(aiohttp.ClientError, match="Failed with status 500") as exc_info:
+            await bs._get_signed_url(session, "http://api/url", {}, {})
+        assert exc_info.value.http_status == 500
+        assert exc_info.value.error_response == body
+
+
+class TestSaveReconciliationMetadataVersionUnavailable:
+    @pytest.mark.asyncio
+    async def test_404_creates_replacement_and_updates_mapping(self) -> None:
+        from app.exceptions.indexing_exceptions import StorageVersionUnavailableError
+
+        graph_provider = AsyncMock()
+        graph_provider.get_document = AsyncMock(
+            return_value={"record_metadata_doc_id": "meta-gone"}
+        )
+        graph_provider.batch_upsert_nodes = AsyncMock()
+        logger = MagicMock()
+        bs = BlobStorage(logger=logger, config_service=AsyncMock(), graph_provider=graph_provider)
+        bs.upload_next_version = AsyncMock(
+            side_effect=StorageVersionUnavailableError(
+                "Storage document meta-gone not found (status: 404)",
+                document_id="meta-gone", status=404, code="NOT_FOUND",
+                reason="storage document not found",
+            )
+        )
+        bs._create_metadata_document = AsyncMock(return_value="meta-new")
+
+        result = await bs.save_reconciliation_metadata("org", "rec", "vr", {"k": "v"})
+
+        assert result == "meta-new"
+        bs._create_metadata_document.assert_awaited_once_with("org", "rec", "vr", {"k": "v"})
+        graph_provider.batch_upsert_nodes.assert_awaited_once()
+        mapping_docs = graph_provider.batch_upsert_nodes.await_args.args[0]
+        assert mapping_docs[0]["_key"] == "vr"
+        assert mapping_docs[0]["record_metadata_doc_id"] == "meta-new"
+        warning_msg = logger.warning.call_args.args[0] % logger.warning.call_args.args[1:]
+        assert "meta-gone" in warning_msg and "storage document not found" in warning_msg
+
+    @pytest.mark.asyncio
+    async def test_500_storage_download_error_creates_replacement(self) -> None:
+        from app.exceptions.indexing_exceptions import StorageVersionUnavailableError
+
+        graph_provider = AsyncMock()
+        graph_provider.get_document = AsyncMock(
+            return_value={"record_metadata_doc_id": "meta-1"}
+        )
+        graph_provider.batch_upsert_nodes = AsyncMock()
+        bs = _make_bs(graph_provider=graph_provider)
+        bs.upload_next_version = AsyncMock(
+            side_effect=StorageVersionUnavailableError(
+                "Previous version unavailable", document_id="meta-1", status=500,
+                code="STORAGE_DOWNLOAD_ERROR", reason="previous version file missing",
+            )
+        )
+        bs._create_metadata_document = AsyncMock(return_value="meta-new")
+
+        assert await bs.save_reconciliation_metadata("org", "rec", "vr", {}) == "meta-new"
+        bs._create_metadata_document.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_other_500_still_raises(self) -> None:
+        graph_provider = AsyncMock()
+        graph_provider.get_document = AsyncMock(
+            return_value={"record_metadata_doc_id": "meta-1"}
+        )
+        bs = _make_bs(graph_provider=graph_provider)
+        bs.upload_next_version = AsyncMock(
+            side_effect=Exception("Failed to upload next version (status: 500)")
+        )
+        bs._create_metadata_document = AsyncMock()
+
+        with pytest.raises(Exception, match="status: 500"):
+            await bs.save_reconciliation_metadata("org", "rec", "vr", {})
+        bs._create_metadata_document.assert_not_awaited()
